@@ -1,0 +1,12 @@
+[package]
+name = "kdu"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+knife-core = { path = "../knife-core" }
+knife-audio = { path = "../knife-audio" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+image = { workspace = true }

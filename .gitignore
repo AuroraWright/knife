@@ -1,0 +1,14 @@
+/target
+/re/*.i64
+/re/*.elf
+/re/decomp
+/out
+.DS_Store
+/switch_exefs
+/switch_romfs
+/re/*.id0
+/re/*.id1
+/re/*.id2
+/re/*.nam
+/re/*.til
+/build

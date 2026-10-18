@@ -1,0 +1,933 @@
+//! wgpu renderer: textures, a quad batcher with blend-mode pipelines, render targets,
+//! rule transitions and a letterboxed present.
+//!
+//! The game composes everything into a fixed 1920x1080 canvas (`CANVAS_W` x `CANVAS_H`),
+//! which is then scaled to the window.
+
+use std::{collections::HashMap, sync::Arc};
+
+use anyhow::{Context, Result};
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+pub const CANVAS_W: u32 = 1920;
+pub const CANVAS_H: u32 = 1080;
+const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Vertex {
+    pub pos: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Blend {
+    #[default]
+    Alpha,
+    Add,
+    Sub,
+    Multiply,
+    Screen,
+    /// Replace destination (no blending).
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Shade {
+    #[default]
+    Sprite,
+    Fill,
+    Text,
+    Mono,
+    Nega,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PipeKey {
+    Sprite(Shade, Blend),
+    /// sprite masked by a screen-space rule image (per-layer rule fades)
+    Rule(Blend),
+    Transition,
+    Blur,
+    Copy,
+}
+
+/// Screen-space rule mask for a quad: visible where `rule < progress` (with soft edge `vague`).
+#[derive(Clone)]
+pub struct RuleMask {
+    pub tex: TexRef,
+    pub progress: f32,
+    pub vague: f32,
+}
+
+pub struct GpuTexture {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GpuTexture {
+    /// UV coordinates of the bottom-right corner of the logical image (block-compressed
+    /// textures are padded to whole blocks).
+    pub fn uv_max(&self) -> [f32; 2] {
+        let s = self.texture.size();
+        [self.width as f32 / s.width as f32, self.height as f32 / s.height as f32]
+    }
+}
+
+pub type TexRef = Arc<GpuTexture>;
+
+/// An offscreen render target that can also be sampled.
+pub struct RenderTarget {
+    pub tex: TexRef,
+}
+
+#[derive(Clone)]
+pub struct Quad {
+    pub tex: TexRef,
+    /// Corner positions in canvas pixels: top-left, top-right, bottom-right, bottom-left.
+    pub pos: [[f32; 2]; 4],
+    /// Texture coordinates for the same corners.
+    pub uv: [[f32; 2]; 4],
+    pub color: [f32; 4],
+    pub blend: Blend,
+    pub shade: Shade,
+    /// Optional convex clip polygon (canvas pixels, any winding).
+    pub clip: Option<[[f32; 2]; 4]>,
+    pub rule: Option<RuleMask>,
+}
+
+/// Clip a convex polygon against a convex clip polygon (Sutherland-Hodgman).
+/// Each vertex carries (x, y, u, v).
+fn clip_poly(subject: Vec<[f32; 4]>, clip: &[[f32; 2]; 4]) -> Vec<[f32; 4]> {
+    // orientation of the clip polygon
+    let area: f32 = (0..4)
+        .map(|i| {
+            let (a, b) = (clip[i], clip[(i + 1) % 4]);
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum();
+    let sign = if area >= 0.0 { 1.0 } else { -1.0 };
+    let mut out = subject;
+    for i in 0..4 {
+        if out.is_empty() {
+            break;
+        }
+        let (a, b) = (clip[i], clip[(i + 1) % 4]);
+        let side = |p: &[f32; 4]| sign * ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]));
+        let input = std::mem::take(&mut out);
+        for k in 0..input.len() {
+            let cur = input[k];
+            let prev = input[(k + input.len() - 1) % input.len()];
+            let (dc, dp) = (side(&cur), side(&prev));
+            if dc >= 0.0 {
+                if dp < 0.0 {
+                    let t = dp / (dp - dc);
+                    out.push(std::array::from_fn(|j| prev[j] + (cur[j] - prev[j]) * t));
+                }
+                out.push(cur);
+            } else if dp >= 0.0 {
+                let t = dp / (dp - dc);
+                out.push(std::array::from_fn(|j| prev[j] + (cur[j] - prev[j]) * t));
+            }
+        }
+    }
+    out
+}
+
+impl Quad {
+    /// Axis-aligned quad covering `rect` (x, y, w, h) in canvas pixels with the whole texture.
+    pub fn rect(tex: TexRef, rect: [f32; 4], color: [f32; 4]) -> Self {
+        let [x, y, w, h] = rect;
+        Self {
+            tex,
+            pos: [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+            uv: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            color,
+            blend: Blend::Alpha,
+            shade: Shade::Sprite,
+            clip: None,
+            rule: None,
+        }
+    }
+
+    pub fn with_uv_rect(mut self, u0: f32, v0: f32, u1: f32, v1: f32) -> Self {
+        self.uv = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+        self
+    }
+}
+
+pub struct Renderer {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pub bc_supported: bool,
+    sampler: wgpu::Sampler,
+    sprite_layout: wgpu::BindGroupLayout,
+    trans_layout: wgpu::BindGroupLayout,
+    module: wgpu::ShaderModule,
+    sprite_pl: wgpu::PipelineLayout,
+    trans_pl: wgpu::PipelineLayout,
+    pipelines: HashMap<(PipeKey, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    pub white: TexRef,
+}
+
+pub enum Upload<'a> {
+    Rgba8(&'a [u8]),
+    Bc7(&'a [u8]),
+    Bc1(&'a [u8]),
+    Bc3(&'a [u8]),
+    R8(&'a [u8]),
+}
+
+impl Renderer {
+    pub fn new(window: Arc<impl wgpu::DisplayAndWindowHandle + 'static>, width: u32, height: u32) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            flags: wgpu::InstanceFlags::default(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let surface = instance.create_surface(window).context("creating surface")?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .context("no suitable GPU adapter")?;
+        tracing::info!("adapter: {:?}", adapter.get_info());
+        let bc_supported = adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("knife"),
+            required_features: if bc_supported {
+                wgpu::Features::TEXTURE_COMPRESSION_BC
+            } else {
+                wgpu::Features::empty()
+            },
+            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+            ..Default::default()
+        }))
+        .context("creating device")?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
+            .into_iter()
+            .find(|f| caps.formats.contains(f))
+            .unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            color_space: Default::default(),
+        };
+        surface.configure(&device, &config);
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linear"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let samp_entry = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sprite"),
+            entries: &[tex_entry(0), samp_entry],
+        });
+        let trans_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("transition"),
+            entries: &[
+                tex_entry(0),
+                samp_entry,
+                tex_entry(2),
+                tex_entry(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("knife shaders"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sprite"),
+            bind_group_layouts: &[Some(&sprite_layout)],
+            immediate_size: 0,
+        });
+        let trans_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transition"),
+            bind_group_layouts: &[Some(&trans_layout)],
+            immediate_size: 0,
+        });
+
+        let white = upload_texture(&device, &queue, &sprite_layout, &sampler, 1, 1, Upload::Rgba8(&[255, 255, 255, 255]), "white");
+        Ok(Self {
+            device,
+            queue,
+            surface,
+            config,
+            bc_supported,
+            sampler,
+            sprite_layout,
+            trans_layout,
+            module,
+            sprite_pl,
+            trans_pl,
+            pipelines: HashMap::new(),
+            white,
+        })
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    fn bind_group_for(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        make_bind_group(&self.device, &self.sprite_layout, &self.sampler, view)
+    }
+
+    /// Upload a texture. `width`/`height` are the logical size; block data must cover
+    /// whole 4x4 blocks.
+    pub fn upload(&self, width: u32, height: u32, data: Upload, label: &str) -> TexRef {
+        upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, label)
+    }
+
+    /// Update a sub-rectangle of an RGBA8/R8 texture (glyph atlas, movie frames).
+    pub fn write_region(&self, tex: &GpuTexture, x: u32, y: u32, w: u32, h: u32, bpp: u32, data: &[u8]) {
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * bpp),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Empty writable texture (for atlases / movie frames).
+    pub fn create_writable(&self, width: u32, height: u32, r8: bool, label: &str) -> TexRef {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: if r8 { wgpu::TextureFormat::R8Unorm } else { wgpu::TextureFormat::Rgba8Unorm },
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = self.bind_group_for(&view);
+        Arc::new(GpuTexture {
+            texture,
+            view,
+            bind_group,
+            width,
+            height,
+        })
+    }
+
+    pub fn create_target(&self, width: u32, height: u32, label: &str) -> RenderTarget {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = self.bind_group_for(&view);
+        RenderTarget {
+            tex: Arc::new(GpuTexture {
+                texture,
+                view,
+                bind_group,
+                width,
+                height,
+            }),
+        }
+    }
+
+    fn pipeline(&mut self, key: PipeKey, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        if !self.pipelines.contains_key(&(key, format)) {
+            let (fs, blend, layout) = match key {
+                PipeKey::Sprite(shade, blend) => (
+                    match shade {
+                        Shade::Sprite => "fs_sprite",
+                        Shade::Fill => "fs_fill",
+                        Shade::Text => "fs_text",
+                        Shade::Mono => "fs_mono",
+                        Shade::Nega => "fs_nega",
+                    },
+                    blend_state(blend),
+                    &self.sprite_pl,
+                ),
+                PipeKey::Rule(blend) => ("fs_rule", blend_state(blend), &self.trans_pl),
+                PipeKey::Transition => ("fs_transition", None, &self.trans_pl),
+                PipeKey::Blur => ("fs_blur", None, &self.trans_pl),
+                PipeKey::Copy => ("fs_copy", None, &self.sprite_pl),
+            };
+            let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fs),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &self.module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipelines.insert((key, format), p);
+        }
+        &self.pipelines[&(key, format)]
+    }
+
+    /// Draw quads into a render target, optionally clearing it first.
+    pub fn draw(&mut self, encoder: &mut wgpu::CommandEncoder, target: &RenderTarget, clear: Option<[f32; 4]>, quads: &[Quad]) {
+        let (tw, th) = (target.tex.width as f32, target.tex.height as f32);
+        let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
+        // vertex range of each quad
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(quads.len());
+        for q in quads {
+            let start = verts.len() as u32;
+            let mk = |p: [f32; 4]| Vertex {
+                pos: [p[0] / tw * 2.0 - 1.0, 1.0 - p[1] / th * 2.0],
+                uv: [p[2], p[3]],
+                color: q.color,
+            };
+            let corners: Vec<[f32; 4]> = (0..4).map(|i| [q.pos[i][0], q.pos[i][1], q.uv[i][0], q.uv[i][1]]).collect();
+            let poly = match &q.clip {
+                Some(c) => clip_poly(corners, c),
+                None => corners,
+            };
+            for k in 1..poly.len().saturating_sub(1) {
+                verts.extend_from_slice(&[mk(poly[0]), mk(poly[k]), mk(poly[k + 1])]);
+            }
+            ranges.push((start, verts.len() as u32));
+        }
+        // make sure all pipelines exist before borrowing them in the pass
+        for q in quads {
+            match q.rule {
+                Some(_) => self.pipeline(PipeKey::Rule(q.blend), TARGET_FORMAT),
+                None => self.pipeline(PipeKey::Sprite(q.shade, q.blend), TARGET_FORMAT),
+            };
+        }
+        // per-quad bind groups for rule-masked quads
+        let rule_groups: Vec<Option<wgpu::BindGroup>> = quads
+            .iter()
+            .map(|q| {
+                let m = q.rule.as_ref()?;
+                Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.vague, tw, th]))
+            })
+            .collect();
+        let vbuf = (!verts.is_empty()).then(|| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("quads"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("draw"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.tex.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: match clear {
+                        Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
+                            r: r as f64,
+                            g: g as f64,
+                            b: b as f64,
+                            a: a as f64,
+                        }),
+                        None => wgpu::LoadOp::Load,
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let Some(vbuf) = vbuf else { return };
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        let mut i = 0;
+        while i < quads.len() {
+            let q = &quads[i];
+            if let Some(bg) = &rule_groups[i] {
+                pass.set_pipeline(&self.pipelines[&(PipeKey::Rule(q.blend), TARGET_FORMAT)]);
+                pass.set_bind_group(0, bg, &[]);
+                let (a, b) = ranges[i];
+                if b > a {
+                    pass.draw(a..b, 0..1);
+                }
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < quads.len()
+                && Arc::ptr_eq(&quads[j].tex, &q.tex)
+                && quads[j].blend == q.blend
+                && quads[j].shade == q.shade
+                && quads[j].rule.is_none()
+            {
+                j += 1;
+            }
+            let p = &self.pipelines[&(PipeKey::Sprite(q.shade, q.blend), TARGET_FORMAT)];
+            pass.set_pipeline(p);
+            pass.set_bind_group(0, &q.tex.bind_group, &[]);
+            let (a, b) = (ranges[i].0, ranges[j - 1].1);
+            if b > a {
+                pass.draw(a..b, 0..1);
+            }
+            i = j;
+        }
+    }
+
+    /// Full-target transition from `old` to `new` (optionally through a rule image).
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &RenderTarget,
+        old: &GpuTexture,
+        new: &GpuTexture,
+        rule: Option<&GpuTexture>,
+        progress: f32,
+        vague: f32,
+        invert: bool,
+    ) {
+        self.pipeline(PipeKey::Transition, TARGET_FORMAT);
+        let params: [f32; 4] = [progress, vague, rule.is_some() as u32 as f32, invert as u32 as f32];
+        let rule_view = rule.map(|r| &r.view).unwrap_or(&self.white.view);
+        let bg = self.trans_bind_group(&old.view, &new.view, rule_view, params);
+        let verts = fullscreen_verts([1.0; 4]);
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fullscreen"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let p = &self.pipelines[&(PipeKey::Transition, TARGET_FORMAT)];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("transition"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &dst.tex.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        pass.draw(0..6, 0..1);
+    }
+
+    fn trans_bind_group(
+        &self,
+        t0: &wgpu::TextureView,
+        t1: &wgpu::TextureView,
+        t2: &wgpu::TextureView,
+        params: [f32; 4],
+    ) -> wgpu::BindGroup {
+        let ubuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("effect params"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("effect"),
+            layout: &self.trans_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(t1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(t2),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: ubuf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// One separable gaussian blur pass of `src` into `dst` along `dir` (pixels per tap).
+    pub fn blur(&mut self, encoder: &mut wgpu::CommandEncoder, src: &GpuTexture, dst: &RenderTarget, dir: [f32; 2], sigma: f32) {
+        self.pipeline(PipeKey::Blur, TARGET_FORMAT);
+        let bg = self.trans_bind_group(&src.view, &self.white.view, &self.white.view, [dir[0], dir[1], sigma, 0.0]);
+        let verts = fullscreen_verts([1.0; 4]);
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fullscreen"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let p = &self.pipelines[&(PipeKey::Blur, TARGET_FORMAT)];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blur"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &dst.tex.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        pass.draw(0..6, 0..1);
+    }
+
+    pub fn copy_target(&self, encoder: &mut wgpu::CommandEncoder, src: &RenderTarget, dst: &RenderTarget) {
+        encoder.copy_texture_to_texture(
+            src.tex.texture.as_image_copy(),
+            dst.tex.texture.as_image_copy(),
+            wgpu::Extent3d {
+                width: src.tex.width,
+                height: src.tex.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn encoder(&self) -> wgpu::CommandEncoder {
+        self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+    }
+
+    /// Scale `canvas` into the window (letterboxed), then submit and present.
+    pub fn present(&mut self, mut encoder: wgpu::CommandEncoder, canvas: &RenderTarget) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                self.queue.submit([encoder.finish()]);
+                return;
+            }
+            _ => {
+                self.queue.submit([encoder.finish()]);
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let format = self.config.format;
+        self.pipeline(PipeKey::Copy, format);
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let scale = (sw / CANVAS_W as f32).min(sh / CANVAS_H as f32);
+        let (w, h) = (CANVAS_W as f32 * scale, CANVAS_H as f32 * scale);
+        let (x, y) = ((sw - w) / 2.0, (sh - h) / 2.0);
+        let ndc = |px: f32, py: f32| [px / sw * 2.0 - 1.0, 1.0 - py / sh * 2.0];
+        let c = [1.0; 4];
+        let v = |p: [f32; 2], uv: [f32; 2]| Vertex { pos: p, uv, color: c };
+        let verts = [
+            v(ndc(x, y), [0.0, 0.0]),
+            v(ndc(x + w, y), [1.0, 0.0]),
+            v(ndc(x + w, y + h), [1.0, 1.0]),
+            v(ndc(x, y), [0.0, 0.0]),
+            v(ndc(x + w, y + h), [1.0, 1.0]),
+            v(ndc(x, y + h), [0.0, 1.0]),
+        ];
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("present"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        {
+            let p = &self.pipelines[&(PipeKey::Copy, format)];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(p);
+            pass.set_bind_group(0, &canvas.tex.bind_group, &[]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.draw(0..6, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(frame);
+    }
+
+    /// Read a render target back to RGBA8 (for save thumbnails / debugging).
+    pub fn read_target(&self, target: &RenderTarget) -> Vec<u8> {
+        let (w, h) = (target.tex.width, target.tex.height);
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.encoder();
+        enc.copy_texture_to_buffer(
+            target.tex.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("mapping readback buffer");
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            out.extend_from_slice(&data[(y * row) as usize..(y * row + w * 4) as usize]);
+        }
+        out
+    }
+}
+
+fn fullscreen_verts(color: [f32; 4]) -> [Vertex; 6] {
+    let v = |x: f32, y: f32, u: f32, w: f32| Vertex {
+        pos: [x, y],
+        uv: [u, w],
+        color,
+    };
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
+    use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
+    let alpha = C {
+        src_factor: F::One,
+        dst_factor: F::OneMinusSrcAlpha,
+        operation: O::Add,
+    };
+    let color = match b {
+        Blend::Opaque => return None,
+        Blend::Alpha => alpha,
+        Blend::Add => C {
+            src_factor: F::One,
+            dst_factor: F::One,
+            operation: O::Add,
+        },
+        Blend::Sub => C {
+            src_factor: F::One,
+            dst_factor: F::One,
+            operation: O::ReverseSubtract,
+        },
+        Blend::Multiply => C {
+            src_factor: F::Dst,
+            dst_factor: F::OneMinusSrcAlpha,
+            operation: O::Add,
+        },
+        Blend::Screen => C {
+            src_factor: F::One,
+            dst_factor: F::OneMinusSrc,
+            operation: O::Add,
+        },
+    };
+    Some(wgpu::BlendState {
+        color,
+        alpha: C {
+            src_factor: F::Zero,
+            dst_factor: F::One,
+            operation: O::Add,
+        },
+    })
+}
+
+fn make_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, view: &wgpu::TextureView) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+/// Upload a texture. `width`/`height` are the logical size; block data must cover
+/// whole 4x4 blocks.
+#[allow(clippy::too_many_arguments)]
+fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+    data: Upload,
+    label: &str,
+) -> TexRef {
+    let (format, bytes, block) = match data {
+        Upload::Rgba8(d) => (wgpu::TextureFormat::Rgba8Unorm, d, 1),
+        Upload::Bc7(d) => (wgpu::TextureFormat::Bc7RgbaUnorm, d, 4),
+        Upload::Bc1(d) => (wgpu::TextureFormat::Bc1RgbaUnorm, d, 4),
+        Upload::Bc3(d) => (wgpu::TextureFormat::Bc3RgbaUnorm, d, 4),
+        Upload::R8(d) => (wgpu::TextureFormat::R8Unorm, d, 1),
+    };
+    let (pw, ph) = (width.div_ceil(block) * block, height.div_ceil(block) * block);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytes,
+    );
+    let view = texture.create_view(&Default::default());
+    let bind_group = make_bind_group(device, layout, sampler, &view);
+    Arc::new(GpuTexture {
+        texture,
+        view,
+        bind_group,
+        width,
+        height,
+    })
+}

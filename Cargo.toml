@@ -1,0 +1,22 @@
+[workspace]
+members = ["knife-core", "kdu", "knife-render", "knife-audio", "knife"]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+tracing = "0.1.44"
+flate2 = "1.0.35"
+memmap2 = "0.9.5"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+clap = { version = "4.6.7", features = ["derive"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+glam = "0.34.1"
+wgpu = "30.0.1"
+winit = "0.30.13"
+kira = { version = "0.12.5", default-features = false, features = ["cpal"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = true

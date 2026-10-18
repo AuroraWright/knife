@@ -1,0 +1,23 @@
+[package]
+name = "knife"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+knife-core = { path = "../knife-core" }
+knife-render = { path = "../knife-render" }
+knife-audio = { path = "../knife-audio" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+clap = { workspace = true }
+image = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+ab_glyph = "0.2.32"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+dirs = "7.0.0"
+parking_lot = "0.12.5"

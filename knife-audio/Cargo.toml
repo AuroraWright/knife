@@ -1,0 +1,12 @@
+[package]
+name = "knife-audio"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+kira = { workspace = true }
+opus = "0.4.0"
+parking_lot = "0.12.5"
