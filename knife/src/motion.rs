@@ -130,48 +130,85 @@ impl MotionTable {
         }
     }
 
+    /// The motion's alpha (0..255) at time `t`, as `advance` would set it.
+    pub fn alpha_at(&self, id: i32, t: f32) -> Option<f32> {
+        let (t, _) = self.local_time(id, t);
+        self.sample(id, field::ALPHA, t)
+    }
+
     pub fn loops(&self, id: i32) -> bool {
         self.loops.contains_key(&(id as u16))
     }
 
-    /// Value of `f` at local time `t`, or None when the motion does not animate it.
+    /// Value of `f` at local time `t`, or None when the motion leaves it alone (sub_97710). The segment is
+    /// bounded by keys of any field: it ends at the first key at or after `t` (skipping HOLD values of `f`)
+    /// and starts at the time of the key before that, taking the value of `f` from there or, when that key
+    /// does not set `f`, from the last earlier key that does. Ease comes from the nearest earlier key that is
+    /// not HOLD for `f` and defines one; interpolation (2 = step, 1 = spline, else linear) from the nearest
+    /// earlier key that defines it. A segment ending in a key without `f` holds the last value.
+    /// Splines (72 keys in the table, sub_972C0) are drawn linear here.
     pub fn sample(&self, id: i32, f: usize, t: f32) -> Option<f32> {
         let (s, e) = self.range(id)?;
         let keys = &self.keys[s..e];
-        let none = |v: i32| v == NO_KEY || v == HOLD || (f == field::ROT && v <= NO_KEY_WIDE);
-        let mut prev: Option<usize> = None;
-        let mut next: Option<usize> = None;
-        for (i, k) in keys.iter().enumerate() {
-            if none(k[f]) {
-                continue;
-            }
-            if k[field::TIME] as f32 <= t {
-                prev = Some(i);
-            } else {
-                next = Some(i);
-                break;
-            }
+        let time = |i: usize| keys[i][field::TIME] as f32;
+        let no = |v: i32| v == NO_KEY || (f == field::ROT && v <= NO_KEY_WIDE);
+        let hold = |v: i32| v == HOLD;
+        let defined = |v: i32| !no(v) && !hold(v);
+        let last = keys.len() - 1;
+        if t < time(0) {
+            return None;
         }
-        let (a, b) = match (prev, next) {
-            (None, None) => return None,
-            (Some(a), None) => return Some(keys[a][f] as f32),
-            (None, Some(b)) => return Some(keys[b][f] as f32),
-            (Some(a), Some(b)) => (a, b),
-        };
-        let (ka, kb) = (&keys[a], &keys[b]);
-        let (va, vb) = (ka[f] as f32, kb[f] as f32);
+        // first key at or after t; past the end the exe samples nothing
+        let a4 = (0..keys.len()).find(|&i| time(i) >= t)?;
+        // segment end value, skipping HOLD keys forward
+        let mut j = a4;
+        while j < last && hold(keys[j][f]) {
+            j += 1;
+        }
+        let target = keys[j][f];
+        if !defined(target) {
+            // no further key sets f: keep the last value set at or before a4
+            return (0..=a4).rev().map(|i| keys[i][f]).find(|&v| defined(v)).map(|v| v as f32);
+        }
+        if a4 == 0 || time(j) <= t {
+            return Some(target as f32);
+        }
+        // segment start: the key before a4 (skipping HOLD); its time, and its value or an earlier one
+        let mut k = a4 - 1;
+        while k > 0 && hold(keys[k][f]) {
+            k -= 1;
+        }
+        let from_t = time(k);
+        let from = (0..=k).rev().map(|i| keys[i][f]).find(|&v| !no(v))?;
+        if hold(from) {
+            return None;
+        }
         // discrete fields step
         if f >= 17 {
+            return Some(from as f32);
+        }
+        let (va, vb) = (from as f32, target as f32);
+        let tb = time(j);
+        let p = if from_t >= tb {
+            1.0
+        } else {
+            let ease_kind = (0..a4)
+                .rev()
+                .filter(|&i| !hold(keys[i][f]))
+                .map(|i| keys[i][field::EASE])
+                .find(|&v| v != NO_KEY && v != HOLD)
+                .unwrap_or(0);
+            ease(ease_kind, (t - from_t) / (tb - from_t))
+        };
+        let interp = (0..a4)
+            .rev()
+            .map(|i| keys[i][field::INTERP])
+            .find(|&v| v != NO_KEY && v != HOLD)
+            .unwrap_or(0);
+        if interp == 2 && f != 15 {
             return Some(va);
         }
-        let interp = ka[field::INTERP];
-        if interp == 2 {
-            return Some(va);
-        }
-        let (ta, tb) = (ka[field::TIME] as f32, kb[field::TIME] as f32);
-        let p = if tb > ta { ((t - ta) / (tb - ta)).clamp(0.0, 1.0) } else { 1.0 };
-        let ease_kind = if ka[field::EASE] == NO_KEY || ka[field::EASE] == HOLD { 0 } else { ka[field::EASE] };
-        Some(va + (vb - va) * ease(ease_kind, p))
+        Some(va + (vb - va) * p)
     }
 }
 

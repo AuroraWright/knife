@@ -1,7 +1,5 @@
 //! CG gallery: which CGs are unlocked (cGalleryMain, sub_4470) and where their thumbnails are.
 
-use std::collections::HashSet;
-
 use crate::gallery_table::{CG_ALIASES, CG_GROUPS};
 
 /// Thumbnail atlas `cg_thumb_all` (CG_THUMB_PARTS_JA): 36 x 55 cells of 154 x 88, indexed by entry id.
@@ -16,10 +14,6 @@ pub struct Entry {
     pub thumb: u16,
     pub width: u16,
     pub height: u16,
-}
-
-pub fn group_count() -> usize {
-    CG_GROUPS.len()
 }
 
 pub fn entry(group: usize, i: usize) -> Option<Entry> {
@@ -56,25 +50,25 @@ fn group_allowed(cond: u32, node: impl Fn(usize) -> bool) -> bool {
 
 /// sub_51E0 / sub_77610: an image counts as seen when it (or, for gallery-only copies, one of
 /// its script aliases) was shown. Sprite aliases match any size letter (A/L/M/S) at position 4.
-fn image_seen(seen: &HashSet<String>, name: &str) -> bool {
-    if seen.contains(name) {
+fn image_seen(seen: &impl Fn(&str) -> bool, name: &str) -> bool {
+    if seen(name) {
         return true;
     }
     let Some((_, aliases)) = CG_ALIASES.iter().find(|(n, _)| *n == name) else { return false };
     aliases.iter().any(|a| {
-        seen.contains(*a)
+        seen(a)
             || (a.len() >= 6
                 && !a.starts_with("IMG")
                 && ['A', 'L', 'M', 'S'].iter().any(|c| {
                     let mut s = a.to_string();
                     s.replace_range(4..5, &c.to_string());
-                    seen.contains(&s)
+                    seen(&s)
                 }))
     })
 }
 
 /// Unlocked entry indices of every group (empty = locked).
-pub fn unlocked(seen: &HashSet<String>, node: impl Fn(usize) -> bool, ending: impl Fn(usize) -> bool) -> Vec<Vec<usize>> {
+pub fn unlocked(seen: impl Fn(&str) -> bool, node: impl Fn(usize) -> bool, ending: impl Fn(usize) -> bool) -> Vec<Vec<usize>> {
     let all = ending(ALL_CG_BIT);
     CG_GROUPS
         .iter()
@@ -82,7 +76,7 @@ pub fn unlocked(seen: &HashSet<String>, node: impl Fn(usize) -> bool, ending: im
             if !group_allowed(*cond, &node) {
                 return Vec::new();
             }
-            (0..entries.len()).filter(|&i| all || image_seen(seen, entries[i].0)).collect()
+            (0..entries.len()).filter(|&i| all || image_seen(&seen, entries[i].0)).collect()
         })
         .collect()
 }
@@ -109,31 +103,33 @@ pub fn music_unlocked(heard: impl Fn(i32) -> bool, node: impl Fn(usize) -> bool,
 /// the openings need their in-game viewing flag.
 pub const MOVIES: &[(usize, Option<u16>)] = &[(4, None), (5, Some(0)), (6, Some(1))];
 
-/// Ending gallery (cGalleryEnding): (flowchart node bit, scene id). Main endings first
-/// (dword_3374EC), then the 21 dead ends (unk_337510).
-pub const ENDINGS: &[(usize, i32)] = &[
-    (544, 1022),
-    (555, 1023),
-    (556, 1000),
-    (533, 1001),
-    (534, 1002),
-    (535, 1003),
-    (536, 1004),
-    (537, 1005),
-    (538, 1006),
-    (539, 1007),
-    (540, 1008),
-    (541, 1009),
-    (542, 1010),
-    (543, 1012),
-    (545, 1013),
-    (546, 1014),
-    (547, 1015),
-    (548, 1016),
-    (549, 1017),
-    (550, 1018),
-    (551, 1019),
-    (552, 1020),
-    (553, 1021),
-    (554, 1024),
+/// Ending gallery (cGalleryEnding, records at 0x3374E8 = {scene id, RDST node bit, confirm}):
+/// (node bit, scene id, SYSMES id of the play confirmation). Main endings first, then the 21 dead ends.
+pub const ENDINGS: &[(usize, i32, usize)] = &[
+    (544, 1011, 1482),
+    (555, 1022, 1493),
+    (556, 1023, 1494),
+    (533, 1000, 1471),
+    (534, 1001, 1472),
+    (535, 1002, 1473),
+    (536, 1003, 1474),
+    (537, 1004, 1475),
+    (538, 1005, 1476),
+    (539, 1006, 1477),
+    (540, 1007, 1478),
+    (541, 1008, 1479),
+    (542, 1009, 1480),
+    (543, 1010, 1481),
+    (545, 1012, 1483),
+    (546, 1013, 1484),
+    (547, 1014, 1485),
+    (548, 1015, 1486),
+    (549, 1016, 1487),
+    (550, 1017, 1488),
+    (551, 1018, 1489),
+    (552, 1019, 1490),
+    (553, 1020, 1491),
+    (554, 1021, 1492),
+    // object 418: QA_25, shown once every ending is completed (sub_926F0(1): RDED 533..556 all set)
+    (557, 1024, 1495),
 ];

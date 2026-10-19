@@ -104,6 +104,11 @@ impl Assets {
         self.text.get(index).unwrap_or("")
     }
 
+    /// Exact image table index of a name (sub_7DFB0).
+    pub fn image_index_of(&self, name: &str) -> Option<usize> {
+        self.image_index.get(&name.to_ascii_uppercase()).copied()
+    }
+
     pub fn image_info(&self, name: &str) -> Option<&ImageInfo> {
         let upper = name.to_ascii_uppercase();
         if let Some(&i) = self.image_index.get(&upper) {
@@ -140,11 +145,19 @@ impl Assets {
 
     /// Load (and cache) an image by script name. Returns None when it does not exist.
     pub fn image(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
-        let key = name.to_ascii_uppercase();
+        self.image_graded(r, name, 0)
+    }
+
+    /// Load (and cache) an image with an STEC colour grade applied (`grade::apply`; 0 = none). The exe keys
+    /// its texture cache (sub_AAA40) the same way, by image and STEC mode.
+    pub fn image_graded(&mut self, r: &Renderer, name: &str, grade: i32) -> Option<Arc<Image>> {
+        let grade = if crate::grade::is_grade(grade) { grade } else { 0 };
+        let name = name.to_ascii_uppercase();
+        let key = if grade == 0 { name.clone() } else { format!("{name}#{grade}") };
         if let Some(i) = self.images.get(&key) {
             return i.clone();
         }
-        let img = match self.load_image(r, &key) {
+        let img = match self.load_image(r, &name, grade) {
             Ok(i) => Some(Arc::new(i)),
             Err(e) => {
                 tracing::warn!("image {name}: {e:#}");
@@ -163,9 +176,15 @@ impl Assets {
         self.images.retain(|_, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1));
     }
 
-    fn load_image(&self, r: &Renderer, name: &str) -> Result<Image> {
+    fn load_image(&self, r: &Renderer, name: &str, grade: i32) -> Result<Image> {
         let data = self.image_bytes(name).context("not found")?;
-        let tex = upload_image(r, &data, name)?;
+        let tex = if grade == 0 {
+            upload_image(r, &data, name)?
+        } else {
+            let (w, h, mut px) = decode_image(&data)?;
+            crate::grade::apply(grade, &mut px);
+            r.upload(w, h, Upload::Rgba8(&px), name)
+        };
         let (width, height, center_x, center_y) = match self.image_info(name) {
             Some(i) => (i.width, i.height, i.center_x, i.center_y),
             None => {
@@ -184,6 +203,14 @@ impl Assets {
         })
     }
 
+    /// Flowchart node preview: allpaccg entry `thumcg_top.mzp` + 1 + n (GALLERY_FC_THnnnn), by stem.
+    pub fn flow_preview_name(&self, n: i32) -> Option<String> {
+        let a = self.allpaccg.as_ref()?;
+        let i = a.find_stem("THUMCG_TOP")? + 1 + usize::try_from(n).ok()?;
+        let name = &a.entries().get(i)?.name;
+        Some(name.split('.').next().unwrap_or(name).to_string())
+    }
+
     /// Load a UI texture atlas (BNTX in allui) by entry stem; returns all textures by name.
     pub fn ui_textures(&self, r: &Renderer, stem: &str) -> Result<Vec<(String, TexRef)>> {
         let i = self.allui.find_stem(stem).with_context(|| format!("{stem} not in allui"))?;
@@ -194,6 +221,17 @@ impl Assets {
             out.push((t.name.clone(), tex));
         }
         Ok(out)
+    }
+
+    /// parts.mrg (no name table; the boot sequence loads entries by index, sub_B4A20 archive slot 27):
+    /// 0 logo_fix, 1 caution2 (both cautions on one screen), 2 caution, 3 caution1.
+    pub fn parts_texture(&self, r: &Renderer, index: usize) -> Option<TexRef> {
+        let load = || -> Result<TexRef> {
+            let data = Archive::open(&self.romfs, "parts")?.read(index)?;
+            let t = bntx::parse(&data)?.into_iter().next().context("empty BNTX")?;
+            upload_bntx(r, &t)
+        };
+        load().map_err(|e| tracing::warn!("parts #{index}: {e:#}")).ok()
     }
 
     /// SYSMES_TEXT.DAT: system strings indexed by id (u32 lang count, u32 count, u64 0, u64 table offset,
@@ -278,6 +316,16 @@ pub fn upload_bntx(r: &Renderer, t: &bntx::Texture) -> Result<TexRef> {
             r.upload(t.width, t.height, Upload::Rgba8(&rgba), label)
         }
     })
+}
+
+/// Decode an archive image (BNTX, JPEG or PNG) to RGBA8: (width, height, pixels).
+fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    if bntx::is_bntx(data) {
+        let t = bntx::parse(data)?.into_iter().next().context("empty BNTX")?;
+        return Ok((t.width, t.height, bntx_decode::to_rgba8(&t)?));
+    }
+    let img = image::load_from_memory(data).context("decoding image")?.to_rgba8();
+    Ok((img.width(), img.height(), img.into_raw()))
 }
 
 /// Upload an archive image (BNTX, JPEG or PNG).

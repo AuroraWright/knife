@@ -12,15 +12,30 @@ pub struct Volumes {
     pub bgm: f32,
     pub se: f32,
     pub voice: f32,
+    pub bgm_mute: bool,
+    pub se_mute: bool,
+}
+
+impl Volumes {
+    fn bgm_level(&self) -> f32 {
+        if self.bgm_mute { 0.0 } else { self.bgm }
+    }
+
+    fn se_level(&self) -> f32 {
+        if self.se_mute { 0.0 } else { self.se }
+    }
 }
 
 impl Default for Volumes {
     fn default() -> Self {
         Self {
             master: 1.0,
-            bgm: 0.8,
-            se: 0.9,
+            // config defaults 40 / 40 (0x46B080), linear x 0.01 (sub_9B7F0)
+            bgm: 0.4,
+            se: 0.4,
             voice: 1.0,
+            bgm_mute: false,
+            se_mute: false,
         }
     }
 }
@@ -49,6 +64,10 @@ pub struct Sound {
     loops: HashMap<i32, (String, f32)>,
     voice: Option<Voice>,
     movie: Option<Voice>,
+    /// sound players 4..7 for system sounds; sub_ACEF0 and sub_ACFA0 each cycle them with their own counter
+    /// (dword_18C04E8 / dword_18C04EC), stopping what the player was playing
+    sys: [Option<Voice>; 4],
+    sys_next: [usize; 2],
     bgm_cache: HashMap<i32, (Arc<Pcm>, f32)>,
     tx: mpsc::Sender<(u64, i32, anyhow::Result<(Pcm, f32)>)>,
     rx: mpsc::Receiver<(u64, i32, anyhow::Result<(Pcm, f32)>)>,
@@ -67,6 +86,8 @@ impl Sound {
             loops: HashMap::new(),
             voice: None,
             movie: None,
+            sys: Default::default(),
+            sys_next: [0; 2],
             bgm_cache: HashMap::new(),
             tx,
             rx,
@@ -110,7 +131,7 @@ impl Sound {
     }
 
     fn start_bgm(&mut self, id: i32, pcm: Arc<Pcm>, base: f32, volume: f32, fade_in: f64) {
-        let v = self.audio.play(pcm, volume * base * self.vol.bgm * self.vol.master, fade_in, true);
+        let v = self.audio.play(pcm, volume * base * self.vol.bgm_level() * self.vol.master, fade_in, true);
         self.bgm = Some(Bgm {
             id,
             voice: Some(v),
@@ -151,8 +172,15 @@ impl Sound {
         }
     }
 
+    /// Music player pause: holds the BGM at its position.
+    pub fn set_bgm_paused(&mut self, paused: bool) {
+        if let Some(v) = self.bgm.as_ref().and_then(|b| b.voice.as_ref()) {
+            v.set_paused(paused);
+        }
+    }
+
     pub fn set_bgm_volume(&mut self, volume: f32, secs: f64) {
-        let (m, c) = (self.vol.master, self.vol.bgm);
+        let (m, c) = (self.vol.master, self.vol.bgm_level());
         if let Some(p) = &mut self.pending {
             p.volume = volume;
         }
@@ -173,7 +201,7 @@ impl Sound {
         } else {
             self.loops.remove(&ch);
         }
-        let v = self.audio.play(pcm, volume * self.vol.se * self.vol.master, fade_in, looping);
+        let v = self.audio.play(pcm, volume * self.vol.se_level() * self.vol.master, fade_in, looping);
         self.se.insert(ch, (v, volume));
     }
 
@@ -211,7 +239,7 @@ impl Sound {
     }
 
     pub fn set_se_volume(&mut self, ch: i32, volume: f32, secs: f64) {
-        let k = self.vol.se * self.vol.master;
+        let k = self.vol.se_level() * self.vol.master;
         for (c, (n, vol)) in self.loops.iter_mut() {
             let _ = n;
             if ch < 0 || *c == ch {
@@ -234,9 +262,26 @@ impl Sound {
         }
     }
 
-    pub fn play_voice(&mut self, pcm: Arc<Pcm>) {
+    /// A system sound on the next sound player of counter `k` (0 sub_ACEF0, 1 sub_ACFA0) at `volume`
+    /// (already scaled by its category).
+    pub fn play_sys(&mut self, k: usize, pcm: Arc<Pcm>, volume: f32) {
+        let slot = self.sys_next[k];
+        self.sys_next[k] = (slot + 1) % 4;
+        if let Some(v) = self.sys[slot].take() {
+            v.stop(0.0);
+        }
+        self.sys[slot] = Some(self.audio.play(pcm, volume * self.vol.master, 0.0, false));
+    }
+
+    /// The SE volume (`se_level`), for sub_ACFA0.
+    pub fn se_volume(&self) -> f32 {
+        self.vol.se_level()
+    }
+
+    /// A voice at `gain` times the voice volume (the speaker's config row volume).
+    pub fn play_voice_gain(&mut self, pcm: Arc<Pcm>, gain: f32) {
         self.stop_voice();
-        self.voice = Some(self.audio.play(pcm, self.vol.voice * self.vol.master, 0.0, false));
+        self.voice = Some(self.audio.play(pcm, gain * self.vol.voice * self.vol.master, 0.0, false));
     }
 
     pub fn stop_voice(&mut self) {
@@ -247,7 +292,7 @@ impl Sound {
 
     pub fn play_movie_audio(&mut self, pcm: Arc<Pcm>) {
         self.stop_movie_audio();
-        self.movie = Some(self.audio.play(pcm, self.vol.bgm * self.vol.master, 0.0, false));
+        self.movie = Some(self.audio.play(pcm, self.vol.bgm_level() * self.vol.master, 0.0, false));
     }
 
     pub fn stop_movie_audio(&mut self) {
@@ -266,10 +311,10 @@ impl Sound {
         if let Some(b) = &self.bgm
             && let Some(v) = &b.voice
         {
-            v.set_volume(b.volume * b.base * self.vol.bgm * m, 0.1);
+            v.set_volume(b.volume * b.base * self.vol.bgm_level() * m, 0.1);
         }
         for (v, vol) in self.se.values() {
-            v.set_volume(vol * self.vol.se * m, 0.1);
+            v.set_volume(vol * self.vol.se_level() * m, 0.1);
         }
     }
 }

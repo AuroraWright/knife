@@ -73,6 +73,8 @@ fn fs_nega(i: VsOut) -> @location(0) vec4<f32> {
 struct TransUniform {
     // x: progress 0..1, y: vagueness (0..1), z: use rule (0/1), w: invert rule
     params: vec4<f32>,
+    // backdrop blends: rule progress (< 0: no rule), vagueness
+    params2: vec4<f32>,
 };
 
 @group(0) @binding(2) var tex1: texture_2d<f32>;
@@ -126,4 +128,76 @@ fn fs_blur(i: VsOut) -> @location(0) vec4<f32> {
 fn fs_copy(i: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(tex0, samp, i.uv);
     return vec4<f32>(t.rgb * i.color.rgb, 1.0);
+}
+
+// Backdrop-reading layer blends (the exe's nexl_nxshader_ps_* family, blend state 7): tex0 = sprite,
+// tex1 = copy of the target taken before this quad, tex2 = optional rule mask.
+// params = (op, fill, target w, target h), params2 = (rule progress or -1, rule vagueness, -, -).
+// Formulas follow the shader disassembly; s = texture rgb * colour rgb, a = texture alpha * colour alpha.
+fn ps_mix(d: vec3<f32>, r: vec3<f32>, a: f32) -> vec3<f32> {
+    return d + a * (r - d);
+}
+
+@fragment
+fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex0, samp, i.uv);
+    let d = textureLoad(tex1, vec2<i32>(i.pos.xy), 0).rgb;
+    var s = t.rgb * i.color.rgb;
+    if (tu.params.y > 0.5) { s = i.color.rgb; }
+    var ca = i.color.a;
+    if (tu.params2.x >= 0.0) {
+        let r = textureSample(tex2, samp, i.pos.xy / tu.params.zw).r;
+        let v = max(tu.params2.y, 0.001);
+        ca *= clamp((tu.params2.x * (1.0 + v) - r) / v, 0.0, 1.0);
+    }
+    let a = t.a * ca;
+    let one = vec3<f32>(1.0);
+    let zero = vec3<f32>(0.0);
+    let op = u32(tu.params.x + 0.5);
+    // the alpha-weighted shaders leave the backdrop alone where a = 0 (their `$p0 exit`)
+    if (a <= 0.0 && op <= 15u) {
+        return vec4<f32>(d, 1.0);
+    }
+    var o = d;
+    switch (op) {
+        case 1u: { o = ps_mix(d, min(d + s, one), a); }
+        case 2u: { o = ps_mix(d, min(d, s), a); }
+        case 3u: { o = ps_mix(d, max(d, s), a); }
+        case 4u: { o = ps_mix(d, max(d + s - one, zero), a); }
+        case 5u: {
+            let r = select(zero, max(one - (one - d) / s, zero), s > zero);
+            o = ps_mix(d, r, a);
+        }
+        case 6u: {
+            let k = max(one - s, zero);
+            o = ps_mix(d, select(one, min(d / k, one), k > zero), a);
+        }
+        case 7u: {
+            let k = max(one - a * s, zero);
+            o = select(zero, min(d / k, one), d > zero);
+        }
+        case 8u: { o = ps_mix(d, abs(d - s), a); }
+        case 9u: { o = abs(d - a * s); }
+        case 10u: { o = ps_mix(d, d + s - 2.0 * d * s, a); }
+        case 11u, 12u: {
+            var h = s;
+            if (op == 12u) { h = min(s / t.a, one); }
+            let r = select(one - 2.0 * (one - h) * (one - d), 2.0 * d * h, h < vec3<f32>(0.5));
+            o = ps_mix(d, r, a);
+        }
+        case 13u: {
+            let r = select(one - 2.0 * (one - s) * (one - d), 2.0 * d * s, d < vec3<f32>(0.5));
+            o = ps_mix(d, r, a);
+        }
+        case 14u: {
+            let r = select(pow(d, one / (2.0 * s)), pow(d, 2.0 - 2.0 * s), s < vec3<f32>(0.5));
+            o = ps_mix(d, r, a);
+        }
+        case 15u: { o = max(d - a * (one - s), zero); }
+        case 16u: { o = min(d + s * ca, one); }
+        case 17u: { o = max(d - ca * (one - s), zero); }
+        case 18u: { o = s; }
+        default: {}
+    }
+    return vec4<f32>(o, 1.0);
 }

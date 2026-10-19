@@ -72,8 +72,23 @@ pub struct Movie {
     shown: u64,
     pub finished: bool,
     pub looping: bool,
+    /// paused: the clock stops and the decoder waits (the title movie under a submenu)
+    pub hold: bool,
     has_frame: bool,
     path: std::path::PathBuf,
+    /// sprite alpha (off_AE01D0 +640): sub_1EC0 raises it by 0.05 a frame from 0 while the movie plays, and
+    /// once playback stops lowers it by 1/30 a frame
+    pub alpha: f32,
+    /// the fade-in runs (off_AE0228; sub_1A80 clears it)
+    fading_in: bool,
+    /// updates since the fade-out reached 0; the player closes 3 later (sub_1EC0 states 1..3)
+    close_steps: u8,
+    /// the player has closed (off_AE0218 == 0): sub_19E0 no longer reports it playing
+    pub closed: bool,
+    /// a looping movie restarts here, in seconds (sub_1C20; the title movies loop from 240 / 30 s)
+    pub loop_start: f32,
+    /// sub_1A30 countdown (dword_AE582C): 4 while the player is not running
+    ready_wait: u8,
 }
 
 fn probe_fps(path: &Path) -> f32 {
@@ -93,9 +108,9 @@ fn probe_fps(path: &Path) -> f32 {
     }
 }
 
-fn spawn_video(path: &Path) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
+fn spawn_video(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{start:.3}"), "-i"])
         .arg(path)
         .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{W}x{H}"), "-"])
         .stdout(Stdio::piped())
@@ -151,7 +166,7 @@ pub fn decode_audio(path: &Path) -> Option<Pcm> {
 impl Movie {
     pub fn open(r: &Renderer, path: &Path, looping: bool) -> Result<Self> {
         let fps = probe_fps(path);
-        let (child, rx) = spawn_video(path)?;
+        let (child, rx) = spawn_video(path, 0.0)?;
         Ok(Self {
             child: Some(child),
             rx,
@@ -161,9 +176,26 @@ impl Movie {
             shown: 0,
             finished: false,
             looping,
+            hold: false,
             has_frame: false,
             path: path.to_path_buf(),
+            alpha: 0.0,
+            fading_in: true,
+            close_steps: 0,
+            closed: false,
+            loop_start: 0.0,
+            ready_wait: 4,
         })
+    }
+
+    /// Playback position in seconds (sub_1AE0).
+    pub fn position(&self) -> f32 {
+        self.elapsed / 1000.0
+    }
+
+    /// sub_1A30: the player has been running for 4 updates.
+    pub fn ready(&self) -> bool {
+        self.ready_wait == 0 && !self.finished
     }
 
     pub fn has_frame(&self) -> bool {
@@ -171,8 +203,22 @@ impl Movie {
     }
 
     pub fn update(&mut self, r: &Renderer, dt: f32) {
+        let frames = dt * 0.06;
         if self.finished {
+            if self.alpha > 0.0 {
+                self.alpha = (self.alpha - frames / 30.0).max(0.0);
+            } else if !self.closed {
+                self.close_steps += 1;
+                self.closed = self.close_steps >= 3;
+            }
             return;
+        }
+        if self.hold {
+            return;
+        }
+        self.ready_wait = if self.has_frame { self.ready_wait.saturating_sub(1) } else { 4 };
+        if self.has_frame && self.fading_in {
+            self.alpha = (self.alpha + 0.05 * frames).min(1.0);
         }
         self.elapsed += dt;
         let due = (self.elapsed / 1000.0 * self.fps) as u64 + 1;
@@ -192,12 +238,12 @@ impl Movie {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if self.looping {
-                        if let Ok((child, rx)) = spawn_video(&self.path) {
+                        if let Ok((child, rx)) = spawn_video(&self.path, self.loop_start) {
                             self.kill();
                             self.child = Some(child);
                             self.rx = rx;
-                            self.elapsed = 0.0;
-                            self.shown = 0;
+                            self.elapsed = self.loop_start * 1000.0;
+                            self.shown = (self.loop_start * self.fps).round() as u64;
                         }
                     } else {
                         self.finished = true;
@@ -219,9 +265,11 @@ impl Movie {
         }
     }
 
+    /// sub_1A80: stops playback; the last frame then fades out.
     pub fn stop(&mut self) {
         self.kill();
         self.finished = true;
+        self.fading_in = false;
     }
 }
 

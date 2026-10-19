@@ -35,6 +35,9 @@ enum Cmd {
     },
     /// Parse every scene and report command counts
     ParseAll,
+    /// Flowchart node starts: JSON {node: [scene, pc, scene name, offset, next offset]} of the first RDST of each
+    /// node (offsets as save records store them)
+    Nodes,
     /// List stream sounds (BGM) in the BFSAR
     Streams,
     /// Decode a sound (BFSAR wave sound name or stream/*.opus file) to WAV
@@ -75,6 +78,30 @@ fn main() -> Result<()> {
                     println!("{:?}", t.images[i]);
                 }
             }
+        }
+        Cmd::Nodes => {
+            let data = std::fs::read(cli.romfs.join("allscr.mrg"))?;
+            let s = script::SceneArchive::parse(&data)?;
+            let mut nodes = std::collections::BTreeMap::new();
+            for i in 0..s.scene_count() {
+                let sc = knife_core::vm::parse::Scene::parse(s.scene(i).unwrap());
+                for (pc, c) in sc.commands.iter().enumerate() {
+                    if c.name == "RDST"
+                        && let Some(n) = c.int(0)
+                    {
+                        // save records address commands by the offset of the `;` before them and the next one
+                        let next = sc.commands.get(pc + 1).map_or(c.offset + 5, |c| c.offset);
+                        nodes.entry(n).or_insert((i, pc, c.offset - 1, next));
+                    }
+                }
+            }
+            let body: Vec<String> = nodes
+                .iter()
+                .map(|(n, (i, pc, off, next))| {
+                    format!("\"{n}\": [{i}, {pc}, \"{}\", {off}, {next}]", s.names.get(*i).map_or("", |n| n.as_str()))
+                })
+                .collect();
+            println!("{{{}}}", body.join(", "));
         }
         Cmd::ParseAll => {
             let data = std::fs::read(cli.romfs.join("allscr.mrg"))?;
@@ -138,7 +165,11 @@ fn main() -> Result<()> {
         }
         Cmd::Extract { archive, name, out } => {
             let a = Archive::open(&cli.romfs, &archive)?;
-            let data = a.read_by_name(&name)?;
+            // `#N` selects an entry by index (archives without a name table, e.g. parts)
+            let data = match name.strip_prefix('#').and_then(|n| n.parse().ok()) {
+                Some(i) => a.read(i)?,
+                None => a.read_by_name(&name)?,
+            };
             if bntx::is_bntx(&data) {
                 for (i, t) in bntx::parse(&data)?.into_iter().enumerate() {
                     let path = out.with_file_name(format!(

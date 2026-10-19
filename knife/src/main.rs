@@ -1,23 +1,31 @@
 //! knife: a reimplementation of the Tsukihime (2021) engine.
 
 mod assets;
+mod flow;
+mod flow_table;
 mod gallery;
+mod grade;
 mod gallery_table;
+mod fx;
 mod game;
 mod motion;
 mod motion_loops;
 mod save;
+mod save_tables;
+mod savedata;
 mod movie;
 mod sound;
 mod stage;
 mod text;
 mod ui;
+mod voice_ids;
 
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use knife_render::{CANVAS_H, CANVAS_W, Renderer};
+use ui::Pad;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
@@ -72,9 +80,29 @@ struct Cli {
     /// Debug: open a UI screen at startup (menu, config, save, load, backlog, flowchart, extra, gallery, cg:GROUP, music, track:N, movies, movie:N, endings, ending:N)
     #[arg(long)]
     screen: Option<String>,
+    /// Debug: open --screen only after this many ms (e.g. to show a backlog after --auto)
+    #[arg(long)]
+    screen_after: Option<u32>,
     /// Debug: jump to a reached flowchart node at startup
     #[arg(long)]
     jump_node: Option<u16>,
+    /// Skip the TYPE-MOON logo movie and the notice shown before the title
+    #[arg(long)]
+    skip_intro: bool,
+    /// Let every story movie be skipped (B, Plus, A or a tap), even unwatched ones the Switch plays through
+    #[arg(long)]
+    skip_movies: bool,
+    /// Debug: set script variables after the start, comma-separated NAME=VALUE (e.g. F822=0)
+    #[arg(long, value_delimiter = ',')]
+    var: Vec<String>,
+    /// Debug: run the launch sequence even with debug options (e.g. --shots)
+    #[arg(long)]
+    boot: bool,
+    /// Debug: scripted input, comma-separated MS:KEY: a controller button (up, down, left, right, a, b, x, y, l, r,
+    /// zl, zr, rup, rdown, minus, plus: tapped, or held from NAME+ to NAME-), menu, click,
+    /// move/X/Y in canvas pixels, press / release of the left button
+    #[arg(long, value_delimiter = ',')]
+    keys: Vec<String>,
 }
 
 struct App {
@@ -113,11 +141,32 @@ impl App {
             None => 0,
         };
         let mut ui = ui::Ui::new(&mut game, &renderer);
-        if !self.cli.title && (self.cli.scene.is_some() || self.cli.shots.is_some() || self.cli.skip) {
+        let debug = self.cli.scene.is_some()
+            || self.cli.shots.is_some()
+            || self.cli.skip
+            || self.cli.title
+            || self.cli.screen.is_some()
+            || self.cli.load_slot.is_some()
+            || self.cli.jump_node.is_some();
+        if !self.cli.title && (self.cli.scene.is_some() || self.cli.shots.is_some() || self.cli.skip) && !self.cli.boot {
             game.start_scene(start, self.cli.label.as_deref());
+            if start != 0 {
+                // START_SCRIPT's lasting state: pages keep their earlier messages (sub_391A0); saves without
+                // it show each message in its own window on the Switch
+                game.set_var_pub("F822", 1);
+            }
+            for v in &self.cli.var {
+                match v.split_once('=').and_then(|(k, n)| Some((k, n.parse().ok()?))) {
+                    Some((k, n)) => game.set_var_pub(k, n),
+                    None => tracing::warn!("--var {v}: expected NAME=VALUE"),
+                }
+            }
             ui.screen = ui::Screen::Game;
+        } else if !debug || self.cli.boot {
+            ui.boot(&mut game, &renderer, self.cli.skip_intro);
         }
         game.auto = self.cli.auto;
+        game.skip_movies = self.cli.skip_movies;
         game.skip = self.cli.skip;
         game.skip_all = self.cli.skip;
         game.auto_choice = self.cli.auto_choice;
@@ -128,7 +177,10 @@ impl App {
                 tracing::warn!("node {n} not reached");
             }
         }
-        if let Some(name) = &self.cli.screen {
+        if let Some(name) = &self.cli.screen
+            && self.cli.load_slot.is_none()
+            && self.cli.screen_after.is_none()
+        {
             ui.debug_open(&mut game, &renderer, name);
         }
         self.window = Some(window);
@@ -172,8 +224,49 @@ impl App {
                 self.cli.save_at = None;
             }
         }
+        if let Some(t) = self.cli.screen_after
+            && self.elapsed >= t as f32
+        {
+            self.cli.screen_after = None;
+            if let Some(name) = &self.cli.screen {
+                ui.debug_open(g, r, name);
+            }
+        }
         if let Some(slot) = self.cli.load_slot.take() {
             ui.debug_load(g, r, slot);
+            // --screen applies on top of the loaded game
+            if let Some(name) = &self.cli.screen {
+                ui.debug_open(g, r, name);
+            }
+        }
+        while let Some((t, k)) = self.cli.keys.first().and_then(|e| e.split_once(':'))
+            && t.parse::<f32>().is_ok_and(|t| self.elapsed >= t)
+        {
+            // a button name taps it; with a trailing + it stays down until the same name with a trailing -
+            if let Some(b) = pad_name(k.trim_end_matches(['+', '-'])) {
+                if !k.ends_with('-') {
+                    ui.pad(g, r, b, true, false);
+                }
+                if !k.ends_with('+') {
+                    ui.pad(g, r, b, false, false);
+                }
+                self.cli.keys.remove(0);
+                continue;
+            }
+            match k {
+                "menu" => ui.cancel(g, r),
+                "click" => ui.click(g, r),
+                "press" => ui.mouse_down(g, r),
+                "release" => ui.mouse_up(g, r),
+                _ if k.starts_with("move/") => {
+                    let v: Vec<f32> = k[5..].split('/').filter_map(|n| n.parse().ok()).collect();
+                    if let [x, y] = v[..] {
+                        ui.mouse_move(g, x, y);
+                    }
+                }
+                _ => tracing::warn!("--keys: unknown key {k}"),
+            }
+            self.cli.keys.remove(0);
         }
         if let Some(dir) = &self.cli.shots
             && self.elapsed >= self.next_shot
@@ -187,14 +280,6 @@ impl App {
                 tracing::warn!("screenshot: {e}");
             }
             tracing::info!("shot {} scene {} pc {}\n{}", path.display(), g.scene_index, g.current_pc(), g.dump_layers());
-        }
-    }
-}
-
-impl App {
-    fn check_quit(&mut self, el: &ActiveEventLoop) {
-        if self.ui.as_ref().is_some_and(|u| u.quit) {
-            el.exit();
         }
     }
 }
@@ -250,22 +335,33 @@ impl ApplicationHandler for App {
                 if let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer) {
                     ui.mouse_move(g, x, y);
                     match button {
-                        MouseButton::Left => ui.click(g, r),
+                        MouseButton::Left => ui.mouse_down(g, r),
                         MouseButton::Right => ui.cancel(g, r),
                         _ => {}
                     }
                 }
-                self.check_quit(el);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer) {
+                    ui.mouse_up(g, r);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                if let (Some(g), Some(ui)) = (&mut self.game, &mut self.ui)
+                // the wheel / trackpad is the right stick
+                if let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer)
                     && dy != 0.0
                 {
-                    ui.wheel(g, dy > 0.0);
+                    let b = if dy > 0.0 { Pad::RUp } else { Pad::RDown };
+                    ui.pad(g, r, b, true, false);
+                    ui.pad(g, r, b, false, false);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -279,18 +375,32 @@ impl ApplicationHandler for App {
             } => {
                 let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer) else { return };
                 let pressed = state == ElementState::Pressed;
+                // the Switch controller on the keyboard (README.md); every screen sees the same buttons
+                let pad = match code {
+                    KeyCode::ArrowUp => Some(Pad::Up),
+                    KeyCode::ArrowDown => Some(Pad::Down),
+                    KeyCode::ArrowLeft => Some(Pad::Left),
+                    KeyCode::ArrowRight => Some(Pad::Right),
+                    KeyCode::Enter | KeyCode::NumpadEnter => Some(Pad::A),
+                    KeyCode::Escape => Some(Pad::B),
+                    KeyCode::KeyB => Some(Pad::X),
+                    KeyCode::KeyM => Some(Pad::Y),
+                    KeyCode::KeyH => Some(Pad::L),
+                    KeyCode::KeyJ => Some(Pad::R),
+                    KeyCode::KeyT => Some(Pad::ZL),
+                    KeyCode::KeyY => Some(Pad::ZR),
+                    KeyCode::KeyK => Some(Pad::RUp),
+                    KeyCode::KeyL => Some(Pad::RDown),
+                    KeyCode::KeyU => Some(Pad::Minus),
+                    KeyCode::KeyI => Some(Pad::Plus),
+                    _ => None,
+                };
+                if let Some(b) = pad {
+                    ui.pad(g, r, b, pressed, repeat);
+                    return;
+                }
                 match code {
-                    KeyCode::ControlLeft | KeyCode::ControlRight => g.set_skip(pressed && ui.in_game()),
-                    KeyCode::Enter | KeyCode::Space | KeyCode::KeyZ if pressed && !repeat => ui.key_nav(g, r, 0, 0, true),
-                    KeyCode::ArrowUp if pressed => ui.key_nav(g, r, -1, 0, false),
-                    KeyCode::ArrowDown if pressed => ui.key_nav(g, r, 1, 0, false),
-                    KeyCode::ArrowLeft if pressed => ui.key_nav(g, r, 0, -1, false),
-                    KeyCode::ArrowRight if pressed => ui.key_nav(g, r, 0, 1, false),
-                    KeyCode::PageUp if pressed => ui.wheel(g, true),
-                    KeyCode::KeyA if pressed && !repeat && ui.in_game() => g.auto = !g.auto,
-                    KeyCode::F5 if pressed && !repeat => ui.quick_save(g, r),
-                    KeyCode::F9 if pressed && !repeat => ui.quick_load(g, r),
-                    KeyCode::Escape | KeyCode::Backspace | KeyCode::KeyX if pressed && !repeat => ui.cancel(g, r),
+                    KeyCode::ControlLeft => g.set_skip(pressed && ui.in_game()),
                     KeyCode::KeyF if pressed && !repeat => {
                         if let Some(w) = &self.window {
                             let fs = w.fullscreen().is_some();
@@ -299,7 +409,6 @@ impl ApplicationHandler for App {
                     }
                     _ => {}
                 }
-                self.check_quit(el);
             }
             _ => {}
         }
@@ -329,4 +438,26 @@ fn main() -> Result<()> {
     };
     el.run_app(&mut app)?;
     Ok(())
+}
+
+fn pad_name(k: &str) -> Option<Pad> {
+    Some(match k {
+        "up" => Pad::Up,
+        "down" => Pad::Down,
+        "left" => Pad::Left,
+        "right" => Pad::Right,
+        "a" => Pad::A,
+        "b" => Pad::B,
+        "x" => Pad::X,
+        "y" => Pad::Y,
+        "l" => Pad::L,
+        "r" => Pad::R,
+        "zl" => Pad::ZL,
+        "zr" => Pad::ZR,
+        "rup" => Pad::RUp,
+        "rdown" => Pad::RDown,
+        "minus" => Pad::Minus,
+        "plus" => Pad::Plus,
+        _ => return None,
+    })
 }

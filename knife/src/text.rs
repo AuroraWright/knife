@@ -239,6 +239,7 @@ fn no_line_start(c: char) -> bool {
     "、。，．・？！゛゜ヽヾゝゞ々ー）］｝」』!),.:;?]}…―ぁぃぅぇぉっゃゅょァィゥェォッャュョ〟’”".contains(c)
 }
 
+#[derive(Clone, Copy)]
 pub struct Layout {
     pub left: f32,
     pub right: f32,
@@ -259,8 +260,9 @@ pub fn layout(
 ) -> (f32, f32, usize) {
     let push_char = |c: char, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>, next: Option<char>| {
         let adv = atlas.advance(c, lay.size);
-        // wrap unless the char is a kinsoku char that may hang into the margin
-        if *x + adv > lay.right && !no_line_start(c) {
+        // sub_391A0 breaks the line once the pen has reached the width (pen - left >= 464 units), so the last
+        // glyph may overhang the right edge; kinsoku chars never start a line
+        if *x >= lay.right && !no_line_start(c) {
             *x = lay.left;
             *baseline += lay.line_height;
         }
@@ -289,7 +291,7 @@ pub fn layout(
             }
             Run::Ruby { base, ruby } => {
                 let bw: f32 = base.chars().map(|c| atlas.advance(c, lay.size)).sum();
-                if x + bw > lay.right {
+                if x + bw - atlas.advance(base.chars().last().unwrap_or(' '), lay.size) >= lay.right {
                     x = lay.left;
                     baseline += lay.line_height;
                 }

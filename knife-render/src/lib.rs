@@ -32,6 +32,51 @@ pub enum Blend {
     Screen,
     /// Replace destination (no blending).
     Opaque,
+    /// A blend computed in the shader from a copy of the target taken just before the quad is drawn (the
+    /// exe's blend state 7, which captures the framebuffer per draw).
+    Ps(PsOp),
+}
+
+/// Backdrop-reading blends of the exe's layer shaders (shader/nexl_nxshader_*.bnsh). With s = texture rgb *
+/// colour rgb, a = texture alpha * colour alpha and d = the backdrop, each writes an opaque colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PsOp {
+    /// ps_add: mix(d, min(d + s, 1), a)
+    Add = 1,
+    /// ps_darken: mix(d, min(d, s), a)
+    Darken,
+    /// ps_lighten: mix(d, max(d, s), a)
+    Lighten,
+    /// ps_sub: mix(d, max(d + s - 1, 0), a)
+    LinearBurn,
+    /// ps_burn: mix(d, s > 0 ? max(1 - (1 - d) / s, 0) : 0, a)
+    Burn,
+    /// ps_dodge: mix(d, 1 - s > 0 ? min(d / (1 - s), 1) : 1, a)
+    Dodge,
+    /// dodge / ps_dodge5: d > 0 ? min(d / max(1 - a s, 0), 1) : 0
+    DodgeAlpha,
+    /// differnce: mix(d, |d - s|, a)
+    Difference,
+    /// differnce5: |d - a s|
+    DifferenceAlpha,
+    /// exclusion: mix(d, d + s - 2 d s, a)
+    Exclusion,
+    /// hardlight: mix(d, s < 0.5 ? 2 d s : 1 - 2 (1 - s)(1 - d), a)
+    HardLight,
+    /// hardlight_ex: hardlight of min(s / texture alpha, 1)
+    HardLightEx,
+    /// overlay: mix(d, d < 0.5 ? 2 d s : 1 - 2 (1 - s)(1 - d), a)
+    Overlay,
+    /// softlight: mix(d, s < 0.5 ? d^(2 - 2 s) : d^(1 / (2 s)), a)
+    SoftLight,
+    /// sub: max(d - a (1 - s), 0)
+    Sub,
+    /// add (ignores texture alpha): min(d + s * colour alpha, 1)
+    AddNoAlpha,
+    /// sub_noalpha (ignores texture alpha): max(d - colour alpha (1 - s), 0)
+    SubNoAlpha,
+    /// noalpha: s, opaque
+    NoAlpha,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -49,6 +94,8 @@ enum PipeKey {
     Sprite(Shade, Blend),
     /// sprite masked by a screen-space rule image (per-layer rule fades)
     Rule(Blend),
+    /// backdrop-reading blend (sprite, backdrop copy, rule mask)
+    Ps,
     Transition,
     Blur,
     Copy,
@@ -174,6 +221,8 @@ pub struct Renderer {
     sprite_pl: wgpu::PipelineLayout,
     trans_pl: wgpu::PipelineLayout,
     pipelines: HashMap<(PipeKey, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    /// per target size: the copy of the target that backdrop blends read
+    backdrops: HashMap<(u32, u32), RenderTarget>,
     pub white: TexRef,
 }
 
@@ -307,6 +356,7 @@ impl Renderer {
             sprite_pl,
             trans_pl,
             pipelines: HashMap::new(),
+            backdrops: HashMap::new(),
             white,
         })
     }
@@ -426,6 +476,7 @@ impl Renderer {
                     &self.sprite_pl,
                 ),
                 PipeKey::Rule(blend) => ("fs_rule", blend_state(blend), &self.trans_pl),
+                PipeKey::Ps => ("fs_ps", None, &self.trans_pl),
                 PipeKey::Transition => ("fs_transition", None, &self.trans_pl),
                 PipeKey::Blur => ("fs_blur", None, &self.trans_pl),
                 PipeKey::Copy => ("fs_copy", None, &self.sprite_pl),
@@ -464,7 +515,8 @@ impl Renderer {
         &self.pipelines[&(key, format)]
     }
 
-    /// Draw quads into a render target, optionally clearing it first.
+    /// Draw quads into a render target, optionally clearing it first. A quad with a backdrop blend
+    /// (`Blend::Ps`) ends the current pass: the target is copied, and the quad is drawn reading that copy.
     pub fn draw(&mut self, encoder: &mut wgpu::CommandEncoder, target: &RenderTarget, clear: Option<[f32; 4]>, quads: &[Quad]) {
         let (tw, th) = (target.tex.width as f32, target.tex.height as f32);
         let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
@@ -489,17 +541,33 @@ impl Renderer {
         }
         // make sure all pipelines exist before borrowing them in the pass
         for q in quads {
-            match q.rule {
-                Some(_) => self.pipeline(PipeKey::Rule(q.blend), TARGET_FORMAT),
-                None => self.pipeline(PipeKey::Sprite(q.shade, q.blend), TARGET_FORMAT),
+            match (q.blend, &q.rule) {
+                (Blend::Ps(_), _) => self.pipeline(PipeKey::Ps, TARGET_FORMAT),
+                (_, Some(_)) => self.pipeline(PipeKey::Rule(q.blend), TARGET_FORMAT),
+                (_, None) => self.pipeline(PipeKey::Sprite(q.shade, q.blend), TARGET_FORMAT),
             };
         }
-        // per-quad bind groups for rule-masked quads
-        let rule_groups: Vec<Option<wgpu::BindGroup>> = quads
+        let has_ps = quads.iter().any(|q| matches!(q.blend, Blend::Ps(_)));
+        if has_ps && !self.backdrops.contains_key(&(target.tex.width, target.tex.height)) {
+            let bd = self.create_target(target.tex.width, target.tex.height, "backdrop");
+            self.backdrops.insert((target.tex.width, target.tex.height), bd);
+        }
+        let backdrop = has_ps.then(|| self.backdrops[&(target.tex.width, target.tex.height)].tex.clone());
+        // per-quad bind groups for rule-masked and backdrop quads
+        let groups: Vec<Option<wgpu::BindGroup>> = quads
             .iter()
-            .map(|q| {
-                let m = q.rule.as_ref()?;
-                Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.vague, tw, th]))
+            .map(|q| match (q.blend, &q.rule) {
+                (Blend::Ps(op), m) => {
+                    let (rule, progress, vague) = match m {
+                        Some(m) => (&m.tex.view, m.progress, m.vague),
+                        None => (&self.white.view, -1.0, 0.0),
+                    };
+                    let fill = if q.shade == Shade::Fill { 1.0 } else { 0.0 };
+                    let bd = backdrop.as_ref().unwrap();
+                    Some(self.effect_bind_group(&q.tex.view, &bd.view, rule, [op as u32 as f32, fill, tw, th, progress, vague, 0.0, 0.0]))
+                }
+                (_, Some(m)) => Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.vague, tw, th])),
+                (_, None) => None,
             })
             .collect();
         let vbuf = (!verts.is_empty()).then(|| {
@@ -509,36 +577,58 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("draw"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.tex.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: match clear {
-                        Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
-                            r: r as f64,
-                            g: g as f64,
-                            b: b as f64,
-                            a: a as f64,
-                        }),
-                        None => wgpu::LoadOp::Load,
-                    },
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        let Some(vbuf) = vbuf else { return };
-        pass.set_vertex_buffer(0, vbuf.slice(..));
         let mut i = 0;
-        while i < quads.len() {
+        let mut clear = clear;
+        loop {
+            // quads up to the next backdrop blend share one pass
+            let end = (i..quads.len()).find(|&k| matches!(quads[k].blend, Blend::Ps(_))).unwrap_or(quads.len());
+            if end > i || clear.is_some() {
+                let mut pass = begin_pass(encoder, target, clear.take());
+                if let Some(vbuf) = &vbuf {
+                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                    self.draw_run(&mut pass, quads, &ranges, &groups, i, end);
+                }
+            }
+            if end == quads.len() {
+                break;
+            }
+            let bd = backdrop.as_ref().unwrap();
+            encoder.copy_texture_to_texture(
+                target.tex.texture.as_image_copy(),
+                bd.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: target.tex.width,
+                    height: target.tex.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let (a, b) = ranges[end];
+            if let (Some(vbuf), Some(bg)) = (&vbuf, &groups[end])
+                && b > a
+            {
+                let mut pass = begin_pass(encoder, target, None);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.set_pipeline(&self.pipelines[&(PipeKey::Ps, TARGET_FORMAT)]);
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(a..b, 0..1);
+            }
+            i = end + 1;
+        }
+    }
+
+    /// Draw quads `i..end` (no backdrop blends) into an open pass, batching runs that share texture and state.
+    fn draw_run(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        quads: &[Quad],
+        ranges: &[(u32, u32)],
+        groups: &[Option<wgpu::BindGroup>],
+        mut i: usize,
+        end: usize,
+    ) {
+        while i < end {
             let q = &quads[i];
-            if let Some(bg) = &rule_groups[i] {
+            if let Some(bg) = &groups[i] {
                 pass.set_pipeline(&self.pipelines[&(PipeKey::Rule(q.blend), TARGET_FORMAT)]);
                 pass.set_bind_group(0, bg, &[]);
                 let (a, b) = ranges[i];
@@ -549,7 +639,7 @@ impl Renderer {
                 continue;
             }
             let mut j = i + 1;
-            while j < quads.len()
+            while j < end
                 && Arc::ptr_eq(&quads[j].tex, &q.tex)
                 && quads[j].blend == q.blend
                 && quads[j].shade == q.shade
@@ -620,6 +710,18 @@ impl Renderer {
         t1: &wgpu::TextureView,
         t2: &wgpu::TextureView,
         params: [f32; 4],
+    ) -> wgpu::BindGroup {
+        let [a, b, c, d] = params;
+        self.effect_bind_group(t0, t1, t2, [a, b, c, d, 0.0, 0.0, 0.0, 0.0])
+    }
+
+    /// Bind group of the effect layout: three textures and two vec4 parameters.
+    fn effect_bind_group(
+        &self,
+        t0: &wgpu::TextureView,
+        t1: &wgpu::TextureView,
+        t2: &wgpu::TextureView,
+        params: [f32; 8],
     ) -> wgpu::BindGroup {
         let ubuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("effect params"),
@@ -823,6 +925,34 @@ fn fullscreen_verts(color: [f32; 4]) -> [Vertex; 6] {
     ]
 }
 
+/// A render pass on `target`, cleared to `clear` or loading what is there.
+fn begin_pass<'a>(encoder: &'a mut wgpu::CommandEncoder, target: &'a RenderTarget, clear: Option<[f32; 4]>) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("draw"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &target.tex.view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: match clear {
+                    Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
+                        r: r as f64,
+                        g: g as f64,
+                        b: b as f64,
+                        a: a as f64,
+                    }),
+                    None => wgpu::LoadOp::Load,
+                },
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
 fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
     use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
     let alpha = C {
@@ -831,7 +961,7 @@ fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
         operation: O::Add,
     };
     let color = match b {
-        Blend::Opaque => return None,
+        Blend::Opaque | Blend::Ps(_) => return None,
         Blend::Alpha => alpha,
         Blend::Add => C {
             src_factor: F::One,

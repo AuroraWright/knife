@@ -82,9 +82,13 @@ pub struct Layer {
     /// Created since the last FADS; not drawn until committed.
     pub pending: bool,
     pub blend: Blend,
+    /// STBR mode as given (-1 none); `blend` is what it renders as
+    pub stbr: i32,
     pub shade: Shade,
     /// STEC colour fill (silhouette), rgb
     pub fill: Option<[f32; 3]>,
+    /// STEC colour grade (modes 2..=82, `grade::apply`) the image was loaded with; 0 = none
+    pub grade: i32,
     pub motion: Option<MotionState>,
     /// Extra offset (script units) from motions / shakes.
     pub offset: (f32, f32),
@@ -148,6 +152,9 @@ pub struct Quake {
     /// remaining ms (negative = forever)
     pub left: f32,
     pub t: f32,
+    /// the SQK2 arguments the save record keeps (quake slot 0, sub_91540): period (3), duration (4),
+    /// fade (5), arg 6 and arg 7
+    pub args: [i32; 5],
 }
 
 /// SSW2: per axis `sign * amp * strength * sin(2pi t / period)`, with amp and period re-rolled
@@ -241,8 +248,10 @@ impl Layer {
             rule: None,
             pending: true,
             blend: Blend::Alpha,
+            stbr: -1,
             shade: Shade::Sprite,
             fill: None,
+            grade: 0,
             motion: None,
             offset: (0.0, 0.0),
             motion_alpha: 1.0,
@@ -320,10 +329,12 @@ pub struct Stage {
     pub shake: (f32, f32),
     /// frames drawn, drives the STNS grain jitter
     pub frame: u32,
-    /// STNS grain textures (noise1, noisehd0)
+    /// STNS grain textures (noisehd0, noisehd1)
     pub noise: Option<[TexRef; 2]>,
     /// The exe's render target 40 that STNS paints into and never clears (owned by Game)
     pub noise_rt: Option<TexRef>,
+    /// What STCC left in the stage block of each layer it cleared (only saves show it)
+    pub kept: Vec<Option<crate::save::Kept>>,
 }
 
 impl Stage {
@@ -334,11 +345,12 @@ impl Stage {
             frame: 0,
             noise: None,
             noise_rt: None,
+            kept: vec![None; LAYERS],
         }
     }
 
     /// STNS (sub_35FC0), once per frame: the quad that paints the noise into render target 40
-    /// (canvas sized, never cleared). Noise texture 390 (noisehd0) when n%10==2, else 389 (noise1),
+    /// (canvas sized, never cleared). Noise texture 390 (noisehd1) when n%10==2, else 389 (noisehd0),
     /// scaled 0.6 in a 960x540 space (1.2x at canvas size) at a fresh random offset of 0..-100 x 0..-45
     /// units, mirrored horizontally on alternate ticks (each frame when n>2, else every third). The
     /// strip the shifted texture misses keeps earlier frames' noise, as in the exe. Grain layers then

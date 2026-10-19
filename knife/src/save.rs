@@ -1,12 +1,15 @@
-//! Save data: per-slot game snapshots and persistent global data (G flags, settings).
+//! Save data types: in-memory game snapshots (saves, rewind history) and the save directory.
+//!
+//! Saves and system data live in the Switch format (`savedata.rs`, `savedata.bin` in the save directory), and
+//! nothing else is kept. Save list previews are rendered from each record's stage block, as on the Switch.
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const SLOTS: usize = 100;
-pub const QUICK_SLOT: usize = 0;
+/// Slots 0..140 are the exe's 140 save records: 0..100 the save list (sub_50790), 100..139 the auto save ring
+/// (sub_52AA0, newest at 100, reached through CONTINUE only), 139 the quick save (sub_52860).
+pub use crate::savedata::{AUTO_FIRST, LIST_SLOTS, QUICK_SLOT, SLOTS};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LayerSave {
@@ -27,6 +30,9 @@ pub struct LayerSave {
     /// SSW2: amp min/max, period min/max, strength, remaining ms
     #[serde(default)]
     pub sway: Option<[f32; 6]>,
+    /// SQK2: amp x / y, remaining ms (negative = forever), elapsed ms, then the SQK2 arguments 3..7
+    #[serde(default)]
+    pub quake: Option<([f32; 4], [i32; 5])>,
     #[serde(default)]
     pub rule: Option<i32>,
     #[serde(default)]
@@ -34,11 +40,20 @@ pub struct LayerSave {
     pub blend: u8,
     pub shade: u8,
     pub fill: Option<[f32; 3]>,
+    /// STEC colour grade (0 none)
+    #[serde(default)]
+    pub grade: i32,
     pub motion: Option<(i32, f32)>,
     #[serde(default)]
     pub clip: Option<[f32; 5]>,
     #[serde(default)]
     pub bright: Option<f32>,
+    /// STBR mode as given (-1 none)
+    #[serde(default)]
+    pub stbr: Option<i32>,
+    /// STRR rotation, degrees
+    #[serde(default)]
+    pub motion_rot: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -68,44 +83,37 @@ pub struct SaveData {
     /// FADE 40 full-screen blur active
     #[serde(default)]
     pub blur: bool,
+    /// per empty layer: what STCC left of it (see `Stage::kept`)
+    #[serde(default)]
+    pub kept: Vec<Option<Kept>>,
+    /// the stage backup block (record +6664, see `Game::stage_backup`)
+    #[serde(default)]
+    pub backup: Option<Vec<u8>>,
+    /// the rewind-ring entry before this one, kept by a save (record count / previous entry)
+    #[serde(default)]
+    pub prev: Option<Box<SaveData>>,
+    /// page-ring entry type when not a message / choice (6: ATSV)
+    #[serde(default)]
+    pub kind: u16,
+    /// the message's voice (entry +13752, played again on load / rewind) and speaker (+13756 / +30)
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub speaker: i16,
+    /// the current `_Z` read key (entry +26 / +28: the message's own, or the last marker's)
+    #[serde(default)]
+    pub read_key: Option<(usize, u8)>,
 }
 
-/// Flowchart node: where it starts and the (non-global) flags when it was last reached.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct NodeRecord {
-    pub scene: usize,
-    pub pc: usize,
-    pub vars: Vec<(String, i32)>,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
-pub struct GlobalData {
-    pub vars: Vec<(String, i32)>,
-    pub text_speed: Option<f32>,
-    pub auto_delay_ms: Option<f32>,
-    pub master: Option<f32>,
-    pub bgm: Option<f32>,
-    pub se: Option<f32>,
-    pub voice: Option<f32>,
-    /// script_text lines already read (for skip-read-only), as a bitmap
+/// What an empty layer keeps in the stage block: the negated anchor at +5844+2 / +4 of the last image shown
+/// there. STCC (sub_62140, `stcc`) also keeps the STBR blend byte and sets alpha 255; a stage reset (sub_57450:
+/// NEW GAME, flowchart jump) clears everything else, alpha 0 and blend -1.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Kept {
+    pub neg_anchor: (i16, i16),
+    pub blend: u8,
     #[serde(default)]
-    pub read: Vec<u64>,
-    /// flowchart nodes reached (RDST) and endings seen (RDED), as bitmaps
-    #[serde(default)]
-    pub nodes: Vec<u64>,
-    #[serde(default)]
-    pub endings: Vec<u64>,
-    #[serde(default)]
-    pub skip_unread: Option<bool>,
-    #[serde(default)]
-    pub node_states: std::collections::BTreeMap<u16, NodeRecord>,
-    /// images shown at least once (CG gallery)
-    #[serde(default)]
-    pub seen: Vec<String>,
-    #[serde(default)]
-    pub heard: Vec<u64>,
-    #[serde(default)]
-    pub movie_flags: u16,
+    pub stcc: bool,
 }
 
 pub fn dir() -> PathBuf {
@@ -116,52 +124,15 @@ pub fn dir() -> PathBuf {
     base.join("knife").join("saves")
 }
 
-fn slot_path(slot: usize) -> PathBuf {
-    dir().join(format!("slot{slot:03}.json"))
-}
-
-pub fn thumb_path(slot: usize) -> PathBuf {
-    dir().join(format!("slot{slot:03}.png"))
-}
-
-pub fn write_slot(slot: usize, data: &SaveData, thumb: Option<(&[u8], u32, u32)>) -> Result<()> {
-    std::fs::create_dir_all(dir())?;
-    let json = serde_json::to_vec_pretty(data)?;
-    let tmp = slot_path(slot).with_extension("tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, slot_path(slot))?;
-    if let Some((rgba, w, h)) = thumb {
-        image::save_buffer(thumb_path(slot), rgba, w, h, image::ExtendedColorType::Rgba8)?;
-    }
-    Ok(())
-}
-
-pub fn read_slot(slot: usize) -> Option<SaveData> {
-    let data = std::fs::read(slot_path(slot)).ok()?;
-    serde_json::from_slice(&data).ok()
-}
-
-pub fn read_global() -> GlobalData {
-    std::fs::read(dir().join("global.json"))
-        .ok()
-        .and_then(|d| serde_json::from_slice(&d).ok())
-        .unwrap_or_default()
-}
-
-pub fn write_global(g: &GlobalData) -> Result<()> {
-    std::fs::create_dir_all(dir())?;
-    let json = serde_json::to_vec(g)?;
-    std::fs::write(dir().join("global.json"), json).context("writing global.json")
-}
-
+/// The local wall-clock time as seconds since 1970-01-01 00:00 of the same clock: save records store the date
+/// fields of the console's local time (sdk time zone conversion before sub_5A910), so timestamps are kept in
+/// local time throughout.
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    let t = chrono::Local::now();
+    (t.timestamp() + i64::from(t.offset().local_minus_utc())).max(0) as u64
 }
 
-/// `YYYY/MM/DD HH:MM` (UTC offset ignored: local time is not available without extra deps).
+/// `YYYY/MM/DD HH:MM` of a local timestamp (`now`).
 pub fn format_time(ts: u64) -> String {
     let days = (ts / 86400) as i64;
     let secs = ts % 86400;
