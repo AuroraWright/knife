@@ -3624,9 +3624,9 @@ impl Ui {
     /// auto save (sub_52AA0) and show its banner; the menu fades out (1/30 per frame) and the title follows
     /// once the banner is gone (sub_4D710).
     fn leave_to_title(&mut self, game: &mut Game, r: &Renderer) {
-        // sub_52A20: no new auto save (and no banner) when the position matches the last one
+        // sub_52A20: no new auto save (and no banner) when the record matches the newest auto save
         let same = game
-            .snapshot()
+            .save_data()
             .zip(self.slots.get(save::AUTO_FIRST).and_then(Option::as_ref))
             .is_some_and(|(a, b)| a.scene == b.scene && a.pc == b.pc);
         if same || !game.can_save() || !self.write_quiet(game, r, save::AUTO_FIRST) {

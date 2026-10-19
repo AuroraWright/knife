@@ -340,6 +340,8 @@ pub struct Game {
     last_voice: Option<String>,
     /// VPLY's voice until the next message takes it (off_AE08B0)
     pending_voice: Option<String>,
+    /// VPLY's voice waiting for the next message start (AE04C8)
+    voice_to_play: Option<String>,
     /// the shown message's voice and speaker (sub_6E0D0: page entry +13752 / +13756, off_AE0590)
     msg_voice: Option<String>,
     speaker: i16,
@@ -484,6 +486,7 @@ impl Game {
             seek_hit: false,
             last_voice: None,
             pending_voice: None,
+            voice_to_play: None,
             msg_voice: None,
             speaker: 0,
             menu_blur: None,
@@ -1035,6 +1038,11 @@ impl Game {
                 self.set_var("F1103", 0);
                 let raw = c.args.first().map(String::as_str).unwrap_or("");
                 self.note_read(&c.name);
+                // sub_6E0D0: VPLY's voice plays unless skipping (a fast skip into unread text with
+                // read-only skip has stopped by now, so it plays there too) and becomes the replay voice
+                if let Some(n) = self.voice_to_play.take() {
+                    self.play_voice(&n, true);
+                }
                 let text = self.resolve_text(raw);
                 // sub_391A0 draws the last F823 - 1 history messages above this one: the page starts over at
                 // a message with F823 <= 1 (the scripts count F823 up before each message, zero it at a page end)
@@ -1609,7 +1617,14 @@ impl Game {
                 if let Some(n) = c.arg(0) {
                     self.note_voice(n);
                     self.pending_voice = Some(n.to_string());
-                    self.play_voice(n);
+                    // VPLY leaves the voice for the next message start (AE04C8, played by sub_6E0D0); VPL2
+                    // plays it at once, without making it the replay voice, and drops it
+                    if name == "VPL2" {
+                        self.play_voice(n, false);
+                        self.voice_to_play = None;
+                    } else {
+                        self.voice_to_play = Some(n.to_string());
+                    }
                 }
             }
             "VCWT" => {
@@ -1660,7 +1675,7 @@ impl Game {
             "ATSV" => {
                 // 0x7a888: a type 6 page-ring entry at the command (also the save point when F823 <= 1, and the
                 // newest rewind-ring entry a following save keeps; knife's rewind does not stop at it)
-                let mut s = self.snapshot_at(self.pc - 1, Vec::new(), None);
+                let mut s = self.snapshot_at(self.pc - 1, Vec::new());
                 s.kind = 6;
                 s.voice = None;
                 s.preview.clear();
@@ -2003,12 +2018,15 @@ impl Game {
     }
 
     /// sub_6E0D0: a voice plays unless voices are off or its speaker's row is muted, at that row's volume.
-    fn play_voice(&mut self, n: &str) {
+    /// `replay`: it becomes the voice the replay button plays (AE06A8), as at a message start.
+    fn play_voice(&mut self, n: &str, replay: bool) {
         if self.skip || !self.settings.voice_on {
             return;
         }
         tracing::debug!("voice {n}");
-        self.last_voice = Some(n.to_string());
+        if replay {
+            self.last_voice = Some(n.to_string());
+        }
         let row = voice_row(n);
         if self.settings.char_mute >> row & 1 == 0 {
             let gain = self.settings.char_voice.get(row).copied().unwrap_or(1.0);
@@ -2363,21 +2381,14 @@ impl Game {
         (self.wait == Wait::Click || (self.wait == Wait::Choice && choice_ok)) && !self.ended
     }
 
-    /// The snapshot a save writes: the current page's save point (see `save_point`), or the current
-    /// position when the page has none yet.
+    /// The snapshot a save writes: the save point (see `save_point`). The exe's record (word_F17FF0) is only
+    /// emptied at boot (sub_4EF00), so it outlives a stage reset; while it is empty no save is written
+    /// (sub_50FC0 0x52274, sub_52860, sub_52AA0 check word_F17FF2).
     pub fn save_data(&self) -> Option<crate::save::SaveData> {
         if !self.can_save() {
             return None;
         }
-        match &self.save_point {
-            Some(s) => Some(crate::save::SaveData { timestamp: crate::save::now(), ..s.clone() }),
-            None => {
-                // the entry before the current message (which the history already holds)
-                let n = self.history.len();
-                let prev = n.checked_sub(2).and_then(|i| self.history.get(i)).map(|h| Box::new(h.0.clone()));
-                self.snapshot().map(|s| crate::save::SaveData { prev, ..s })
-            }
-        }
+        self.save_point.as_ref().map(|s| crate::save::SaveData { timestamp: crate::save::now(), ..s.clone() })
     }
 
     /// The committed layers as a save snapshot stores them (pending STCH layers are left out).
@@ -2433,26 +2444,15 @@ impl Game {
             .collect()
     }
 
-    pub fn snapshot(&self) -> Option<crate::save::SaveData> {
-        if !self.can_save() {
+    /// The current message as a page-ring entry (choices are never one: the exe's save record is not refreshed
+    /// at them, and knife's rewind does not stop there).
+    fn snapshot(&self) -> Option<crate::save::SaveData> {
+        if self.wait != Wait::Click || self.ended {
             return None;
         }
-        let (pc, page_texts, choice) = match self.wait {
-            Wait::Click => {
-                let mut t = self.page.texts.clone();
-                t.pop();
-                (self.msg_pc, t, None)
-            }
-            _ => {
-                let c = self.choice.as_ref()?;
-                (
-                    self.pc,
-                    Vec::new(),
-                    Some((c.var.clone(), c.opts.iter().map(|o| (o.value, o.text.clone())).collect::<Vec<_>>())),
-                )
-            }
-        };
-        Some(self.snapshot_at(pc, page_texts, choice))
+        let mut t = self.page.texts.clone();
+        t.pop();
+        Some(self.snapshot_at(self.msg_pc, t))
     }
 
     /// The state as a snapshot resuming at command `pc`.
@@ -2460,11 +2460,8 @@ impl Game {
         &self,
         pc: usize,
         page_texts: Vec<String>,
-        choice: Option<(String, Vec<(i32, String)>)>,
     ) -> crate::save::SaveData {
         use crate::save::{SaveData, SeSave};
-        // a choice entry (type 12) keeps sub_5A910's "no voice"
-        let choice_entry = choice.is_some();
         let layers = self.layer_saves();
         let preview = self
             .page
@@ -2480,7 +2477,6 @@ impl Game {
                     })
                     .collect::<String>()
             })
-            .or_else(|| choice.as_ref().map(|(_, o)| o.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" / ")))
             .unwrap_or_default();
         SaveData {
             version: 1,
@@ -2498,7 +2494,7 @@ impl Game {
             backup: self.stage_backup.clone(),
             prev: None,
             page_texts,
-            choice,
+            choice: None,
             bgm: self.sound.bgm_state(),
             loops: self
                 .sound
@@ -2510,7 +2506,7 @@ impl Game {
             preview,
             blur: self.post_blur,
             kind: 0,
-            voice: if choice_entry { None } else { self.msg_voice.clone() },
+            voice: self.msg_voice.clone(),
             speaker: self.speaker,
             read_key: self.read_key,
         }
@@ -2717,13 +2713,14 @@ impl Game {
         // the entry's voice plays again (load: sub_5D950 0x5ee6c; rewind: sub_5BAF0 makes it pending for the
         // replayed message)
         self.pending_voice = None;
+        self.voice_to_play = None;
         self.msg_voice = d.voice.clone();
         self.speaker = d.speaker;
         // the entry's read key is current again (sub_5BAF0), so the next `_Z` command marks it read
         self.read_key = d.read_key;
         self.last_voice = None;
         if let Some(n) = d.voice.clone() {
-            self.play_voice(&n);
+            self.play_voice(&n, true);
         }
         if let Some((var, opts)) = &d.choice {
             let opts = opts.iter().map(|(v, t)| ChoiceOpt { value: *v, text: t.clone(), disabled: false }).collect();
@@ -2734,7 +2731,6 @@ impl Game {
 
     pub fn reset(&mut self) {
         self.history.clear();
-        self.save_point = None;
         self.read_key = None;
         self.node_seq = 0;
         self.seek_node = false;
@@ -2749,6 +2745,7 @@ impl Game {
         self.stage_backup = None;
         self.last_ring = None;
         self.pending_voice = None;
+        self.voice_to_play = None;
         self.msg_voice = None;
         self.speaker = 0;
         self.vars.retain(|k, _| k.starts_with('G'));
