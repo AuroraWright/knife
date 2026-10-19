@@ -3845,7 +3845,9 @@ impl Ui {
         }
         self.help_t = (self.help_t + 0.05 * f).min(1.0);
         self.intro_update(game, r, f);
-        self.menu_bg.update(f);
+        // the backdrop keeps fading while the title waits for its movie: the movie is held while the backdrop
+        // shows, so a frozen fade (leaving the gallery restarts the movie) would never let it get ready
+        self.menu_bg.update(secs * 60.0);
         // the title movie stops while a submenu backdrop covers the title
         game.hold_movie(self.title_movie && self.menu_bg.visible());
         let on_title = self.screen == Screen::Title
