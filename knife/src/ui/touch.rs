@@ -9,7 +9,7 @@
 //!
 //! Positions in the exe's input state are 640x448 units (touch x / 2, y * 448 / 720).
 
-use knife_render::{CANVAS_H, CANVAS_W, Quad, Renderer, TexRef, Upload};
+use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, Renderer, TexRef, Upload};
 
 use super::{Confirm, Screen, Ui};
 use crate::{game::Game, save};
@@ -62,11 +62,16 @@ pub struct Touch {
     /// drag arrow: alpha (off_AE0600), effect fade (dword_AFECA4), start (units) and stretch
     arrow_a: f32,
     arrow_fx: f32,
+    /// sub_3C510's mode icon (dword_AFEC9C): mode_disp cell (0 none, 1 previous scene, 2 rewind, 3 fast
+    /// forward, 4 next scene, 5 skip mode)
+    mode_icon: usize,
     arrow_at: [f32; 2],
     arrow_dx: f32,
     /// the gesture currently drives game.skip / a rewind at this speed
     drag_skip: bool,
     rewind: u32,
+    /// 60 Hz frames towards the next rewind step
+    rewind_t: f32,
     /// message window hidden at the bottom edge (off_AE0690)
     pub hidden: bool,
     /// mode panel (dword_B35A10), its slide (dword_B35A28), its hovered button, the button held
@@ -107,6 +112,8 @@ impl Touch {
             arrow_a: 0.0,
             arrow_fx: 0.0,
             arrow_at: [0.0; 2],
+            mode_icon: 0,
+            rewind_t: 0.0,
             arrow_dx: 0.0,
             drag_skip: false,
             rewind: 0,
@@ -426,7 +433,8 @@ impl Ui {
                 game.set_skip(false);
             }
             self.touch.drag_skip = true;
-            game.speed = fwd.max(1);
+            // skip mode runs at word_34E054[off_AE0660 & 3] = 64 (ZR / the gesture when held)
+            game.speed = if fwd > 0 { fwd } else { 64 };
         } else if fwd > 0 {
             game.set_skip(true);
             game.speed = fwd;
@@ -448,16 +456,33 @@ impl Ui {
         if back > 0 && game.can_rewind() {
             self.touch.rewind = back;
             game.speed = back;
-            if game.settled() {
+            // sub_814C0 runs once per 60 Hz frame, whatever the display rate
+            self.touch.rewind_t = (self.touch.rewind_t + f).min(1.0);
+            if self.touch.rewind_t >= 1.0 && game.settled() {
+                self.touch.rewind_t -= 1.0;
                 game.rewind_step(r);
             }
         } else if self.touch.rewind > 0 {
             self.touch.rewind = 0;
             game.speed = 1;
         }
-        // sub_3C510: the arrow's effect fades in at 0.05 per frame (x5 while rewinding) while the gesture runs
+        // sub_3C510: the effect fade (dword_AFECA4) rises 0.05 per frame (x5 while rewinding) while rewinding,
+        // at speed 2 or more (a skip; ZR from its 30th frame), in auto mode (dword_AFEC98), or while the drag
+        // gesture runs (off_AE0610), and falls otherwise
         let rate = 0.05 * f * if self.touch.rewind > 0 { 5.0 } else { 1.0 };
-        self.touch.arrow_fx = if arrow_on || self.touch.drag_skip || self.touch.rewind > 0 {
+        let fx_on = self.touch.rewind > 0 || (in_game && (game.speed >= 2 || game.auto)) || arrow_on;
+        // the mode icon (sub_3B5B0, set each frame by sub_40ED0): 5 in skip mode, then 2 while rewinding or 3
+        // while skipping fast (off_AE0670)
+        self.touch.mode_icon = if self.touch.rewind > 0 {
+            2
+        } else if self.touch.drag_skip && in_game {
+            3
+        } else if self.touch.skip_mode {
+            5
+        } else {
+            0
+        };
+        self.touch.arrow_fx = if fx_on {
             (self.touch.arrow_fx + rate).min(1.0)
         } else {
             (self.touch.arrow_fx - rate).max(0.0)
@@ -542,6 +567,16 @@ impl Ui {
             let (u1, v1) = (t.width as f32 / tw, t.height as f32 / th);
             q = if len < 0.0 { q.with_uv_rect(u1, 0.0, 0.0, v1) } else { q.with_uv_rect(0.0, 0.0, u1, v1) };
             out.push(q);
+        }
+        // sub_3C510: the mode icon, mode_disp cell 88x88 centred (anchor 20) at (dword_34DBE4[icon], 38.16)
+        // units, alpha dword_AFECA4 (x 0.6 in skip mode)
+        let icon = self.touch.mode_icon;
+        if (1..=5).contains(&icon) && self.touch.arrow_fx > 0.0 {
+            const X: [f32; 6] = [589.333, 546.667, 546.667, 626.667, 626.667, 626.667];
+            const CELL: [f32; 6] = [176.0, 0.0, 88.0, 264.0, 352.0, 264.0];
+            let a = self.touch.arrow_fx * if icon == 5 { 0.6 } else { 1.0 };
+            let (x, y) = (X[icon] * UX, 38.163 * UY);
+            self.sprite_c(out, "mode_disp", [x - 44.0, y - 44.0, 88.0, 88.0], Some([CELL[icon], 0.0, 88.0, 88.0]), a, Blend::Alpha);
         }
         if self.touch.panel_t > 0.0 {
             let y = self.panel_y();

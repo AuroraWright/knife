@@ -263,9 +263,12 @@ impl Renderer {
         .context("creating device")?;
 
         let caps = surface.get_capabilities(&adapter);
+        // plain 8-bit and never sRGB, as the Switch draws: compositors treat float (and some 10-bit) surfaces as
+        // linear or HDR, which washes the colours out
         let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
             .into_iter()
             .find(|f| caps.formats.contains(f))
+            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
             .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

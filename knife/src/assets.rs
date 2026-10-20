@@ -30,12 +30,32 @@ pub struct Image {
     pub center_y: f32,
 }
 
+/// Decoded pixels of an image, ready to upload.
+pub enum Pixels {
+    Bntx(bntx::Texture),
+    Rgba(u32, u32, Vec<u8>),
+}
+
+/// An image `Assets::decode_async` read on a worker thread.
+pub struct Decoded {
+    key: String,
+    name: String,
+    pixels: Result<Pixels>,
+}
+
+impl Decoded {
+    /// The image's cache key (`Assets::image_key`).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 pub struct Assets {
     pub romfs: PathBuf,
-    pub allpac: Archive,
-    pub allpachd: Option<Archive>,
-    pub allpaccg: Option<Archive>,
-    pub allui: Archive,
+    pub allpac: Arc<Archive>,
+    pub allpachd: Option<Arc<Archive>>,
+    pub allpaccg: Option<Arc<Archive>>,
+    pub allui: Arc<Archive>,
     pub tables: ExeTables,
     image_index: HashMap<String, usize>,
     pub scenes: SceneArchive,
@@ -66,10 +86,10 @@ impl Assets {
         let sar = SoundArchive::parse(std::fs::read(romfs.join("knife1.bfsar")).context("reading knife1.bfsar")?)?;
         Ok(Self {
             romfs: romfs.to_path_buf(),
-            allpac: Archive::open(romfs, "allpac")?,
-            allpachd: Archive::open(romfs, "allpachd").ok(),
-            allpaccg: Archive::open(romfs, "allpaccg").ok(),
-            allui: Archive::open(romfs, "allui")?,
+            allpac: Arc::new(Archive::open(romfs, "allpac")?),
+            allpachd: Archive::open(romfs, "allpachd").ok().map(Arc::new),
+            allpaccg: Archive::open(romfs, "allpaccg").ok().map(Arc::new),
+            allui: Arc::new(Archive::open(romfs, "allui")?),
             tables,
             image_index,
             scenes,
@@ -128,11 +148,17 @@ impl Assets {
         None
     }
 
-    fn image_bytes(&self, name: &str) -> Option<Vec<u8>> {
-        for a in [Some(&self.allpac), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
+    /// The image archives in lookup order.
+    fn image_archives(&self) -> Vec<Arc<Archive>> {
+        [Some(&self.allpac), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
             .into_iter()
             .flatten()
-        {
+            .cloned()
+            .collect()
+    }
+
+    fn image_bytes(archives: &[Arc<Archive>], name: &str) -> Option<Vec<u8>> {
+        for a in archives {
             if let Some(i) = a.find_stem(name) {
                 match a.read(i) {
                     Ok(d) => return Some(d),
@@ -151,13 +177,50 @@ impl Assets {
     /// Load (and cache) an image with an STEC colour grade applied (`grade::apply`; 0 = none). The exe keys
     /// its texture cache (sub_AAA40) the same way, by image and STEC mode.
     pub fn image_graded(&mut self, r: &Renderer, name: &str, grade: i32) -> Option<Arc<Image>> {
-        let grade = if crate::grade::is_grade(grade) { grade } else { 0 };
-        let name = name.to_ascii_uppercase();
-        let key = if grade == 0 { name.clone() } else { format!("{name}#{grade}") };
+        let (name, grade, key) = Self::image_key(name, grade);
         if let Some(i) = self.images.get(&key) {
             return i.clone();
         }
-        let img = match self.load_image(r, &name, grade) {
+        let pixels = Self::decode_pixels(&self.image_archives(), &name, grade);
+        self.finish_image(r, key, &name, pixels)
+    }
+
+    /// Cache key of an image load: (upper-case name, effective grade, key).
+    pub fn image_key(name: &str, grade: i32) -> (String, i32, String) {
+        let grade = if crate::grade::is_grade(grade) { grade } else { 0 };
+        let name = name.to_ascii_uppercase();
+        let key = if grade == 0 { name.clone() } else { format!("{name}#{grade}") };
+        (name, grade, key)
+    }
+
+    /// Whether `image_graded(name, grade)` would return without loading anything.
+    pub fn image_cached(&self, name: &str, grade: i32) -> bool {
+        self.images.contains_key(&Self::image_key(name, grade).2)
+    }
+
+    /// Read and decode an image for `image_graded` on a worker thread; the result arrives on `done`, for
+    /// `finish_decoded` to upload and cache. Returns the cache key.
+    pub fn decode_async(&self, name: &str, grade: i32, done: std::sync::mpsc::Sender<Decoded>) {
+        let (name, grade, k) = Self::image_key(name, grade);
+        let archives = self.image_archives();
+        let spawned = std::thread::Builder::new().name("image decode".into()).spawn(move || {
+            let pixels = Self::decode_pixels(&archives, &name, grade);
+            let _ = done.send(Decoded { key: k, name, pixels });
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("image decode thread: {e}");
+        }
+    }
+
+    /// Upload and cache an image `decode_async` read.
+    pub fn finish_decoded(&mut self, r: &Renderer, d: Decoded) {
+        if !self.images.contains_key(&d.key) {
+            self.finish_image(r, d.key, &d.name, d.pixels);
+        }
+    }
+
+    fn finish_image(&mut self, r: &Renderer, key: String, name: &str, pixels: Result<Pixels>) -> Option<Arc<Image>> {
+        let img = match pixels.and_then(|p| self.upload_pixels(r, name, p)) {
             Ok(i) => Some(Arc::new(i)),
             Err(e) => {
                 tracing::warn!("image {name}: {e:#}");
@@ -176,14 +239,23 @@ impl Assets {
         self.images.retain(|_, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1));
     }
 
-    fn load_image(&self, r: &Renderer, name: &str, grade: i32) -> Result<Image> {
-        let data = self.image_bytes(name).context("not found")?;
-        let tex = if grade == 0 {
-            upload_image(r, &data, name)?
-        } else {
-            let (w, h, mut px) = decode_image(&data)?;
+    /// The CPU side of an image load (no renderer needed): archive read, BNTX parse or image decode, grade.
+    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: i32) -> Result<Pixels> {
+        let data = Self::image_bytes(archives, name).context("not found")?;
+        if grade == 0 && bntx::is_bntx(&data) {
+            return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?));
+        }
+        let (w, h, mut px) = decode_image(&data)?;
+        if grade != 0 {
             crate::grade::apply(grade, &mut px);
-            r.upload(w, h, Upload::Rgba8(&px), name)
+        }
+        Ok(Pixels::Rgba(w, h, px))
+    }
+
+    fn upload_pixels(&self, r: &Renderer, name: &str, pixels: Pixels) -> Result<Image> {
+        let tex = match pixels {
+            Pixels::Bntx(t) => upload_bntx(r, &t)?,
+            Pixels::Rgba(w, h, px) => r.upload(w, h, Upload::Rgba8(&px), name),
         };
         let (width, height, center_x, center_y) = match self.image_info(name) {
             Some(i) => (i.width, i.height, i.center_x, i.center_y),
@@ -328,12 +400,3 @@ fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((img.width(), img.height(), img.into_raw()))
 }
 
-/// Upload an archive image (BNTX, JPEG or PNG).
-pub fn upload_image(r: &Renderer, data: &[u8], name: &str) -> Result<TexRef> {
-    if bntx::is_bntx(data) {
-        let t = bntx::parse(data)?.into_iter().next().context("empty BNTX")?;
-        return upload_bntx(r, &t);
-    }
-    let img = image::load_from_memory(data).context("decoding image")?.to_rgba8();
-    Ok(r.upload(img.width(), img.height(), Upload::Rgba8(img.as_raw()), name))
-}

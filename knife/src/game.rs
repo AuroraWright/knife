@@ -200,8 +200,28 @@ const PARAGRAPH_GAP: f32 = 0.0;
 /// sub_391A0: earlier messages on the page fade to 100/255 over (config word 7) * 1.2 = 42 frames; a run of
 /// messages ending in @k shares the fade of the message that ends it.
 const READ_ALPHA: f32 = 100.0 / 255.0;
+/// A rewind-ring entry: the snapshot, the RDST count it belongs to (for the mode panel's previous scene), its
+/// (scene, message pc, page line) key and a serial the backlog pages refer to.
+#[derive(Clone)]
+struct RingEntry {
+    data: crate::save::SaveData,
+    node: u32,
+    key: (usize, usize, usize),
+    serial: u64,
+}
+
+/// A finished page in the backlog: its texts and the serials of its first and last ring entries (None when
+/// they were never recorded, as for the page a load restored).
+struct BacklogPage {
+    texts: Vec<String>,
+    first: Option<u64>,
+    last: Option<u64>,
+}
+
 /// rewind history length (sub_814C0: 800 page records)
 const HISTORY: usize = 800;
+/// frames a message stays up under a skip (measured on the Switch: about 20 messages a second within a page)
+const SKIP_FRAMES: f32 = 3.0;
 const READ_FADE_FRAMES: f32 = 42.0;
 /// ms per 60 fps frame
 const FRAME_MS: f32 = 1000.0 / 60.0;
@@ -311,16 +331,23 @@ pub struct Game {
     mouse: (f32, f32),
     time: f32,
     warned: HashSet<String>,
-    /// raw texts of finished pages, oldest first (the backlog shows one page at a time)
-    pub backlog_pages: Vec<Vec<String>>,
+    /// finished pages, oldest first (the backlog shows one page at a time)
+    backlog_pages: Vec<BacklogPage>,
     /// hide the message window and text (while the backlog is shown)
     pub hide_text: bool,
     /// script / effect steps per frame (sub_3FBD0 runs its effect steps this many times): the touch
     /// gesture and mode panel skip and rewind speeds, 1 normally
     pub speed: u32,
-    /// per-message rewind history (sub_814C0 walks an 800-entry page ring): snapshot, the RDST count it
-    /// belongs to (for the mode panel's previous scene) and its (scene, message pc, page line) key
-    history: std::collections::VecDeque<(crate::save::SaveData, u32, (usize, usize, usize))>,
+    /// per-message rewind history (sub_814C0 walks an 800-entry page ring, which the backlog lists too)
+    history: std::collections::VecDeque<RingEntry>,
+    /// ms the current click wait has been up (a skip passes it after `SKIP_FRAMES` 60 Hz frames)
+    click_ms: f32,
+    /// ms since the script last ran under a skip (one dispatch per 60 Hz frame)
+    dispatch_ms: f32,
+    /// serial of the next history entry
+    ring_serial: u64,
+    /// serials of the current page's first and newest history entries
+    page_ring: (Option<u64>, Option<u64>),
     /// What a save writes (the exe's in-memory record, sub_527F0): the state as the first message of the
     /// current page started (F823 <= 1, never a choice), so a save resumes at the start of its page
     save_point: Option<crate::save::SaveData>,
@@ -367,6 +394,10 @@ pub struct Game {
     previews: std::collections::HashMap<usize, TexRef>,
     preview_queue: Vec<(usize, Vec<Option<crate::save::LayerSave>>)>,
     preview_rt: Option<RenderTarget>,
+    /// images the queued previews need, read and decoded on worker threads so opening the save list does
+    /// not stall on large stage images (cache keys in flight, and where they arrive)
+    preview_decoding: std::collections::HashSet<String>,
+    preview_decoded: (std::sync::mpsc::Sender<crate::assets::Decoded>, std::sync::mpsc::Receiver<crate::assets::Decoded>),
     old_rt: RenderTarget,
     blur_rt: RenderTarget,
     /// FADE 40: blur the stage (FADE 41 clears)
@@ -475,6 +506,10 @@ impl Game {
             time: 0.0,
             warned: HashSet::new(),
             backlog_pages: Vec::new(),
+            click_ms: 0.0,
+            dispatch_ms: 0.0,
+            ring_serial: 0,
+            page_ring: (None, None),
             hide_text: false,
             speed: 1,
             history: Default::default(),
@@ -502,6 +537,8 @@ impl Game {
             previews: Default::default(),
             preview_queue: Vec::new(),
             preview_rt: None,
+            preview_decoding: Default::default(),
+            preview_decoded: std::sync::mpsc::channel(),
             old_rt: r.create_target(CANVAS_W, CANVAS_H, "old frame"),
             blur_rt: r.create_target(CANVAS_W, CANVAS_H, "blur"),
             post_blur: false,
@@ -658,6 +695,7 @@ impl Game {
     }
 
     fn finish_click(&mut self) {
+        self.click_ms = 0.0;
         // sub_40ED0 LABEL_307 (leaving a click wait; sub_2C500 too) resets the 11 per-message colour words
         for i in 0..11 {
             self.set_var(&format!("F{}", 800 + i), Self::TEXT_COLOUR >> 8);
@@ -680,6 +718,10 @@ impl Game {
     // ---- per-frame update ---------------------------------------------------------
 
     pub fn update(&mut self, r: &Renderer, dt: f32) {
+        if self.wait == Wait::Click {
+            self.click_ms += dt;
+        }
+        self.dispatch_ms = (self.dispatch_ms + dt).min(1000.0 / 60.0);
         for _ in 0..self.speed.max(1) {
             self.update_step(r, dt);
         }
@@ -700,7 +742,9 @@ impl Game {
             return;
         }
         let fast = self.skip || self.seek_node;
-        let step = if fast { dt * 8.0 } else { dt };
+        // the speed already repeats the steps (sub_3FBD0); a skip at speed 1 (the debug skip) runs time 8x
+        let step = if fast && self.speed <= 1 { dt * 8.0 } else { dt };
+        let cut = self.seek_node || (fast && self.speed <= 1);
 
         // layer tweens and motions
         self.stage.advance(step);
@@ -774,7 +818,7 @@ impl Game {
         // transition
         if let Some(t) = &mut self.trans {
             t.t += step;
-            if t.t >= t.dur || fast {
+            if t.t >= t.dur || cut {
                 self.trans = None;
             }
         }
@@ -835,9 +879,12 @@ impl Game {
                     self.wait = Wait::None;
                 }
             }
+            // under a skip at speed n the exe's waits and effects run n steps a frame (the wait budget
+            // sub_802C0 gets is speed x frames); knife cuts them short only for the next-scene seek and the
+            // debug skip at speed 1
             Wait::Time { left, click } => {
                 let left = left - step;
-                self.wait = if left <= 0.0 || fast { Wait::None } else { Wait::Time { left, click } };
+                self.wait = if left <= 0.0 || cut { Wait::None } else { Wait::Time { left, click } };
             }
             Wait::Transition => {
                 if self.trans.is_none() {
@@ -845,12 +892,12 @@ impl Game {
                 }
             }
             Wait::Layer(l) => {
-                if fast {
+                if cut {
                     for layer in self.stage.layers.iter_mut().flatten() {
                         layer.finish();
                     }
                 }
-                if !self.stage.animating(l) || fast {
+                if !self.stage.animating(l) || cut {
                     self.wait = Wait::None;
                 }
             }
@@ -861,7 +908,11 @@ impl Game {
             }
             Wait::Click => {
                 let revealed = self.page.revealed as usize >= self.page.order;
-                if fast && revealed {
+                // a skip passes a message once it has been up SKIP_FRAMES frames: sub_802C0 runs once a frame,
+                // clears the text flag (4) a frame after the text is complete and only then the click wait
+                // (AE0670 set or skip mode), and dispatches up to the next wait; the speed only multiplies the
+                // effect steps (sub_3FBD0) and wait timers. The next-scene seek runs in one frame.
+                if fast && revealed && (self.seek_node || self.click_ms >= SKIP_FRAMES * 1000.0 / 60.0 - 1.0) {
                     if self.seek_node && self.seek_hit {
                         self.seek_node = false;
                     } else {
@@ -902,7 +953,16 @@ impl Game {
         // sub_391A0, the message layer's draw callback (sub_3B9A0: layer 15), set F824 = 65 last frame
         self.set_var("F824", 65);
 
-        // run the script
+        // run the script. sub_802C0 dispatches once per 60 Hz frame, so under a skip each wait the script stops
+        // at costs a frame (knife resolves the waits within the frame's speed steps); the next-scene seek
+        // runs in one frame
+        if self.skip && !self.seek_node && self.wait == Wait::None && !self.ended {
+            if self.dispatch_ms < 1000.0 / 60.0 - 1.0 {
+                self.record_history();
+                return;
+            }
+            self.dispatch_ms = 0.0;
+        }
         let mut budget = 20000;
         while self.wait == Wait::None && !self.ended && budget > 0 {
             budget -= 1;
@@ -924,7 +984,7 @@ impl Game {
             return;
         }
         let key = (self.scene_index, self.msg_pc, self.page.texts.len());
-        if self.history.back().is_some_and(|h| h.2 == key) {
+        if self.history.back().is_some_and(|h| h.key == key) {
             return;
         }
         if let Some(s) = self.snapshot() {
@@ -936,8 +996,17 @@ impl Game {
             self.last_ring = Some(s.clone());
             if self.history.len() >= HISTORY {
                 self.history.pop_front();
+                // the backlog lists the ring (sub_27EB0): pages that left it go too
+                let oldest = self.history.front().map_or(0, |h| h.serial);
+                self.backlog_pages.retain(|p| p.last.is_some_and(|l| l >= oldest));
             }
-            self.history.push_back((s, self.node_seq, key));
+            let serial = self.ring_serial;
+            self.ring_serial += 1;
+            if key.2 == 1 {
+                self.page_ring.0 = Some(serial);
+            }
+            self.page_ring.1 = Some(serial);
+            self.history.push_back(RingEntry { data: s, node: self.node_seq, key, serial });
         }
     }
 
@@ -945,9 +1014,11 @@ impl Game {
         self.history.len() >= 2
     }
 
-    /// The current message is in place and its effects have finished (the rewind takes its next step).
+    /// The restored message is in place (the rewind takes its next step). sub_814C0 steps once a frame when
+    /// no wait is pending, finishing the text reveal itself (sub_9C3B0), whatever the speed; the window's
+    /// fade does not hold it.
     pub fn settled(&self) -> bool {
-        self.wait == Wait::Click && self.trans.is_none() && self.page.alpha == if self.page.visible { 1.0 } else { 0.0 }
+        self.wait == Wait::Click && self.trans.is_none()
     }
 
     /// Back one message (sub_814C0).
@@ -967,26 +1038,46 @@ impl Game {
         if n < 2 {
             return false;
         }
-        let first = |tag: u32| self.history.iter().position(|h| h.1 == tag).unwrap_or(0);
-        let mut target = first(self.history[n - 1].1);
+        let first = |tag: u32| self.history.iter().position(|h| h.node == tag).unwrap_or(0);
+        let mut target = first(self.history[n - 1].node);
         if target == n - 1 {
             if target == 0 {
                 return false;
             }
-            target = first(self.history[target - 1].1);
+            target = first(self.history[target - 1].node);
         }
         self.history.truncate(target + 1);
         self.rewind_to(r, target);
         true
     }
 
+    /// Backlog quick jump (sub_28A90 state 7 -> sub_28D50): replay from the first message of backlog page
+    /// `back` (0 = the newest), as a rewind does (sub_5BAF0). False when its entry has left the ring.
+    pub fn backlog_jump(&mut self, r: &Renderer, back: usize) -> bool {
+        let Some(page) = self.backlog_pages.len().checked_sub(back + 1).map(|i| &self.backlog_pages[i]) else {
+            return false;
+        };
+        let Some(i) = page.first.and_then(|s| self.history.iter().position(|h| h.serial == s)) else {
+            return false;
+        };
+        self.history.truncate(i + 1);
+        self.rewind_to(r, i);
+        true
+    }
+
     fn rewind_to(&mut self, r: &Renderer, i: usize) {
-        let (d, tag, _) = self.history[i].clone();
+        let RingEntry { data: d, node: tag, serial, .. } = self.history[i].clone();
         self.node_seq = tag;
         self.seek_node = false;
         self.restore_with(r, &d, true);
+        // the backlog shares the ring: pages from this entry on are gone, and the page around it is current again
+        self.backlog_pages.retain(|p| p.last.is_some_and(|l| l < serial));
+        // (its first message: the newest page start up to here, unless that belongs to a kept page)
+        let kept = self.backlog_pages.last().and_then(|p| p.last);
+        let start = self.history.iter().take(i + 1).rev().find(|h| h.key.2 == 1).map(|h| h.serial);
+        self.page_ring = (start.filter(|&s| kept.is_none_or(|l| s > l)), Some(serial));
         // the ring still holds the entries before this one
-        let prev = i.checked_sub(1).and_then(|j| self.history.get(j)).map(|h| Box::new(h.0.clone()));
+        let prev = i.checked_sub(1).and_then(|j| self.history.get(j)).map(|h| Box::new(h.data.clone()));
         self.last_ring = prev.as_deref().cloned();
         if let Some(sp) = self.save_point.as_mut().filter(|sp| sp.scene == d.scene && sp.pc == d.pc) {
             sp.prev = prev;
@@ -1048,7 +1139,7 @@ impl Game {
                 // a message with F823 <= 1 (the scripts count F823 up before each message, zero it at a page end)
                 // (only in page mode, F822 == 1; otherwise every message has the window to itself)
                 if self.var("F823") <= 1 || !self.page_mode() {
-                    self.clear_page();
+                    self.clear_page(true);
                 }
                 // sub_6E0D0: in page mode message n = min(F823, 11) of the page records its colour and the F31 /
                 // F32 text scale in F799+n / F810+n / F824+n / F835+n
@@ -1160,7 +1251,7 @@ impl Game {
             // window commands (script_dispatch 0x7f3c4, `F1103` = text not drawn until the next message)
             "CLO2" => {
                 // the messages go (sub_53AB0(1)), the window is off at once
-                self.clear_page();
+                self.clear_page(true);
                 self.page.visible = false;
                 self.page.alpha = 0.0;
                 self.set_var("F1103", 1);
@@ -2070,14 +2161,14 @@ impl Game {
 
     // ---- messages -----------------------------------------------------------------
 
-    fn clear_page(&mut self) {
+    /// Start a new page; `finished`: the old one goes to the backlog (not when a load, rewind or reset
+    /// replaces it).
+    fn clear_page(&mut self, finished: bool) {
         let mut texts = std::mem::take(&mut self.page.texts);
         texts.append(&mut self.page.choice_texts);
-        if !texts.is_empty() {
-            self.backlog_pages.push(texts);
-            if self.backlog_pages.len() > 300 {
-                self.backlog_pages.drain(..100);
-            }
+        let (first, last) = std::mem::take(&mut self.page_ring);
+        if finished && !texts.is_empty() {
+            self.backlog_pages.push(BacklogPage { texts, first, last });
         }
         self.page.chars.clear();
         self.page.texts.clear();
@@ -2144,7 +2235,7 @@ impl Game {
         let (x, b, order) = text::layout(&self.font, &lay, &runs, start.0, start.1, self.page.order, &mut placed);
         self.msg_pc = self.pc.saturating_sub(1);
         if b > BOTTOM_LIMIT && !self.page.chars.is_empty() {
-            self.clear_page();
+            self.clear_page(true);
             placed.clear();
             let (x, b, order) = text::layout(&self.font, &lay, &runs, lay.left, top, 0, &mut placed);
             self.page.pen = (x, b);
@@ -2166,21 +2257,19 @@ impl Game {
     // ---- rendering ------------------------------------------------------------------
 
     /// Pages the backlog can show: the finished pages plus the current one.
+    /// Finished pages in the backlog. sub_27EB0 lists the history newest first and drops every entry up to the
+    /// last one of the previous page (F799, the page-break flag each entry keeps), so the page on screen is
+    /// never in it and the backlog only opens once a page has been read.
     pub fn backlog_len(&self) -> usize {
-        self.backlog_pages.len() + usize::from(!self.page.texts.is_empty() || !self.page.choice_texts.is_empty())
+        self.backlog_pages.len()
     }
 
-    /// Text quads of backlog page `back` (0 = the current page), laid out like the message window
+    /// Text quads of backlog page `back` (0 = the newest finished page), laid out like the message window
     /// (sub_28470 lays the history out with the message text style at x 88 units).
     pub fn backlog_quads(&mut self, r: &Renderer, back: usize) -> Vec<Quad> {
-        let cur = usize::from(!self.page.texts.is_empty() || !self.page.choice_texts.is_empty());
-        let texts = if back < cur {
-            self.page.texts.iter().chain(&self.page.choice_texts).cloned().collect()
-        } else {
-            match self.backlog_pages.len().checked_sub(back + 1 - cur) {
-                Some(i) => self.backlog_pages[i].clone(),
-                None => return Vec::new(),
-            }
+        let texts = match self.backlog_pages.len().checked_sub(back + 1) {
+            Some(i) => self.backlog_pages[i].texts.clone(),
+            None => return Vec::new(),
         };
         let mut placed = Vec::new();
         let (mut pen_y, mut order) = (None, 0);
@@ -2599,13 +2688,40 @@ impl Game {
     }
 
     /// Draw the queued previews: the layers as a stage on black at canvas size, then halved twice.
+    /// A preview waits until the worker threads have decoded the images it is missing.
     fn render_previews(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
+        while let Ok(d) = self.preview_decoded.1.try_recv() {
+            self.preview_decoding.remove(d.key());
+            self.assets.finish_decoded(r, d);
+        }
         if self.preview_queue.is_empty() {
+            return;
+        }
+        let mut ready = Vec::new();
+        for (slot, layers) in std::mem::take(&mut self.preview_queue) {
+            let mut waiting = false;
+            for ls in layers.iter().flatten() {
+                let Some(name) = &ls.image else { continue };
+                if self.assets.image_cached(name, ls.grade) {
+                    continue;
+                }
+                waiting = true;
+                if self.preview_decoding.insert(crate::assets::Assets::image_key(name, ls.grade).2) {
+                    self.assets.decode_async(name, ls.grade, self.preview_decoded.0.clone());
+                }
+            }
+            if waiting {
+                self.preview_queue.push((slot, layers));
+            } else {
+                ready.push((slot, layers));
+            }
+        }
+        if ready.is_empty() {
             return;
         }
         let rt = self.preview_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "preview")).tex.clone();
         let half = r.create_target(CANVAS_W / 2, CANVAS_H / 2, "preview half");
-        for (slot, layers) in std::mem::take(&mut self.preview_queue) {
+        for (slot, layers) in ready {
             let mut stage = Stage::new();
             for (i, ls) in layers.iter().enumerate() {
                 if let Some(l) = ls.as_ref().and_then(|ls| self.layer_from_save(r, i, ls)) {
@@ -2639,9 +2755,13 @@ impl Game {
         }
         // a load puts the record's previous entry back into the rewind ring (sub_82330 -> sub_5D950)
         if !rewind {
+            // so the backlog (the ring's pages) starts out empty
             self.history.clear();
+            self.backlog_pages.clear();
             if let Some(p) = d.prev.as_deref().filter(|p| p.kind == 0) {
-                self.history.push_back((p.clone(), self.node_seq, (p.scene, p.pc, usize::MAX)));
+                let serial = self.ring_serial;
+                self.ring_serial += 1;
+                self.history.push_back(RingEntry { data: p.clone(), node: self.node_seq, key: (p.scene, p.pc, usize::MAX), serial });
             }
             self.last_ring = d.prev.as_deref().cloned();
         }
@@ -2695,7 +2815,7 @@ impl Game {
             }
         }
         self.ended = false;
-        self.clear_page();
+        self.clear_page(false);
         self.page.visible = false;
         self.page.alpha = 0.0;
         self.page.quick = false;
@@ -2710,6 +2830,7 @@ impl Game {
         }
         self.pc = d.pc;
         self.wait = Wait::None;
+        self.click_ms = 0.0;
         // the entry's voice plays again (load: sub_5D950 0x5ee6c; rewind: sub_5BAF0 makes it pending for the
         // replayed message)
         self.pending_voice = None;
@@ -2731,6 +2852,7 @@ impl Game {
 
     pub fn reset(&mut self) {
         self.history.clear();
+        self.backlog_pages.clear();
         self.read_key = None;
         self.node_seq = 0;
         self.seek_node = false;
@@ -2749,7 +2871,7 @@ impl Game {
         self.msg_voice = None;
         self.speaker = 0;
         self.vars.retain(|k, _| k.starts_with('G'));
-        self.clear_page();
+        self.clear_page(false);
         self.page.visible = false;
         self.page.alpha = 0.0;
         self.page.quick = false;
@@ -2885,8 +3007,7 @@ const JUMP_KEEP_BITS: [usize; 42] = [
 ];
 
 /// Per-playthrough flowchart state lives in F words like the exe's, so saves carry it: RTST node bits
-/// from F201 (sub_92340) and edge bits from F600 (sub_92380), 8 per word; `~LAST` (not saved; rebuilt from
-/// the scene on load) is the last RTST node + 1.
+/// from F201 (sub_92340) and edge bits from F600 (sub_92380), 8 per word; F110 is the current node.
 impl Game {
     fn play_word(key: char, i: usize) -> String {
         format!("F{:03}", if key == 'R' { 201 } else { 600 } + i / 8)
@@ -2915,12 +3036,13 @@ impl Game {
         if (533..=557).contains(&n) || self.var("F024") != 0 {
             self.set_var("F110", n);
         }
-        self.vars.insert("~LAST".into(), n + 1);
     }
 
-    /// Last node reached in this playthrough.
-    pub fn route_last(&self) -> Option<i32> {
-        Some(self.var("~LAST") - 1).filter(|&n| n >= 0)
+    /// The playthrough's current node, F110 (byte 0xDC of the F words: set by RTST for nodes 533..557 or
+    /// while F24 is set, and to the target node at every scene JUMP, sub_954B0). The in-game flowchart
+    /// opens with its cursor there (sub_1767C).
+    pub fn current_node(&self) -> i32 {
+        self.var("F110")
     }
 
     pub fn flow_flags(&self) -> crate::flow::Flags {

@@ -7,7 +7,7 @@ use super::{Game, Settings, get_bit, read_key, set_bit};
 use crate::{
     save::{Kept, LayerSave, SaveData, SeSave},
     stage::Source,
-    save_tables::{SCENE_NODE, SE_NAMES, SEEN_ALIAS},
+    save_tables::{SE_NAMES, SEEN_ALIAS},
     savedata::{self as sd, SaveFile, cfg, get_f32, get_i16, get_i32, get_i64, get_u16, put_f32, put_i16, put_i32, put_i64, st},
     text,
 };
@@ -199,14 +199,8 @@ impl Game {
         let script = self.assets.scene(scene)?;
         let target = get_i64(p, sd::P_OFFSET) + 1;
         let pc = script.commands.iter().position(|c| c.offset as i64 >= target)?;
-        let mut vars: Vec<(String, i32)> =
+        let vars: Vec<(String, i32)> =
             sd::read_f(p).into_iter().filter(|&(_, v)| v != 0).map(|(n, v)| (format!("F{n:03}"), i32::from(v))).collect();
-        // knife's edge marking starts from the node of the scene being resumed (sub_92D00)
-        if let Some(&n) = scene.checked_sub(1).and_then(|i| SCENE_NODE.get(i))
-            && n >= 0
-        {
-            vars.push(("~LAST".into(), i32::from(n) + 1));
-        }
         let raw = &p[sd::P_TEXT..sd::P_TEXT + 0x200];
         let raw = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
         let preview = if get_u16(p, sd::P_TYPE) == TYPE_MESSAGE && raw.starts_with('$') {

@@ -12,6 +12,10 @@ CARGO_INCREMENTAL=0 cargo build --release -p knife
 `build/Tsukihime.command` starts the copied build with normal saves. `build/Tsukihime (Unlocked).command` starts it
 with everything unlocked (see `tools/unlocked_save.py`). Saves go to `KNIFE_SAVE_DIR` when it is set.
 
+Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the Media
+Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, and the GStreamer development
+packages to build). An `ffmpeg` executable on the `PATH` is the fallback; `--features ffmpeg` always uses it.
+
 ## Saves
 
 knife uses the Switch game's save file, `savedata.bin` (0x3E7000 bytes: settings, unlocks, read text and 140
@@ -26,6 +30,12 @@ The keyboard stands in for the Switch controller, with the same key for the same
 button then does what it does in the Switch game on that screen (the game's own map is Config → 操作説明,
 `conf_manual0_ja`). The left mouse button is the touch screen, and the mouse wheel / trackpad scroll is
 the right stick.
+
+Game controllers work too (gilrs, as in shin; on macOS the GameController framework, which keeps
+working after another app has used the pad): every controller is the same Switch controller, button for
+button — A / B / X / Y as the controller labels them, Plus / Minus (Start / Back), L / R, ZL / ZR, the d-pad
+and left stick, and the right stick up / down. Held directions repeat like on the Switch (after 15 frames,
+then every 5).
 
 | Key | Switch |
 |---|---|

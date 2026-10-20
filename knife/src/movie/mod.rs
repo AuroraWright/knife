@@ -1,4 +1,11 @@
-//! Movie playback through an external `ffmpeg` process (H.264 MP4 -> raw RGBA frames).
+//! Movie playback: the MP4 is demuxed here and its H.264 video decoded by the platform (VideoToolbox, Media
+//! Foundation or GStreamer, see `decoder`), its AAC audio by symphonia. An `ffmpeg` executable is the fallback
+//! when the platform decoder is unavailable.
+
+mod audio;
+mod bitstream;
+mod decoder;
+mod mp4;
 
 use std::{
     io::Read,
@@ -60,8 +67,8 @@ pub const MOVIES: &[&str] = &[
     "credit06",
 ];
 
-const W: u32 = 1920;
-const H: u32 = 1080;
+pub(crate) const W: u32 = 1920;
+pub(crate) const H: u32 = 1080;
 
 pub struct Movie {
     child: Option<Child>,
@@ -91,28 +98,50 @@ pub struct Movie {
     ready_wait: u8,
 }
 
-fn probe_fps(path: &Path) -> f32 {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"])
-        .arg(path)
-        .output();
-    let Ok(out) = out else { return 30.0 };
-    let s = String::from_utf8_lossy(&out.stdout);
-    let s = s.trim();
-    match s.split_once('/') {
-        Some((a, b)) => {
-            let (a, b) = (a.parse::<f32>().unwrap_or(30.0), b.parse::<f32>().unwrap_or(1.0));
-            if b > 0.0 { a / b } else { 30.0 }
-        }
-        None => s.parse().unwrap_or(30.0),
-    }
+/// Frame rate from the video track's sample tables (30 when unknown).
+fn track_fps(path: &Path) -> f32 {
+    let fps = mp4::Mp4::open(path)
+        .map(|m| m.video.info(|t| t.frame_rate()))
+        .unwrap_or(0.0);
+    if fps > 0.0 { fps as f32 } else { 30.0 }
 }
 
-fn spawn_video(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
+/// RGBA frames from `start` seconds on: the platform decoder, else an ffmpeg process.
+fn spawn_video(
+    path: &Path,
+    start: f32,
+    fps: f32,
+) -> Result<(Option<Child>, mpsc::Receiver<Vec<u8>>)> {
+    if !cfg!(feature = "ffmpeg") {
+        match decoder::spawn(path, start, fps) {
+            Ok(rx) => return Ok((None, rx)),
+            Err(e) => tracing::warn!("platform movie decoder unavailable, trying ffmpeg: {e:#}"),
+        }
+    }
+    let (child, rx) = spawn_ffmpeg(path, start)?;
+    Ok((Some(child), rx))
+}
+
+fn spawn_ffmpeg(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-ss", &format!("{start:.3}"), "-i"])
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-ss",
+            &format!("{start:.3}"),
+            "-i",
+        ])
         .arg(path)
-        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{W}x{H}"), "-"])
+        .args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &format!("{W}x{H}"),
+            "-",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -136,28 +165,15 @@ fn spawn_video(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8>
 
 /// Decode a movie's audio track (None when it has none).
 pub fn decode_audio(path: &Path) -> Option<Pcm> {
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
-        .arg(path)
-        .args(["-vn", "-f", "f32le", "-ac", "2", "-ar", "48000", "-"])
-        .stderr(Stdio::null())
-        .output()
+    let track = mp4::Mp4::open(path)
+        .map_err(|e| tracing::warn!("{}: {e:#}", path.display()))
+        .ok()?
+        .audio?;
+    let (sample_rate, frames) = audio::decode(track)
+        .map_err(|e| tracing::warn!("{}: {e:#}", path.display()))
         .ok()?;
-    if out.stdout.len() < 8 {
-        return None;
-    }
-    let frames = out
-        .stdout
-        .chunks_exact(8)
-        .map(|c| {
-            [
-                f32::from_le_bytes(c[0..4].try_into().unwrap()),
-                f32::from_le_bytes(c[4..8].try_into().unwrap()),
-            ]
-        })
-        .collect();
-    Some(Pcm {
-        sample_rate: 48000,
+    (!frames.is_empty()).then_some(Pcm {
+        sample_rate,
         frames,
         loop_range: None,
     })
@@ -165,10 +181,10 @@ pub fn decode_audio(path: &Path) -> Option<Pcm> {
 
 impl Movie {
     pub fn open(r: &Renderer, path: &Path, looping: bool) -> Result<Self> {
-        let fps = probe_fps(path);
-        let (child, rx) = spawn_video(path, 0.0)?;
+        let fps = track_fps(path);
+        let (child, rx) = spawn_video(path, 0.0, fps)?;
         Ok(Self {
-            child: Some(child),
+            child,
             rx,
             tex: r.create_writable(W, H, false, "movie"),
             fps,
@@ -216,7 +232,11 @@ impl Movie {
         if self.hold {
             return;
         }
-        self.ready_wait = if self.has_frame { self.ready_wait.saturating_sub(1) } else { 4 };
+        self.ready_wait = if self.has_frame {
+            self.ready_wait.saturating_sub(1)
+        } else {
+            4
+        };
         if self.has_frame && self.fading_in {
             self.alpha = (self.alpha + 0.05 * frames).min(1.0);
         }
@@ -238,9 +258,10 @@ impl Movie {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if self.looping {
-                        if let Ok((child, rx)) = spawn_video(&self.path, self.loop_start) {
+                        if let Ok((child, rx)) = spawn_video(&self.path, self.loop_start, self.fps)
+                        {
                             self.kill();
-                            self.child = Some(child);
+                            self.child = child;
                             self.rx = rx;
                             self.elapsed = self.loop_start * 1000.0;
                             self.shown = (self.loop_start * self.fps).round() as u64;
@@ -263,6 +284,8 @@ impl Movie {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // a platform decoder thread ends once its frame channel is gone
+        self.rx = mpsc::sync_channel(0).1;
     }
 
     /// sub_1A80: stops playback; the last frame then fades out.
@@ -276,5 +299,53 @@ impl Movie {
 impl Drop for Movie {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// The platform decoder's frames match ffmpeg's from the start and after a seek (needs switch_romfs).
+    #[test]
+    fn platform_frames_match_ffmpeg() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../switch_romfs/movie/titlebg1.mp4");
+        if !path.exists() {
+            return;
+        }
+        for start in [0.0, 30.0] {
+            let fps = super::track_fps(&path);
+            let ours = super::decoder::spawn(&path, start, fps).unwrap().recv().unwrap();
+            let (mut child, rx) = super::spawn_ffmpeg(&path, start).unwrap();
+            let theirs = rx.recv().unwrap();
+            let _ = child.kill();
+            let diff = ours.iter().zip(&theirs).map(|(a, b)| u64::from(a.abs_diff(*b))).sum::<u64>() as f64
+                / ours.len() as f64;
+            eprintln!("start {start}: mean abs diff {diff:.3}");
+            assert!(diff < 2.0, "start {start}: mean abs diff {diff}");
+        }
+    }
+
+    /// symphonia's AAC decode matches ffmpeg's (needs switch_romfs).
+    #[test]
+    fn audio_matches_ffmpeg() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../switch_romfs/movie/prologue.mp4");
+        if !path.exists() {
+            return;
+        }
+        let ours = super::decode_audio(&path).unwrap();
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&path)
+            .args(["-vn", "-f", "f32le", "-ac", "2", "-ar", "48000", "-"])
+            .output()
+            .unwrap();
+        let theirs: Vec<f32> = out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        eprintln!("frames {} vs {}", ours.frames.len(), theirs.len() / 2);
+        let n = ours.frames.len().min(theirs.len() / 2);
+        let err = (0..n).map(|i| (ours.frames[i][0] - theirs[2 * i]).abs()).fold(0.0f32, f32::max);
+        eprintln!("max abs diff {err}");
+        assert_eq!(ours.sample_rate, 48000);
+        assert!(ours.frames.len() == theirs.len() / 2 && err < 1e-3);
     }
 }

@@ -36,6 +36,8 @@ pub enum Confirm {
     Ending(usize),
     /// config Default (dialog 27)
     Defaults,
+    /// backlog quick jump (dialog 23)
+    BacklogJump,
 }
 
 impl Confirm {
@@ -53,6 +55,7 @@ impl Confirm {
             Confirm::QuickLoad => (230, true),
             Confirm::Ending(i) => (crate::gallery::ENDINGS[i].2, true),
             Confirm::Defaults => (160, true),
+            Confirm::BacklogJump => (231, true),
         }
     }
 }
@@ -63,7 +66,7 @@ impl Confirm {
 #[derive(Clone, Copy, PartialEq)]
 struct Cursor {
     screen: Screen,
-    rest: (usize, bool, bool, usize, usize, usize, usize, usize),
+    rest: (usize, bool, bool, usize, crate::flow::Cell, usize, usize, usize),
     hover: Option<usize>,
 }
 
@@ -141,6 +144,8 @@ enum Action {
     ToTitle,
     Slot(usize),
     Back,
+    /// A or a tap on the backlog page: ask to jump back to it (sub_28A90)
+    BacklogJump,
     Setting(usize, i32),
     Yes,
     No,
@@ -250,7 +255,10 @@ pub struct Ui {
     flow_target: f32,
     flow_from: f32,
     flow_t: f32,
-    flow_cur: usize,
+    /// cursor cell (record, shown row; cFlowchart + 56 / + 60), which can be a record without a node
+    flow_cell: flow::Cell,
+    /// chart y of the cursor sprite: moved only onto records with a node (sub_10BA4), 0 before that
+    flow_cur_y: f32,
     /// boot / caution sequence (Screen::Intro)
     intro: Option<Intro>,
     /// title in PRESS ANY BUTTON mode (sub_90180: the first title of a session before the cautions)
@@ -283,6 +291,8 @@ pub struct Ui {
     /// content alpha of the top screen; `closing` fades it out and then leaves the screen
     scr_a: f32,
     closing: bool,
+    /// the backlog is closing for a quick jump
+    backlog_jump: bool,
     /// gallery mode crossfade (sub_8400: 0.5 s out, 0.5 s in) and the mode waiting for the fade-out
     gal_a: f32,
     gal_next: Option<Screen>,
@@ -324,8 +334,20 @@ pub struct Ui {
     /// UI fonts besides the message font: ja2 TsukuGo (help balloon), ja3 FOT-Seurat (menu chapter name)
     font_go: Option<FontAtlas>,
     font_ui: Option<FontAtlas>,
-    /// system menu tab under the cursor (HIDWORD(qword_B359EC)): kept across menu invocations
+    /// system menu tab under the cursor (HIDWORD(qword_B359EC)): kept across menu invocations and title
+    /// visits (set to 0 once at boot, sub_4CA50); the line / dot cursor marks it
     sys_tab: usize,
+    /// the UI focus object (qword_19150EC, sub_AE0E0) is that tab: the tab is drawn highlighted with its
+    /// help balloon. sub_4CEA0 sets it when the cursor moves or is tapped and a return from a submenu
+    /// restores it (states 9 / 12 / 16); every other screen (the title, a choice, a submenu's page) takes
+    /// the focus for its own objects, so the first menu after starting from the title shows none.
+    sys_focus: bool,
+    /// config cursor per tab (dword_46CDB0[628 * tab + 2] row, -1 the tab bar, and +550 + row column),
+    /// kept for the whole run and shared by the title's config: sub_2B010 starts tabs 0 / 1 on their first
+    /// object (55 / 78, the first slider's minus) and the controls tab on the tab bar
+    conf_cur: [Option<(usize, usize)>; 3],
+    /// title cursor entry (dword_65CBD4), kept while a submenu or dialog is open over the title
+    title_cur: Option<Action>,
     /// focus is on the system menu tabs while one of its submenus stays open (sub_4D580 -> sub_4CEA0),
     /// and the submenu item to return to
     side: bool,
@@ -636,7 +658,8 @@ impl Ui {
             flow_target: 0.0,
             flow_from: 0.0,
             flow_t: FLOW_SCROLL_MS,
-            flow_cur: 0,
+            flow_cell: (0, 0),
+            flow_cur_y: 0.0,
             intro: None,
             press: false,
             boot_flag: true,
@@ -657,6 +680,7 @@ impl Ui {
             black_under: false,
             scr_a: 1.0,
             closing: false,
+            backlog_jump: false,
             gal_a: 1.0,
             gal_next: None,
             gal_side: true,
@@ -678,6 +702,9 @@ impl Ui {
             help_item: None,
             key_focus: false,
             sys_tab: 0,
+            sys_focus: false,
+            conf_cur: [Some((0, 0)), Some((0, 0)), None],
+            title_cur: None,
             sounded: false,
             side: false,
             sub_hover: None,
@@ -1351,9 +1378,15 @@ impl Ui {
     }
 
     fn push(&mut self, s: Screen) {
+        if self.screen == Screen::Title {
+            self.title_cur = self.hover.and_then(|i| self.title_entries().get(i).map(|e| e.0));
+        }
         self.stack.push(self.screen);
         self.screen = s;
-        self.hover = if s == Screen::Menu { Some(self.sys_tab) } else { None };
+        if s != Screen::Menu {
+            self.sys_focus = false;
+        }
+        self.hover = if s == Screen::Menu { self.sys_focus.then_some(self.sys_tab) } else { None };
         self.side = false;
         self.closing = false;
         self.scr_a = if Self::fade_speeds(s).0 < 1.0 { 0.0 } else { 1.0 };
@@ -1377,8 +1410,16 @@ impl Ui {
 
     fn pop(&mut self) {
         self.screen = self.stack.pop().unwrap_or(Screen::Game);
-        // back in the system menu the cursor stays on the tab that was open (state 9 / 12)
-        self.hover = if self.screen == Screen::Menu { Some(self.sys_tab) } else { None };
+        // back in the system menu the cursor stays on the tab that was open and takes the focus (state 9 / 12)
+        if self.screen == Screen::Menu {
+            self.sys_focus = true;
+        }
+        self.hover = match self.screen {
+            Screen::Menu => Some(self.sys_tab),
+            // back on the title from LOAD GAME, CONFIG or a dialog: states 15 / 17 keep dword_65CBD4
+            Screen::Title => self.title_cur.and_then(|a| self.title_entries().iter().position(|e| e.0 == a)),
+            _ => None,
+        };
         self.side = false;
         // back in the gallery (from the CG viewer, a movie, a dialog or the flowchart): the cursor returns
         // to where the focus was, the button cursor onto the open mode (sub_7624)
@@ -1409,6 +1450,7 @@ impl Ui {
         match self.screen {
             // objects 197..201 placed by sub_4C370
             // the focused tab (sub_AE0E0): the menu's cursor, or the side cursor over an open submenu
+            Screen::Menu if hover.is_none() => None,
             Screen::Menu | Screen::SaveLoad { .. } | Screen::Config if self.screen == Screen::Menu || self.side => {
                 let h = self.sys_tab;
                 let id = [161, 162, 163, 168, 166][h];
@@ -1442,6 +1484,11 @@ impl Ui {
     /// offset by 6 units, as mode_help stretched to the text width + 40 behind the text (alpha 0.7).
     fn draw_help(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
         let Some((id, pos, rc, flags)) = self.help_target() else { return };
+        // a target the update has not seen yet (the screen changed after it ran this frame, e.g. a submenu's
+        // close finishing) starts from nothing next frame; drawing it now would flash the old balloon alpha
+        if self.help_item != Some((id, [pos[0].round() as i32, pos[1].round() as i32])) {
+            return;
+        }
         let a = self.help_t * self.scr_a;
         if a <= 0.0 || self.busy() || self.popup.is_some() {
             return;
@@ -1529,6 +1576,8 @@ impl Ui {
     /// Show the title, fading in from black (sub_8E200 state 2: 0.012 / frame).
     fn enter_title(&mut self) {
         self.screen = Screen::Title;
+        // the title's entries take the UI focus (sub_8E200)
+        self.sys_focus = false;
         self.stack.clear();
         self.intro = None;
         self.press = self.boot_flag;
@@ -1714,6 +1763,8 @@ impl Ui {
             Screen::SaveLoad { .. } | Screen::Config => (0.024, 0.048),
             Screen::Menu => (0.0555, 0.0333),
             Screen::Gallery | Screen::Music | Screen::Movies | Screen::Endings => (0.04, 0.04),
+            // backlog: sub_28F80 states 4 and 8 (and the quick jump, sub_28D50)
+            Screen::Backlog { .. } => (0.05, 0.05),
             _ => (1.0, 1.0),
         }
     }
@@ -1732,8 +1783,15 @@ impl Ui {
     }
 
     /// The fade-out finished: leave the screen; back on the title or in game the backdrop fades out.
-    fn finish_close(&mut self, game: &mut Game) {
+    fn finish_close(&mut self, game: &mut Game, r: &Renderer) {
         let from = self.screen;
+        // the backlog faded out for a quick jump (sub_28D50): replay from the page as a rewind does (sub_5BAF0),
+        // or sound 2 when its entry is gone
+        if let (Screen::Backlog { scroll }, true) = (from, std::mem::take(&mut self.backlog_jump)) {
+            if !game.backlog_jump(r, scroll) {
+                self.snd(game, 2);
+            }
+        }
         if Self::is_gallery_mode(from) && self.playing_track.take().is_some() {
             self.music_paused = false;
             game.play_bgm(0, 1.0, 0.5);
@@ -1741,9 +1799,12 @@ impl Ui {
         self.pop();
         match self.screen {
             Screen::Title if Self::is_gallery_mode(from) => {
-                // leaving the gallery (sub_5040): backdrop out at 0.04, the title fades in from black
-                self.menu_bg.fade(-0.04);
+                // leaving the gallery (sub_48AC0 mode 0 substate 10): sub_8D2E0 restarts the title (black, state
+                // 0, fading in at 0.012 in state 2) and the backdrop and strips fade out at 0.02 over it, so the
+                // backdrop crossfades into the title instead of going to black first
+                self.menu_bg.fade(-0.02);
                 self.enter_title();
+                self.black_under = true;
                 // byte_1536158: the cursor comes back on GALLERY
                 self.hover = self.title_cursor(Action::OpenExtra);
             }
@@ -1908,7 +1969,9 @@ impl Ui {
             }
             // sub_4AE90: buttons 0 (Yes) at 330 and 1 (No) at 252, y 249.01 (640x448 units), 216x56
             Screen::Confirm(_) => vec![([990.0, 600.0, 216.0, 56.0], Action::Yes), ([756.0, 600.0, 216.0, 56.0], Action::No)],
-            Screen::Backlog { .. } => vec![([0.0, 0.0, W, H], Action::Back)],
+            // sub_28A90: a tap left of x 543 (640x448 units, clear of the scroll bar) asks for the quick jump;
+            // the button guide (sub_4A410: x >= 546, y > 393) closes
+            Screen::Backlog { .. } => vec![([0.0, 0.0, 543.0 * 3.0, H], Action::BacklogJump), ([546.0 * 3.0, 393.0 * H / 448.0, W - 546.0 * 3.0, H - 393.0 * H / 448.0], Action::Back)],
             Screen::Game => {
                 let _ = game;
                 Vec::new()
@@ -1957,17 +2020,40 @@ impl Ui {
         if self.sysmes.is_empty() {
             self.sysmes = game.assets.sysmes();
         }
-        let chart = flow::build(&game.flow_flags(), gallery);
-        let last = game.route_last();
-        self.flow_cur = chart.nodes.iter().position(|n| Some(n.node) == last).unwrap_or(0);
+        let chart = flow::build(game.flow_flags(), gallery);
         self.flow_scroll = 0.0;
         self.flow_target = 0.0;
         self.flow_t = FLOW_SCROLL_MS;
+        self.flow_cur_y = 0.0;
+        // sub_F8FC(a3): the cursor starts on the record (0, 0), then on each shown row's first record with id
+        // a3, the last row winning, each placement followed at once (sub_10BA4, sub_10D5C(0)). In game a3 is
+        // the current node F110 (sub_1767C), so a playthrough at id 0 (no JUMP yet) ends on the last row
+        // holding an empty record. The gallery passes the node its last flowchart replay started from
+        // (off_AE0288[1], sub_5040), -1 until then; knife has no gallery replay.
+        let a3 = if gallery { -1 } else { game.current_node() };
+        let mut placed = Vec::new();
+        self.flow_cell = chart.open_cursor(a3, |c| placed.push(c));
         self.flow = Some(chart);
-        // sub_F8FC: the first placement does not animate
-        self.flow_follow(false);
+        for c in placed {
+            self.flow_cell = c;
+            self.flow_place(false);
+        }
         self.push(Screen::Flowchart { gallery });
-        self.hover = self.flow.as_ref().filter(|c| !c.nodes.is_empty()).map(|_| self.flow_cur);
+        self.hover = self.flow_node();
+    }
+
+    /// The node under the flowchart cursor, if its record has one.
+    fn flow_node(&self) -> Option<usize> {
+        self.flow.as_ref().and_then(|c| c.node_at(self.flow_cell))
+    }
+
+    /// sub_10BA4 + sub_10D5C: the cursor sprite moves onto the cursor's node (when its record has one), and
+    /// the view follows it.
+    fn flow_place(&mut self, animate: bool) {
+        if let Some(i) = self.flow_node() {
+            self.flow_cur_y = self.flow.as_ref().map_or(0.0, |c| c.nodes[i].pos[1]);
+        }
+        self.flow_follow(animate);
     }
 
     /// Draw the screen below the current one (for dialogs and the CG viewer), without its guide.
@@ -2016,14 +2102,18 @@ impl Ui {
     /// Keep the cursor node inside the chart view (sub_10D5C).
     /// sub_10D5C: when the cursor node is above y 2 the row before it goes to y 4; when it is below y 966 the
     /// row after it goes to y 966 (positions are node tops in the view).
+    /// It measures the cursor sprite, which stays put while the cursor is on a record without a node.
     fn flow_follow(&mut self, animate: bool) {
         let Some(c) = &self.flow else { return };
-        let Some(n) = c.nodes.get(self.flow_cur) else { return };
-        let y = n.pos[1] - self.flow_target;
+        let Ok(row) = usize::try_from(self.flow_cell.1) else { return };
+        if c.row_y.is_empty() {
+            return;
+        }
+        let y = self.flow_cur_y - self.flow_target;
         let target = if y < 2.0 {
-            c.row_y[n.row.max(1) - 1] - 4.0
+            c.row_y[row.max(1) - 1] - 4.0
         } else if y > 966.0 {
-            c.row_y[(n.row + 1).min(c.row_y.len() - 1)] - 966.0
+            c.row_y[(row + 1).min(c.row_y.len() - 1)] - 966.0
         } else {
             return;
         };
@@ -2046,31 +2136,14 @@ impl Ui {
     /// sub_12D1C: after a manual scroll the cursor moves row by row until its node is inside y 4..994.
     fn flow_keep_cursor(&mut self) {
         let Some(c) = &self.flow else { return };
-        let Some(cur) = c.nodes.get(self.flow_cur) else { return };
-        let y = cur.pos[1] - self.flow_target;
-        let dy = if y < 4.0 {
-            1
-        } else if y >= 994.0 {
-            -1
-        } else {
-            return;
-        };
-        let (x, mut row) = (cur.pos[0], cur.row as i64);
-        let last = c.row_y.len() as i64 - 1;
-        while (0..=last).contains(&(row + dy)) {
-            row += dy;
-            let near = (0..c.nodes.len())
-                .filter(|&i| c.nodes[i].row as i64 == row)
-                .min_by(|&a, &b| (c.nodes[a].pos[0] - x).abs().total_cmp(&(c.nodes[b].pos[0] - x).abs()));
-            if let Some(i) = near {
-                self.flow_cur = i;
-                let y = c.nodes[i].pos[1] - self.flow_target;
-                if (4.0..994.0).contains(&y) {
-                    break;
-                }
+        let target = self.flow_target;
+        if let Some(cell) = c.keep_in_view(self.flow_cell, |i| c.nodes[i].pos[1] - target) {
+            self.flow_cell = cell;
+            if let Some(i) = c.node_at(cell) {
+                self.flow_cur_y = c.nodes[i].pos[1];
             }
         }
-        self.hover = Some(self.flow_cur);
+        self.hover = self.flow_node();
     }
 
     /// Controls of the config screen with their top-left on the canvas (content scrolled).
@@ -2484,7 +2557,7 @@ impl Ui {
         };
         Cursor {
             screen,
-            rest: (self.sys_tab, self.side, self.gal_side, self.gal_tab, self.flow_cur, self.music_row, self.music_btn, self.conf_bar),
+            rest: (self.sys_tab, self.side, self.gal_side, self.gal_tab, self.flow_cell, self.music_row, self.music_btn, self.conf_bar),
             hover: self.hover,
         }
     }
@@ -2531,6 +2604,16 @@ impl Ui {
                 self.sounded = true;
             }
         }
+        // touch only moves these cursors onto their own objects; anywhere else (a system menu tab, the back
+        // area) they stay, so the slot or control a page opened on (the free slot, the newest save, the
+        // remembered config control) keeps its highlight: sub_50FC0 follows only touched slots 8..11,
+        // sub_29770 only the config's own objects
+        if let Screen::SaveLoad { .. } = self.screen {
+            let items = self.items(game);
+            hover = hover.filter(|&h| matches!(items[h].1, Action::Slot(_))).or(self.hover);
+        } else if self.screen == Screen::Config {
+            hover = hover.or(self.hover);
+        }
         if hover == self.hover && (self.key_focus || self.side) {
             return;
         }
@@ -2563,8 +2646,10 @@ impl Ui {
         }
         if matches!(self.screen, Screen::Flowchart { .. })
             && let Some(h) = self.hover
+            && let Some(cell) = self.flow.as_ref().and_then(|c| c.cell_of(h))
         {
-            self.flow_cur = h;
+            self.flow_cell = cell;
+            self.flow_cur_y = self.flow.as_ref().map_or(0.0, |c| c.nodes[h].pos[1]);
         }
     }
 
@@ -2609,6 +2694,7 @@ impl Ui {
             self.help_t = 0.0;
             if let Some(i) = items.iter().position(|(rc, _)| rect_hit(*rc, self.mouse)) {
                 self.sys_tab = i;
+                self.sys_focus = true;
                 self.hover = Some(i);
                 self.act(game, r, items[i].1);
             }
@@ -2689,12 +2775,18 @@ impl Ui {
             self.side_nav(game, r, dy, dx, enter);
             return;
         }
+        if enter && matches!(self.screen, Screen::Backlog { .. }) {
+            self.act(game, r, Action::BacklogJump);
+            return;
+        }
         if self.screen == Screen::Menu {
             // sub_4CEA0: up / down over the five tabs, wrapping; A opens the tab under the cursor
+            // A acts on the cursor without moving the focus onto it
             if dy != 0 {
                 self.sys_tab = (self.sys_tab as i32 + dy).rem_euclid(5) as usize;
+                self.sys_focus = true;
             }
-            self.hover = Some(self.sys_tab);
+            self.hover = self.sys_focus.then_some(self.sys_tab);
             if enter {
                 let a = self.items(game)[self.sys_tab].1;
                 self.act(game, r, a);
@@ -2815,6 +2907,7 @@ impl Ui {
     fn side_nav(&mut self, game: &mut Game, r: &Renderer, dy: i32, dx: i32, enter: bool) {
         if dy != 0 {
             self.sys_tab = (self.sys_tab as i32 + dy).rem_euclid(5) as usize;
+            self.sys_focus = true;
         } else if dx > 0 {
             self.leave_side();
         } else if enter {
@@ -3058,32 +3151,20 @@ impl Ui {
         }
     }
 
-    /// Flowchart cursor: left/right steps through the nodes in order, up/down goes to the nearest
-    /// node of the closest row above / below.
+    /// Flowchart cursor (sub_11418): left / right sub_1262C / sub_1280C, up / down sub_129F4 / sub_12B68.
     fn flow_move(&mut self, dx: i32, dy: i32) {
         let Some(c) = &self.flow else { return };
-        let n = c.nodes.len();
-        if n == 0 {
-            return;
-        }
-        let cur = self.flow_cur.min(n - 1);
-        let next = if dy != 0 {
-            let here = &c.nodes[cur];
-            let row = |r: usize| if dy > 0 { r > here.row } else { r < here.row };
-            let target = c.nodes.iter().filter(|m| row(m.row)).map(|m| m.row).reduce(|a, b| if (dy > 0) == (b < a) { b } else { a });
-            target.and_then(|t| {
-                (0..n).filter(|&i| c.nodes[i].row == t).min_by(|&a, &b| {
-                    let d = |i: usize| (c.nodes[i].pos[0] - here.pos[0]).abs();
-                    d(a).total_cmp(&d(b))
-                })
-            })
-        } else {
-            Some((cur as i32 + dx).clamp(0, n as i32 - 1) as usize)
+        let next = match (dx.signum(), dy.signum()) {
+            (-1, _) => c.move_left(self.flow_cell),
+            (1, _) => c.move_right(self.flow_cell),
+            (_, -1) => c.move_up(self.flow_cell),
+            (_, 1) => c.move_down(self.flow_cell),
+            _ => None,
         };
-        if let Some(i) = next {
-            self.flow_cur = i;
-            self.flow_follow(true);
-            self.hover = Some(i);
+        if let Some(cell) = next {
+            self.flow_cell = cell;
+            self.flow_place(true);
+            self.hover = self.flow_node();
         }
     }
 
@@ -3276,9 +3357,15 @@ impl Ui {
                 self.conf_ca = 1.0;
                 self.conf_next = None;
                 self.conf_show_tab();
-                // the cursor starts on the open tab's button in the tab bar
+                // the cursor comes back where it was on the open tab (sub_2B680), on the tab bar for a tab
+                // left there
                 self.conf_bar = self.conf_tab;
-                self.hover = Some(self.conf_tab);
+                let layout = self.conf_layout();
+                let rows = self.conf_rows(&layout);
+                self.hover = Some(match self.conf_cur[self.conf_tab].filter(|&(r, _)| r < rows.len()) {
+                    Some((r, c)) => rows[r][c.min(rows[r].len() - 1)],
+                    None => self.conf_tab,
+                });
             }
             Action::OpenFlow => {
                 // availability: the gallery needs node 1 read (loc_14CFC); in game sub_1767C needs route
@@ -3288,9 +3375,9 @@ impl Ui {
                 let ok = if gallery {
                     fl.read.get(1).copied().unwrap_or(false)
                 } else {
-                    let cur = game.route_last();
+                    let cur = game.current_node();
                     let ending = |n: i32| n == 557 || crate::gallery::ENDINGS.iter().any(|e| e.0 as i32 == n);
-                    fl.route.get(1).copied().unwrap_or(false) && !cur.is_some_and(ending)
+                    fl.route.get(1).copied().unwrap_or(false) && !ending(cur)
                 };
                 if ok {
                     self.snd(game, 1);
@@ -3450,7 +3537,18 @@ impl Ui {
                     }
                 }
             }
-            Action::ToTitle => self.confirm(game, Confirm::Title),
+            // sub_4CEA0 case 4: the confirm (sub_49710(8), state 19) only while F024 is set (the archive
+            // scene); otherwise sound 1 and straight to the auto save and the fade out
+            Action::ToTitle if game.var("F024") != 0 => self.confirm(game, Confirm::Title),
+            Action::ToTitle => {
+                self.snd(game, 1);
+                self.leave_to_title(game, r);
+            }
+            Action::BacklogJump => {
+                // sub_28A90: dialog 23 (sub_49710(23, 1), its sound 3), then sound 1
+                self.confirm(game, Confirm::BacklogJump);
+                self.snd(game, 1);
+            }
             Action::Back => {
                 // B / the back button: sound 2 (sub_4CEA0, sub_50FC0, sub_2B5C0, sub_49A40, sub_28A90, sub_6E28, ...)
                 if self.screen != Screen::MoviePlay {
@@ -3513,6 +3611,11 @@ impl Ui {
                     Confirm::Title => self.leave_to_title(game, r),
                     Confirm::Overwrite(i) => self.save(game, r, i),
                     Confirm::Load(i) => self.load(game, r, i),
+                    Confirm::BacklogJump => {
+                        // sub_28A90 state 6 -> 7: back in the backlog, which fades out and jumps
+                        self.backlog_jump = true;
+                        self.closing = true;
+                    }
                     Confirm::PrevScene => {
                         game.prev_scene(r);
                     }
@@ -3629,11 +3732,11 @@ impl Ui {
             .save_data()
             .zip(self.slots.get(save::AUTO_FIRST).and_then(Option::as_ref))
             .is_some_and(|(a, b)| a.scene == b.scene && a.pc == b.pc);
-        if same || !game.can_save() || !self.write_quiet(game, r, save::AUTO_FIRST) {
-            self.to_title(game);
-            return;
+        // without a new auto save straight to state 21, else the banner first (state 18); either way the menu
+        // and its backdrop fade out at 1/30 per frame and the title follows once both are done (sub_4D7E0)
+        if !(same || !game.can_save() || !self.write_quiet(game, r, save::AUTO_FIRST)) {
+            self.show_banner(2);
         }
-        self.show_banner(2);
         self.title_after_banner = true;
         self.closing = true;
         self.menu_bg.fade(-1.0 / 30.0);
@@ -3845,11 +3948,12 @@ impl Ui {
         }
         self.help_t = (self.help_t + 0.05 * f).min(1.0);
         self.intro_update(game, r, f);
-        // the backdrop keeps fading while the title waits for its movie: the movie is held while the backdrop
-        // shows, so a frozen fade (leaving the gallery restarts the movie) would never let it get ready
+        // the backdrop keeps fading while the title waits for its movie (the exe's backdrop runs outside
+        // sub_8E200)
         self.menu_bg.update(secs * 60.0);
-        // the title movie stops while a submenu backdrop covers the title
-        game.hold_movie(self.title_movie && self.menu_bg.visible());
+        // sub_49630 -> sub_1B20: the title movie pauses when a submenu backdrop starts fading in and resumes as
+        // soon as it starts fading out, so the title shows under the fading backdrop
+        game.hold_movie(self.title_movie && self.menu_bg.movie_paused);
         let on_title = self.screen == Screen::Title
             || self.stack.first() == Some(&Screen::Title)
             || matches!(self.intro, Some(Intro::PressOut { .. }));
@@ -3864,6 +3968,7 @@ impl Ui {
             self.black = (self.black + self.black_speed * f).clamp(0.0, 1.2);
             if self.black <= 0.0 {
                 self.black_speed = 0.0;
+                self.black_under = false;
             } else if self.black >= 1.2 {
                 self.black_speed = 0.0;
                 if let Some(a) = self.black_then.take() {
@@ -3878,7 +3983,7 @@ impl Ui {
                 if self.title_after_banner {
                     self.scr_a = 0.0;
                 } else {
-                    self.finish_close(game);
+                    self.finish_close(game, r);
                 }
             }
         } else {
@@ -3897,6 +4002,20 @@ impl Ui {
         }
         if self.screen == Screen::Config {
             self.conf_tick(f);
+            // sub_29770: each move of the config cursor is kept as the tab's row / column (-1: the tab bar)
+            if !self.side
+                && self.conf_next.is_none()
+                && let Some(h) = self.hover
+            {
+                let layout = self.conf_layout();
+                let rows = self.conf_rows(&layout);
+                self.conf_cur[self.conf_tab] =
+                    rows.iter().enumerate().find_map(|(r, row)| row.iter().position(|&x| x == h).map(|c| (r, c)));
+            }
+        }
+        // a choice takes the UI focus (sub_83B20)
+        if self.screen == Screen::Game && game.in_choice() {
+            self.sys_focus = false;
         }
         if self.screen == Screen::Config && self.conf_tab == 0 {
             self.conf_preview_update(game, f);
@@ -3932,7 +4051,7 @@ impl Ui {
                 }
             }
         }
-        if self.title_after_banner && self.banner.is_none() {
+        if self.title_after_banner && self.banner.is_none() && self.scr_a <= 0.0 {
             self.title_after_banner = false;
             self.closing = false;
             self.to_title(game);
@@ -4001,7 +4120,7 @@ impl Ui {
     /// The system menu (sub_4C370) drawn under the save/load and config screens when they were opened
     /// from it. `open`: the button of the open submenu (selected column); `cursor`: the tab under the cursor
     /// (hover column, with the cursor light and line).
-    fn draw_menu_base(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, open: Option<usize>, cursor: Option<usize>) {
+    fn draw_menu_base(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, open: Option<usize>, cursor: Option<usize>, focus: Option<usize>) {
         self.sprite(out, "system_titlebg", [0.0, 0.0, W, 392.0], None);
         self.sprite(out, "system_scenebg", [752.0, 0.0, 1168.0, 80.0], None);
         self.sprite(out, "underline", [0.0, 72.0, W, 16.0], None);
@@ -4026,7 +4145,7 @@ impl Ui {
             // menu_btn_ja: rows Save, Load, Config, FlowChart, Title; columns normal / hover / selected
             let col = if open == Some(i) {
                 2.0
-            } else if cursor == Some(i) {
+            } else if focus == Some(i) {
                 1.0
             } else {
                 0.0
@@ -4289,11 +4408,13 @@ impl Ui {
                 // sub_4C370 (640x448 units scaled to the canvas): title band, scene band, underline,
                 // phase title (F023 indexes the rect table at dword_5912E8+624), window on the left,
                 // buttons, cursor line + light, and the scene title SYSMES[F022+395] at the right
-                // the cursor shows on the remembered tab as soon as the menu opens
+                // the line / dot cursor shows on the remembered tab as soon as the menu opens; the tab is
+                // highlighted only while it has the focus
                 let cur = Some(self.sys_tab);
+                let focus = self.hover;
                 self.draw_menu_layer(out);
                 let n0 = out.len();
-                self.draw_menu_base(game, r, out, None, cur);
+                self.draw_menu_base(game, r, out, None, cur, focus);
                 self.fade_quads(out, n0, self.scr_a);
             }
             Screen::SaveLoad { save, .. } => {
@@ -4301,7 +4422,7 @@ impl Ui {
                     self.draw_menu_layer(out);
                     // the line / dot cursor only shows while the tabs have the focus
                     let cur = self.side.then_some(self.sys_tab);
-                    self.draw_menu_base(game, r, out, Some(usize::from(!save)), cur);
+                    self.draw_menu_base(game, r, out, Some(usize::from(!save)), cur, cur);
                 } else {
                     // opened from the title: the title (with the backdrop) stays underneath
                     self.draw_under(game, r, out);
@@ -4378,7 +4499,7 @@ impl Ui {
                     self.draw_menu_layer(out);
                     // the line / dot cursor only shows while the tabs have the focus
                     let cur = self.side.then_some(self.sys_tab);
-                    self.draw_menu_base(game, r, out, Some(2), cur);
+                    self.draw_menu_base(game, r, out, Some(2), cur, cur);
                 } else {
                     self.draw_under(game, r, out);
                 }
@@ -4444,7 +4565,7 @@ impl Ui {
                         }
                     }
                 }
-                let cur = self.flow.as_ref().and_then(|c| c.nodes.get(self.flow_cur)).map(|n| (n.pos, n.preview, n.name, n.desc));
+                let cur = self.flow.as_ref().and_then(|c| Some(&c.nodes[c.node_at(self.flow_cell)?])).map(|n| (n.pos, n.preview, n.name, n.desc));
                 if let Some((p, ..)) = cur {
                     self.sprite(out, "flow_cur", [p[0], p[1] - self.flow_scroll, 104.0, 64.0], Some([8.0, 8.0, 104.0, 64.0]));
                 }
@@ -4665,10 +4786,12 @@ impl Ui {
             // message layout, and the scroll widget (sub_9B0C4: scroll_bar at 615.67,43.56 and
             // scroll_slider running 41.07..293.27 at x 613, 640x448 units)
             Screen::Backlog { scroll } => {
+                let n0 = out.len();
                 out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 0.75]));
                 out.extend(game.backlog_quads(r, scroll));
                 let n = game.backlog_len();
                 self.draw_scroll_bar(out, if n > 1 { 1.0 - scroll as f32 / (n - 1) as f32 } else { 1.0 }, 608.0);
+                self.fade_quads(out, n0, self.scr_a);
             }
             Screen::Confirm(c) => {
                 // sub_4AE90: the screen below, dialog_BG at 75% and dialog_win popping in (scale

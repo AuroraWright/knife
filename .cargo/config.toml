@@ -1,0 +1,4 @@
+[env]
+# Match Opus's MSVC runtime to Rust's, see msvc-crt.cmake.
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = ".cargo/msvc-crt.cmake", relative = true }
+CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc = { value = ".cargo/msvc-crt.cmake", relative = true }

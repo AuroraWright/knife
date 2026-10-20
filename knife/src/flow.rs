@@ -70,7 +70,6 @@ pub struct Sprite {
 pub struct Node {
     pub node: i32,
     pub pos: [f32; 2],
-    pub row: usize,
     /// preview picture: allpaccg entry thumcg_top.mzp + 1 + n
     pub preview: i32,
     /// SYSMES title / description
@@ -91,6 +90,21 @@ pub struct Chart {
     /// scroll range (sub_FFFC end: sub_14B58 end + 56 + 4 - 1022, less 28 when that leaves at most 1022,
     /// less 56 when the last shown row is table row 276)
     pub scroll_max: f32,
+    /// every record of the shown rows (cFlowchart + 608): the cursor is a cell of this grid
+    grid: Vec<GridRow>,
+    flags: Flags,
+    gallery: bool,
+}
+
+struct GridRow {
+    phase: u8,
+    cells: Vec<GridCell>,
+}
+
+struct GridCell {
+    f: [i32; 9],
+    /// the node sprite (record + 40), when the record has one
+    node: Option<usize>,
 }
 
 pub const NODE_W: f32 = 104.0;
@@ -403,9 +417,11 @@ impl Builder<'_> {
 }
 
 /// Lay out the chart. `gallery`: opened from the title's Extra menu (no current playthrough).
-pub fn build(fl: &Flags, gallery: bool) -> Chart {
+pub fn build(flags: Flags, gallery: bool) -> Chart {
+    let fl = &flags;
     let mut b = Builder { fl, rows: visible_rows(fl), sprites: Vec::new() };
     let mut nodes = Vec::new();
+    let mut cell_nodes: Vec<Vec<Option<usize>>> = b.rows.iter().map(|r| vec![None; r.recs.len()]).collect();
     let mut titles: Vec<Vec<Sprite>> = Vec::new();
     let (mut limits, mut row_y) = (Vec::new(), Vec::new());
     let (mut y, mut title_y, mut band_top) = (0.0f32, 0.0f32, 0.0f32);
@@ -447,7 +463,8 @@ pub fn build(fl: &Flags, gallery: bool) -> Chart {
             }
             let x = j as f32 * 96.0 + 438.0;
             if b.node(k, j, gallery, x, node_y) {
-                nodes.push(Node { node: f[0], pos: [x, node_y], row: k, preview: f[6], name: f[7], desc: f[8] });
+                cell_nodes[k][j] = Some(nodes.len());
+                nodes.push(Node { node: f[0], pos: [x, node_y], preview: f[6], name: f[7], desc: f[8] });
             }
             if b.grey(k, j, first, x, node_y - 5.0) {
                 b.rows[k].recs[j].flags |= DRAWN;
@@ -470,5 +487,419 @@ pub fn build(fl: &Flags, gallery: bool) -> Chart {
     if b.rows.last().is_some_and(|r| r.index == 276) {
         scroll_max -= 56.0;
     }
-    Chart { sprites: b.sprites, nodes, titles, limits, row_y, scroll_max: scroll_max.max(0.0) }
+    let grid = b
+        .rows
+        .iter()
+        .zip(cell_nodes)
+        .map(|(r, ns)| GridRow { phase: r.phase, cells: r.recs.iter().zip(ns).map(|(c, node)| GridCell { f: c.f, node }).collect() })
+        .collect();
+    let sprites = b.sprites;
+    Chart { sprites, nodes, titles, limits, row_y, scroll_max: scroll_max.max(0.0), grid, flags, gallery }
+}
+
+/// A cursor cell: (record index in the row, shown row), cFlowchart + 56 / + 60.
+pub type Cell = (i32, i32);
+
+/// Cursor movement over the record grid, ported from cFlowchart. A cell "has a sprite" when its record got a
+/// node sprite (record + 40), which is what `Chart::nodes` holds.
+impl Chart {
+    fn rows(&self) -> i32 {
+        self.grid.len() as i32
+    }
+
+    fn count(&self, k: i32) -> i32 {
+        usize::try_from(k).ok().and_then(|k| self.grid.get(k)).map_or(0, |r| r.cells.len() as i32)
+    }
+
+    fn cell(&self, (j, k): Cell) -> Option<&GridCell> {
+        let row = self.grid.get(usize::try_from(k).ok()?)?;
+        row.cells.get(usize::try_from(j).ok()?)
+    }
+
+    /// The node at a cell, if its record has a sprite.
+    pub fn node_at(&self, c: Cell) -> Option<usize> {
+        self.cell(c).and_then(|c| c.node)
+    }
+
+    fn sprite(&self, c: Cell) -> bool {
+        self.node_at(c).is_some()
+    }
+
+    /// The cell of node `i`.
+    pub fn cell_of(&self, i: usize) -> Option<Cell> {
+        self.grid.iter().enumerate().find_map(|(k, r)| {
+            r.cells.iter().position(|c| c.node == Some(i)).map(|j| (j as i32, k as i32))
+        })
+    }
+
+    fn completed(&self, n: i32) -> bool {
+        n >= 1 && self.flags.completed(n)
+    }
+
+    /// Record field 2 (the edge into the cell) taken in any playthrough (sub_92300).
+    fn edge_ok(&self, c: Cell) -> bool {
+        self.cell(c).is_some_and(|r| self.flags.edge(r.f[2]))
+    }
+
+    /// sub_F8FC: the cursor on open. (0, 0), then every shown row's first record with id `a3` (when
+    /// a3 >= 0), the last one found winning; each match runs the scroll follow (`follow`) at once.
+    pub fn open_cursor(&self, a3: i32, mut follow: impl FnMut(Cell)) -> Cell {
+        let mut cur = (0, 0);
+        if a3 >= 0 {
+            for (k, r) in self.grid.iter().enumerate() {
+                if let Some(j) = r.cells.iter().position(|c| c.f[0] == a3) {
+                    cur = (j as i32, k as i32);
+                    follow(cur);
+                }
+            }
+        }
+        cur
+    }
+
+    /// sub_1303C(a2): keep the column when its record has a sprite, else the nearest one with a sprite
+    /// within 8 (right first). With `wide` false the record's side of the chart is kept: columns 0..3 look
+    /// only within 0..3 (3 away at most), 4+ only within 4+.
+    fn snap(&self, (j, k): Cell, wide: bool) -> Option<i32> {
+        let n = self.count(k);
+        let ok = |c: i32| c >= 0 && c < n && self.sprite((c, k));
+        if ok(j) {
+            return Some(j);
+        }
+        let (reach, lo, hi) = if wide {
+            (8, 0, n)
+        } else if j >= 4 {
+            (8, 4, n)
+        } else {
+            (3, 0, 4)
+        };
+        (1..=reach).flat_map(|d| [j + d, j - d]).find(|&c| c >= lo && c < hi && ok(c))
+    }
+
+    /// sub_1262C: left along the row, else one or two columns left in the row below, then above.
+    pub fn move_left(&self, (j, k): Cell) -> Option<Cell> {
+        if let Some(c) = (0..j).rev().find(|&c| self.sprite((c, k))) {
+            return Some((c, k));
+        }
+        let ok = |c: Cell| c.1 >= 0 && c.1 < self.rows() && self.sprite(c);
+        let last = self.rows() - 1;
+        if k < last {
+            if j < 1 {
+                return None;
+            }
+            for c in [j - 1, j - 2] {
+                if c < 0 {
+                    break;
+                }
+                if ok((c, k + 1)) {
+                    return Some((c, k + 1));
+                }
+                if k >= 1 && ok((c, k - 1)) {
+                    return Some((c, k - 1));
+                }
+            }
+            None
+        } else if k <= 0 {
+            None
+        } else {
+            [j - 1, j - 2].into_iter().filter(|&c| c >= 0).map(|c| (c, k - 1)).find(|&c| ok(c))
+        }
+    }
+
+    /// sub_1280C: right along the row, else one or two columns right (from columns 0..7 / 0..6) in the row
+    /// below, then above.
+    pub fn move_right(&self, (j, k): Cell) -> Option<Cell> {
+        if let Some(c) = (j + 1..self.count(k)).find(|&c| self.sprite((c, k))) {
+            return Some((c, k));
+        }
+        let ok = |c: Cell| c.1 >= 0 && c.1 < self.rows() && self.sprite(c);
+        let last = self.rows() - 1;
+        if k < last {
+            for (c, max) in [(j + 1, 7), (j + 2, 6)] {
+                if j > max {
+                    return None;
+                }
+                if ok((c, k + 1)) {
+                    return Some((c, k + 1));
+                }
+                if k >= 1 && ok((c, k - 1)) {
+                    return Some((c, k - 1));
+                }
+            }
+            None
+        } else if k <= 0 {
+            None
+        } else {
+            [(j + 1, 7), (j + 2, 6)].into_iter().filter(|&(_, max)| j <= max).map(|(c, _)| (c, k - 1)).find(|&c| ok(c))
+        }
+    }
+
+    /// In game: the first node of this playthrough (RTST, with a sprite) in the nearest row above / below; up
+    /// stops at the prologue (phase 0).
+    fn route_step(&self, k: i32, dy: i32) -> Option<Cell> {
+        let mut r = k;
+        loop {
+            r += dy;
+            if r < 0 || r >= self.rows() || (dy < 0 && self.grid[r as usize].phase == 0) {
+                return None;
+            }
+            let row = &self.grid[r as usize];
+            if let Some(j) = row.cells.iter().position(|c| c.f[0] >= 1 && self.flags.route(c.f[0]) && c.node.is_some()) {
+                return Some((j as i32, r));
+            }
+            if (dy < 0 && r < 1) || (dy > 0 && r >= self.rows() - 1) {
+                return None;
+            }
+        }
+    }
+
+    /// sub_129F4: up. In the gallery the lines are followed up to the node they come from (sub_12EAC), else
+    /// the cursor steps a row up and snaps (sub_1303C(0)).
+    pub fn move_up(&self, (j, k): Cell) -> Option<Cell> {
+        if k < 1 {
+            return None;
+        }
+        if !self.gallery {
+            return self.route_step(k, -1);
+        }
+        let (mut col, mut row) = (j, k);
+        loop {
+            if let Some(c) = self.trace_up(col, row) {
+                return Some(c);
+            }
+            row -= 1;
+            if let Some(c) = self.snap((col, row), false) {
+                return Some((c, row));
+            }
+            if row <= 0 {
+                return None;
+            }
+            col = j;
+        }
+    }
+
+    /// sub_12B68: down. In the gallery the lines are followed down to the node they lead to (sub_136D0) or
+    /// the next row snaps (sub_1303C(0)); failing every row, the rows below snap with any column
+    /// (sub_1303C(1)).
+    pub fn move_down(&self, (j, k): Cell) -> Option<Cell> {
+        let last = self.rows() - 1;
+        if !self.gallery {
+            return if k >= last { None } else { self.route_step(k, 1) };
+        }
+        let mut row = k;
+        while row < last {
+            row += 1;
+            if let Some(c) = self.trace_down(j, row) {
+                return Some(c);
+            }
+            if let Some(c) = self.snap((j, row), false) {
+                return Some((c, row));
+            }
+        }
+        let mut row = k;
+        while row < last {
+            row += 1;
+            if let Some(c) = self.snap((j, row), true) {
+                return Some((c, row));
+            }
+        }
+        None
+    }
+
+    /// sub_12EAC: follow the line through cell (j, k) up to a finished node in the row above it.
+    fn trace_up(&self, mut j: i32, mut k: i32) -> Option<Cell> {
+        loop {
+            if k < 0 || j < 0 || j >= self.count(k) || !self.edge_ok((j, k)) {
+                return None;
+            }
+            if k >= 1 && j < self.count(k - 1) && self.completed(self.cell((j, k - 1))?.f[0]) {
+                return Some((j, k - 1));
+            }
+            match self.cell((j, k))?.f[1] {
+                2 | 5 | 8 => {
+                    if let Some(c) = self.trace_up(j + 1, k) {
+                        return Some(c);
+                    }
+                    k -= 1;
+                }
+                3 => k -= 1,
+                4 | 7 => j += 1,
+                6 => return self.trace_up(j, k - 1).or_else(|| self.trace_up_left(j - 1, k)),
+                9 => return self.trace_up_left(j - 1, k),
+                10 => {
+                    if let Some(c) = self.trace_up_left(j - 1, k) {
+                        return Some(c);
+                    }
+                    k -= 1;
+                }
+                11 => return self.trace_up(j + 1, k).or_else(|| self.trace_up_left(j - 1, k)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// sub_13854: follow a line leftwards along row k, then up (sub_12EAC).
+    fn trace_up_left(&self, mut j: i32, k: i32) -> Option<Cell> {
+        loop {
+            if j < 0 || j >= self.count(k) || !self.edge_ok((j, k)) {
+                return None;
+            }
+            if k > 0 && j < self.count(k - 1) && self.completed(self.cell((j, k - 1))?.f[0]) {
+                return Some((j, k - 1));
+            }
+            match self.cell((j, k))?.f[1] {
+                2 | 3 | 5 => return self.trace_up(j, k - 1),
+                7 | 11 => j -= 1,
+                8 => return self.trace_up_left(j - 1, k).or_else(|| self.trace_up(j, k - 1)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// sub_136D0: follow the line through cell (j, k) down to a finished node.
+    fn trace_down(&self, mut j: i32, mut k: i32) -> Option<Cell> {
+        loop {
+            if k >= self.rows() || j < 0 || j >= self.count(k) {
+                return None;
+            }
+            let id = self.cell((j, k))?.f[0];
+            if self.completed(id) {
+                return Some((j, k));
+            }
+            if !self.edge_ok((j, k)) {
+                return None;
+            }
+            match self.cell((j, k))?.f[1] {
+                2 | 7 => j += 1,
+                3 | 9 => k += 1,
+                4 => {
+                    if id < 0 && self.completed(-id) {
+                        j += 1;
+                    } else {
+                        k += 1;
+                    }
+                }
+                5 | 11 => {
+                    if let Some(c) = self.trace_down(j + 1, k) {
+                        return Some(c);
+                    }
+                    k += 1;
+                }
+                6 | 8 => return self.trace_down_left(j - 1, k),
+                10 => {
+                    if id < 0 && self.completed(-id) {
+                        k += 1;
+                    } else {
+                        return self.trace_down_left(j - 1, k);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// sub_139F4: follow a line leftwards, then down (sub_136D0).
+    fn trace_down_left(&self, mut j: i32, mut k: i32) -> Option<Cell> {
+        loop {
+            if j < 0 || k >= self.rows() {
+                return None;
+            }
+            let id = self.cell((j, k))?.f[0];
+            if self.completed(id) {
+                return Some((j, k));
+            }
+            if !self.edge_ok((j, k)) {
+                return None;
+            }
+            match self.cell((j, k))?.f[1] {
+                11 => {
+                    if let Some(c) = self.trace_down_left(j - 1, k) {
+                        return Some(c);
+                    }
+                    if id >= 0 || !self.completed(-id) {
+                        return self.trace_down(j, k + 1);
+                    }
+                    k += 1;
+                }
+                3 | 4 | 5 => return self.trace_down(j, k + 1),
+                7 | 8 => j -= 1,
+                _ => return None,
+            }
+        }
+    }
+
+    /// sub_12D1C, after a manual scroll: the cursor walks down a row at a time while its node is above view
+    /// y 4, then up while it is at view y 994 or below; each row snaps with sub_1303C(0), else (1). `y` is the
+    /// view y of a node. None when the row did not change.
+    pub fn keep_in_view(&self, (j0, k0): Cell, y: impl Fn(usize) -> f32) -> Option<Cell> {
+        let last = self.rows() - 1;
+        let (mut col, mut row) = (j0, k0);
+        // at `row`: snap, and stop there when the node is in view
+        let settle = |col: &mut i32, row: i32, below: bool| {
+            let Some(c) = self.snap((*col, row), false).or_else(|| self.snap((*col, row), true)) else { return false };
+            *col = c;
+            self.node_at((c, row)).is_some_and(|i| if below { y(i) < 994.0 } else { y(i) >= 4.0 })
+        };
+        if row < last {
+            while !settle(&mut col, row, false) {
+                row += 1;
+                if row >= last {
+                    break;
+                }
+            }
+        }
+        if row >= 1 {
+            while !settle(&mut col, row, true) {
+                row -= 1;
+                if row <= 0 {
+                    break;
+                }
+            }
+        }
+        (row != k0).then_some((col, row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all(on: bool) -> Flags {
+        Flags {
+            completed: vec![on; NODE_BITS],
+            read: vec![on; NODE_BITS],
+            edge: vec![on; EDGE_BITS],
+            route: vec![on; NODE_BITS],
+            route_edge: vec![on; EDGE_BITS],
+        }
+    }
+
+    #[test]
+    fn cursor_moves_land_on_nodes() {
+        for gallery in [false, true] {
+            let c = build(all(true), gallery);
+            assert!(!c.nodes.is_empty());
+            for k in 0..c.rows() {
+                for j in 0..c.count(k) {
+                    for m in [Chart::move_left, Chart::move_right, Chart::move_up, Chart::move_down] {
+                        if let Some(to) = m(&c, (j, k)) {
+                            assert!(c.sprite(to), "{gallery} ({j}, {k}) -> {to:?}");
+                        }
+                    }
+                    if let Some(to) = c.keep_in_view((j, k), |_| 500.0) {
+                        assert!(c.sprite(to));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_cursor_takes_the_last_row_with_the_id() {
+        let c = build(all(true), false);
+        let mut seen = Vec::new();
+        let cur = c.open_cursor(0, |p| seen.push(p));
+        assert_eq!(seen.last(), Some(&cur));
+        assert_eq!(cur.1, c.rows() - 1 - c.grid.iter().rev().position(|r| r.cells.iter().any(|x| x.f[0] == 0)).unwrap() as i32);
+        assert_eq!(c.open_cursor(-1, |_| unreachable!()), (0, 0));
+    }
 }

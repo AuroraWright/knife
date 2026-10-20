@@ -200,6 +200,8 @@ pub struct MenuBg {
     /// strip animation 0..1 and its per-frame speed (+1/60 when opening, the closing speed otherwise)
     pub t: f32,
     pub t_speed: f32,
+    /// sub_1B20: a fade in pauses the title movie, a fade out resumes it (off_AE0210)
+    pub movie_paused: bool,
     rng: Rng,
     sparks: Vec<Spark>,
     acc: f32,
@@ -225,6 +227,7 @@ impl MenuBg {
             speed: 0.0,
             t: 0.0,
             t_speed: 0.0,
+            movie_paused: false,
             rng: Rng::new(seed),
             sparks: Vec::new(),
             acc: 0.0,
@@ -239,8 +242,10 @@ impl MenuBg {
         self.speed = speed;
         if speed > 0.0 {
             self.t_speed = 1.0 / 60.0;
+            self.movie_paused = true;
         } else if speed < 0.0 {
             self.t_speed = speed;
+            self.movie_paused = false;
         }
     }
 

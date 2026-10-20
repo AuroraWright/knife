@@ -8,6 +8,7 @@ mod grade;
 mod gallery_table;
 mod fx;
 mod game;
+mod gamepad;
 mod motion;
 mod motion_loops;
 mod save;
@@ -116,14 +117,85 @@ struct App {
     elapsed: f32,
     next_shot: f32,
     shot_n: u32,
+    gamepads: gamepad::Gamepads,
+}
+
+/// A 1920x1080 window, shrunk to 90% of the monitor (or its work area) at 16:9 when it does not fit, centred.
+fn centered_window(
+    area: winit::dpi::PhysicalSize<u32>,
+    origin: winit::dpi::PhysicalPosition<i32>,
+    scale: f64,
+) -> (winit::dpi::PhysicalSize<u32>, winit::dpi::PhysicalPosition<i32>) {
+    // room for the title bar, menu bar and dock or taskbar
+    const MAX_FRACTION: f64 = 0.9;
+    let (aw, ah) = (f64::from(area.width), f64::from(area.height));
+    let fit = (aw * MAX_FRACTION / (1920.0 * scale)).min(ah * MAX_FRACTION / (1080.0 * scale)).min(1.0);
+    let (w, h) = ((1920.0 * scale * fit).round(), (1080.0 * scale * fit).round());
+    (
+        winit::dpi::PhysicalSize::new(w as u32, h as u32),
+        winit::dpi::PhysicalPosition::new(origin.x + ((aw - w) / 2.0) as i32, origin.y + ((ah - h) / 2.0) as i32),
+    )
+}
+
+/// The monitor's work area (without the taskbar or docked app bars), in physical pixels.
+#[cfg(windows)]
+fn work_area(
+    monitor: &winit::monitor::MonitorHandle,
+) -> Option<(winit::dpi::PhysicalSize<u32>, winit::dpi::PhysicalPosition<i32>)> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    use winit::platform::windows::MonitorHandleExtWindows;
+    // SAFETY: MONITORINFO is plain data; all zeroes is a valid value.
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    // SAFETY: winit's handle is a live HMONITOR and cbSize matches `info`.
+    if unsafe { GetMonitorInfoW(monitor.hmonitor(), &mut info) } == 0 {
+        return None;
+    }
+    let work = info.rcWork;
+    Some((
+        winit::dpi::PhysicalSize::new((work.right - work.left).max(0) as u32, (work.bottom - work.top).max(0) as u32),
+        winit::dpi::PhysicalPosition::new(work.left, work.top),
+    ))
 }
 
 impl App {
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("Tsukihime (knife)")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1920.0, 1080.0));
+        #[cfg(windows)]
+        let mut centering_area = None;
+        if let Some(monitor) = el.primary_monitor().or_else(|| el.available_monitors().next()) {
+            #[cfg(windows)]
+            let area = work_area(&monitor);
+            #[cfg(not(windows))]
+            let area = None;
+            let (area_size, area_position) = area.unwrap_or_else(|| (monitor.size(), monitor.position()));
+            let (size, position) = centered_window(area_size, area_position, monitor.scale_factor());
+            attrs = attrs.with_inner_size(size).with_position(position);
+            #[cfg(windows)]
+            {
+                // shown once the frame is centred below
+                attrs = attrs.with_visible(false);
+                centering_area = Some((area_size, area_position));
+            }
+        }
         let window = Arc::new(el.create_window(attrs)?);
+        // the position places the frame's corner: centre the whole frame (title bar, borders) once its size is
+        // known
+        #[cfg(windows)]
+        if let Some((area_size, area_position)) = centering_area {
+            let outer = window.outer_size();
+            let offset = |area: u32, outer: u32| ((area as i32 - outer as i32) / 2).max(0);
+            window.set_outer_position(winit::dpi::PhysicalPosition::new(
+                area_position.x + offset(area_size.width, outer.width),
+                area_position.y + offset(area_size.height, outer.height),
+            ));
+            window.set_visible(true);
+        }
+        // a launch from a terminal does not always activate the app
+        #[cfg(target_os = "macos")]
+        window.focus_window();
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
         let assets = assets::Assets::open(&self.cli.romfs, &self.cli.exefs)?;
@@ -208,6 +280,10 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32() * 1000.0;
         self.last = now;
+        // controllers: the same buttons as the keyboard
+        for (b, pressed, repeat) in self.gamepads.poll(dt / 1000.0 * 60.0) {
+            ui.pad(g, r, b, pressed, repeat);
+        }
         g.paused = ui.game_paused();
         if self.cli.hold_skip {
             g.set_skip(ui.in_game());
@@ -435,6 +511,7 @@ fn main() -> Result<()> {
         elapsed: 0.0,
         next_shot: 0.0,
         shot_n: 0,
+        gamepads: gamepad::Gamepads::new(),
     };
     el.run_app(&mut app)?;
     Ok(())

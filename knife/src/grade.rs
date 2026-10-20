@@ -176,38 +176,83 @@ pub fn is_grade(mode: i32) -> bool {
 /// Apply STEC `mode` to RGBA8 pixels in place (alpha untouched).
 pub fn apply(mode: i32, px: &mut [u8]) {
     let Some(p) = params(mode) else { return };
+    // after the optional grey, each channel only depends on its own value: tabulate it per input (the grey
+    // value is a 1/256 multiple, so it is indexed by the integer weighted sum)
+    if p.grey {
+        let lut: Vec<[u8; 3]> = (0..=255 * 256).map(|s| channels(&p, [s as f32 / 256.0; 3])).collect();
+        for q in px.chunks_exact_mut(4) {
+            let s = usize::from(q[0]) * 54 + usize::from(q[1]) * 183 + usize::from(q[2]) * 19;
+            q[..3].copy_from_slice(&lut[s]);
+        }
+    } else {
+        let lut: Vec<[u8; 3]> = (0..=255u8).map(|x| channels(&p, [f32::from(x); 3])).collect();
+        for q in px.chunks_exact_mut(4) {
+            for c in 0..3 {
+                q[c] = lut[usize::from(q[c])][c];
+            }
+        }
+    }
+}
+
+/// The per-channel part of the grade: levels, then the tint layers.
+fn channels(p: &Params, mut v: [f32; 3]) -> [u8; 3] {
     let amount = p.amount.clamp(0.0, 1.0);
-    for q in px.chunks_exact_mut(4) {
-        let mut v = [q[0], q[1], q[2]].map(f32::from);
-        if p.grey {
-            let g = (v[0] * 54.0 + v[1] * 183.0 + v[2] * 19.0) / 256.0;
-            v = [g; 3];
-        }
-        if amount > 0.0 {
-            for c in 0..3 {
-                let x = v[c];
-                if p.keep_zero && c > 0 && x == 0.0 {
-                    continue;
-                }
-                let g = p.gain[c];
-                let curve = if g <= 0.0 {
-                    0.0
-                } else if g == 1.0 {
-                    x
-                } else {
-                    (x / 255.0).powf(1.0 / g) * 255.0
-                };
-                let lv = 255.0 * p.low[c] + (p.high[c] - p.low[c]) * curve;
-                v[c] = x + amount * (lv - x);
-            }
-        }
-        for &(rgb, a, mode) in &p.tints {
-            for c in 0..3 {
-                v[c] = tint(v[c], rgb[c], a, mode);
-            }
-        }
+    if amount > 0.0 {
         for c in 0..3 {
-            q[c] = v[c].clamp(0.0, 255.0).round() as u8;
+            let x = v[c];
+            if p.keep_zero && c > 0 && x == 0.0 {
+                continue;
+            }
+            let g = p.gain[c];
+            let curve = if g <= 0.0 {
+                0.0
+            } else if g == 1.0 {
+                x
+            } else {
+                (x / 255.0).powf(1.0 / g) * 255.0
+            };
+            let lv = 255.0 * p.low[c] + (p.high[c] - p.low[c]) * curve;
+            v[c] = x + amount * (lv - x);
+        }
+    }
+    for &(rgb, a, mode) in &p.tints {
+        for c in 0..3 {
+            v[c] = tint(v[c], rgb[c], a, mode);
+        }
+    }
+    v.map(|x| x.clamp(0.0, 255.0).round() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The direct per-pixel form the tables replace.
+    fn reference(mode: i32, px: &mut [u8]) {
+        let Some(p) = params(mode) else { return };
+        for q in px.chunks_exact_mut(4) {
+            let mut v = [q[0], q[1], q[2]].map(f32::from);
+            if p.grey {
+                v = [(v[0] * 54.0 + v[1] * 183.0 + v[2] * 19.0) / 256.0; 3];
+            }
+            q[..3].copy_from_slice(&channels(&p, v));
+        }
+    }
+
+    #[test]
+    fn tables_match_per_pixel() {
+        // every channel value in each position, plus a spread of mixed colours
+        let mut px: Vec<u8> = (0..=255u8).flat_map(|x| [x, 255 - x, x.wrapping_mul(7), 255]).collect();
+        let mut s = 1u32;
+        for _ in 0..20000 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            px.extend_from_slice(&[(s >> 8) as u8, (s >> 16) as u8, (s >> 24) as u8, s as u8]);
+        }
+        for mode in 2..TABLE.len() as i32 {
+            let (mut a, mut b) = (px.clone(), px.clone());
+            apply(mode, &mut a);
+            reference(mode, &mut b);
+            assert!(a == b, "mode {mode}");
         }
     }
 }

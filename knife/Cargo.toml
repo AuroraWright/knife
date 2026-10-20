@@ -21,3 +21,34 @@ serde = { version = "1.0.229", features = ["derive"] }
 dirs = "7.0.0"
 parking_lot = "0.12.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mp4 = "0.14.0"
+symphonia = { version = "0.6.1", features = ["aac"], default-features = false }
+
+# Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows and GStreamer
+# elsewhere. An ffmpeg executable is the fallback.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-video-toolbox = "0.3.2"
+# controllers: the GameController framework (gilrs's raw HID access loses a pad once another app uses it there)
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSString"] }
+objc2-game-controller = { version = "0.3.2", default-features = false, features = ["std", "GCController", "GCDevice", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerAxisInput", "GCControllerElement"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
+# the version winit uses, so its HMONITOR matches
+windows-sys = { version = "0.52.0", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
+gst = { package = "gstreamer", version = "0.25.4" }
+gst-app = { package = "gstreamer-app", version = "0.25.2" }
+gst-video = { package = "gstreamer-video", version = "0.25.4" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# controllers (macOS uses the GameController framework instead)
+gilrs = "0.11.2"
+
+[features]
+# Always decode movies with an ffmpeg executable instead of the platform decoder.
+ffmpeg = []
