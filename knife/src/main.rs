@@ -100,7 +100,8 @@ struct Cli {
     #[arg(long)]
     boot: bool,
     /// Debug: scripted input, comma-separated MS:KEY: a controller button (up, down, left, right, a, b, x, y, l, r,
-    /// zl, zr, rup, rdown, minus, plus: tapped, or held from NAME+ to NAME-), menu, click,
+    /// zl, zr, minus, plus, r3, lup, ldown, lleft, lright (left stick), rup, rdown (right stick): tapped, or held
+    /// from NAME+ to NAME-), menu, click,
     /// move/X/Y in canvas pixels, press / release of the left button
     #[arg(long, value_delimiter = ',')]
     keys: Vec<String>,
@@ -118,6 +119,10 @@ struct App {
     next_shot: f32,
     shot_n: u32,
     gamepads: gamepad::Gamepads,
+    /// W / A / S / D held: the left stick at full tilt
+    wasd: [bool; 4],
+    /// K / L held: the right stick up / down at full tilt
+    kl: [bool; 2],
 }
 
 /// A 1920x1080 window, shrunk to 90% of the monitor (or its work area) at 16:9 when it does not fit, centred.
@@ -281,7 +286,10 @@ impl App {
         let dt = (now - self.last).as_secs_f32() * 1000.0;
         self.last = now;
         // controllers: the same buttons as the keyboard
-        for (b, pressed, repeat) in self.gamepads.poll(dt / 1000.0 * 60.0) {
+        let events = self.gamepads.poll(dt / 1000.0 * 60.0);
+        ui.stick = stick(self.gamepads.left(), self.wasd);
+        ui.rstick = rstick(self.gamepads.right_y(), self.kl);
+        for (b, pressed, repeat) in events {
             ui.pad(g, r, b, pressed, repeat);
         }
         g.paused = ui.game_paused();
@@ -319,11 +327,33 @@ impl App {
             && t.parse::<f32>().is_ok_and(|t| self.elapsed >= t)
         {
             // a button name taps it; with a trailing + it stays down until the same name with a trailing -
+            if let Some(i) = ["rup", "rdown"].iter().position(|&n| n == k.trim_end_matches(['+', '-'])) {
+                let b = if i == 0 { Pad::Up } else { Pad::Down };
+                for down in [true, false] {
+                    if (down && !k.ends_with('-')) || (!down && !k.ends_with('+')) {
+                        self.kl[i] = down;
+                        ui.rstick = rstick(self.gamepads.right_y(), self.kl);
+                        ui.pad(g, r, b, down, false);
+                    }
+                }
+                self.cli.keys.remove(0);
+                continue;
+            }
             if let Some(b) = pad_name(k.trim_end_matches(['+', '-'])) {
+                // a left stick name tilts the stick like its WASD key
+                let l = [Pad::LUp, Pad::LDown, Pad::LLeft, Pad::LRight].iter().position(|&p| p == b);
                 if !k.ends_with('-') {
+                    if let Some(i) = l {
+                        self.wasd[i] = true;
+                        ui.stick = stick(self.gamepads.left(), self.wasd);
+                    }
                     ui.pad(g, r, b, true, false);
                 }
                 if !k.ends_with('+') {
+                    if let Some(i) = l {
+                        self.wasd[i] = false;
+                        ui.stick = stick(self.gamepads.left(), self.wasd);
+                    }
                     ui.pad(g, r, b, false, false);
                 }
                 self.cli.keys.remove(0);
@@ -431,13 +461,11 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                // the wheel / trackpad is the right stick
-                if let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer)
+                // the wheel / trackpad scrolls a step (no Switch control)
+                if let (Some(g), Some(ui)) = (&mut self.game, &mut self.ui)
                     && dy != 0.0
                 {
-                    let b = if dy > 0.0 { Pad::RUp } else { Pad::RDown };
-                    ui.pad(g, r, b, true, false);
-                    ui.pad(g, r, b, false, false);
+                    ui.wheel(g, dy > 0.0);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -465,13 +493,27 @@ impl ApplicationHandler for App {
                     KeyCode::KeyJ => Some(Pad::R),
                     KeyCode::KeyT => Some(Pad::ZL),
                     KeyCode::KeyY => Some(Pad::ZR),
-                    KeyCode::KeyK => Some(Pad::RUp),
-                    KeyCode::KeyL => Some(Pad::RDown),
+                    KeyCode::KeyW => Some(Pad::LUp),
+                    KeyCode::KeyS => Some(Pad::LDown),
+                    KeyCode::KeyA => Some(Pad::LLeft),
+                    KeyCode::KeyD => Some(Pad::LRight),
+                    KeyCode::KeyO => Some(Pad::R3),
                     KeyCode::KeyU => Some(Pad::Minus),
                     KeyCode::KeyI => Some(Pad::Plus),
                     _ => None,
                 };
+                // K / L: the right stick up / down, which the game reads as the d-pad plus its tilt
+                if let Some(i) = [KeyCode::KeyK, KeyCode::KeyL].iter().position(|&k| k == code) {
+                    self.kl[i] = pressed;
+                    ui.rstick = rstick(self.gamepads.right_y(), self.kl);
+                    ui.pad(g, r, if i == 0 { Pad::Up } else { Pad::Down }, pressed, repeat);
+                    return;
+                }
                 if let Some(b) = pad {
+                    if let Some(i) = [Pad::LUp, Pad::LDown, Pad::LLeft, Pad::LRight].iter().position(|&p| p == b) {
+                        self.wasd[i] = pressed;
+                        ui.stick = stick(self.gamepads.left(), self.wasd);
+                    }
                     ui.pad(g, r, b, pressed, repeat);
                     return;
                 }
@@ -512,9 +554,22 @@ fn main() -> Result<()> {
         next_shot: 0.0,
         shot_n: 0,
         gamepads: gamepad::Gamepads::new(),
+        wasd: [false; 4],
+        kl: [false; 2],
     };
     el.run_app(&mut app)?;
     Ok(())
+}
+
+/// The left stick: the controllers' tilt plus W / S / A / D (up, down, left, right) at full tilt, clamped to ±128.
+fn stick(pads: [i32; 2], [up, down, left, right]: [bool; 4]) -> [i32; 2] {
+    let key = |a: bool, b: bool| (i32::from(a) - i32::from(b)) * 128;
+    [(pads[0] + key(right, left)).clamp(-128, 128), (pads[1] + key(up, down)).clamp(-128, 128)]
+}
+
+/// The right stick's y: the controllers' plus K (up) / L (down) at full tilt, clamped to ±128.
+fn rstick(pad: i32, [up, down]: [bool; 2]) -> i32 {
+    (pad + (i32::from(up) - i32::from(down)) * 128).clamp(-128, 128)
 }
 
 fn pad_name(k: &str) -> Option<Pad> {
@@ -531,8 +586,11 @@ fn pad_name(k: &str) -> Option<Pad> {
         "r" => Pad::R,
         "zl" => Pad::ZL,
         "zr" => Pad::ZR,
-        "rup" => Pad::RUp,
-        "rdown" => Pad::RDown,
+        "lup" => Pad::LUp,
+        "ldown" => Pad::LDown,
+        "lleft" => Pad::LLeft,
+        "lright" => Pad::LRight,
+        "r3" => Pad::R3,
         "minus" => Pad::Minus,
         "plus" => Pad::Plus,
         _ => return None,

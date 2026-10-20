@@ -40,7 +40,7 @@ impl Default for Volumes {
     }
 }
 
-struct Bgm {
+pub struct Bgm {
     id: i32,
     voice: Option<Voice>,
     /// script volume 0..1 (before category volume)
@@ -163,12 +163,28 @@ impl Sound {
         self.se.retain(|_, (v, _)| !v.finished());
     }
 
+    /// sub_9C460: the BGM playing or loading (-1 after a stop).
+    pub fn bgm_id(&self) -> i32 {
+        self.pending.as_ref().map(|p| p.id).or(self.bgm.as_ref().map(|b| b.id)).unwrap_or(-1)
+    }
+
     pub fn stop_bgm(&mut self, fade: f64) {
         self.pending = None;
         if let Some(b) = self.bgm.take()
             && let Some(v) = b.voice
         {
             v.stop(fade);
+        }
+    }
+
+    /// Take the playing BGM out (with `put_bgm`, a stop that leaves it alone).
+    pub fn take_bgm(&mut self) -> Option<Bgm> {
+        self.bgm.take()
+    }
+
+    pub fn put_bgm(&mut self, b: Option<Bgm>) {
+        if b.is_some() {
+            self.bgm = b;
         }
     }
 

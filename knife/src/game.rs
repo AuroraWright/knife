@@ -319,6 +319,8 @@ pub struct Game {
     pub skip_movies: bool,
     /// a gallery movie is playing while the game is paused
     pub gallery_movie: bool,
+    /// the UI draws the movie itself (`movie_quad`), over the gallery movie player's curtain
+    pub movie_by_ui: bool,
     pub auto: bool,
     /// debug: pick the first option of every choice
     pub auto_choice: bool,
@@ -328,6 +330,14 @@ pub struct Game {
     /// the message being shown was already read (selects the read text speed)
     line_read: bool,
     pub ended: bool,
+    /// the script stopped with sub_802C0 result 2 (RDED of the replayed node while F024 is set): the
+    /// system data is written before the gallery comes back (sub_48AC0 case 2 states 7 / 5)
+    pub replay_done: bool,
+    /// RDAS hit a completed node with "既読シーンのオートスキップ" on (sub_92580 -> off_AE06B0 = 1)
+    pub auto_skip_hit: bool,
+    /// a gallery replay (byte_B34AF0, sub_47B00): set when cGallery starts 528_ARCHIVE (sub_48AC0 case 4),
+    /// cleared by every other start; `IFSC` tests it
+    pub archive: bool,
     mouse: (f32, f32),
     time: f32,
     warned: HashSet<String>,
@@ -496,12 +506,16 @@ impl Game {
             story_movie: None,
             skip_movies: false,
             gallery_movie: false,
+            movie_by_ui: false,
             auto: false,
             auto_choice: false,
             paused: false,
             auto_timer: 0.0,
             line_read: false,
             ended: false,
+            replay_done: false,
+            auto_skip_hit: false,
+            archive: false,
             mouse: (0.0, 0.0),
             time: 0.0,
             warned: HashSet::new(),
@@ -964,7 +978,7 @@ impl Game {
             self.dispatch_ms = 0.0;
         }
         let mut budget = 20000;
-        while self.wait == Wait::None && !self.ended && budget > 0 {
+        while self.wait == Wait::None && !self.ended && !self.auto_skip_hit && budget > 0 {
             budget -= 1;
             let Some(cmd) = self.script.commands.get(self.pc).cloned() else {
                 tracing::info!("scene {} ran off the end", self.scene_index);
@@ -1194,6 +1208,13 @@ impl Game {
                     }
                 };
                 if !cond && let Some(l) = c.arg(3) {
+                    let l = l.to_string();
+                    self.goto_label(&l);
+                }
+            }
+            // IFSC(, label) (0x77b2c): on through a gallery start (sub_47B00), else to the label
+            "IFSC" if !self.archive => {
+                if let Some(l) = c.arg(1) {
                     let l = l.to_string();
                     self.goto_label(&l);
                 }
@@ -1758,9 +1779,19 @@ impl Game {
                     self.route_enter(n);
                 }
             }
+            // RDED(n) (sub_92440): node n is completed only when it is the current node F110 and was reached in
+            // this playthrough (RTST); then a replay (F024) ends there with result 2 (0x79be8)
             "RDED" => {
-                if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n)) {
+                if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n))
+                    && n == self.var("F110")
+                    && self.play_bit('R', n as usize)
+                {
                     set_bit(&mut self.endings, n as usize);
+                    if self.var("F024") != 0 {
+                        tracing::info!("RDED {n}: gallery replay finished");
+                        self.replay_done = true;
+                        self.ended = true;
+                    }
                 }
             }
             "ATSV" => {
@@ -1775,7 +1806,20 @@ impl Game {
                 }
                 self.last_ring = Some(s);
             }
-            "RDAS" | "SHAF" | "SQS2" | "SHS2" | "SSS2" | "NOP_" | "WTSV" => {}
+            // RDAS(n) (0x79b78 -> sub_92580): with the auto skip of read scenes on, a completed node n asks for the
+            // next scene (sub_40ED0 top state 1), unless skipping / seeking (off_AE0568, byte_146E638); the UI
+            // drops it in a gallery flowchart replay (sub_50F0)
+            "RDAS" => {
+                if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n))
+                    && self.settings.auto_skip_read
+                    && !self.seek_node
+                    && !self.skip
+                    && get_bit(&self.endings, n as usize)
+                {
+                    self.auto_skip_hit = true;
+                }
+            }
+            "SHAF" | "SQS2" | "SHS2" | "SSS2" | "NOP_" | "WTSV" => {}
             other => self.warn_once(other),
         }
     }
@@ -1845,6 +1889,22 @@ impl Game {
 
     pub fn movie_active(&self) -> bool {
         self.movie.is_some()
+    }
+
+    /// The movie sprite (off_AE01D0) over the whole canvas at its alpha.
+    pub fn movie_quad(&self) -> Option<Quad> {
+        let m = self.movie.as_ref().filter(|m| m.has_frame())?;
+        Some(Quad::rect(m.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, m.alpha]))
+    }
+
+    /// The movie sprite's alpha (0 before the first frame).
+    pub fn movie_alpha(&self) -> f32 {
+        self.movie.as_ref().filter(|m| m.has_frame()).map_or(0.0, |m| m.alpha)
+    }
+
+    /// sub_1A80 from the UI: the movie stops and fades out (then closes).
+    pub fn fade_movie_out(&mut self) {
+        self.stop_movie_playback();
     }
 
     /// sub_ACEF0(n): system sound n on the system SE volume (config, linear x 0.01).
@@ -2447,10 +2507,8 @@ impl Game {
             None => self.menu_captured = false,
         }
         let mut ui = Vec::new();
-        if let Some(m) = &self.movie
-            && m.has_frame()
-        {
-            ui.push(Quad::rect(m.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, m.alpha]));
+        if !self.movie_by_ui {
+            ui.extend(self.movie_quad());
         }
         ui.extend(self.story_movie.as_ref().and_then(|t| t.cover_quad(r)));
         ui.extend(self.ui_quads(r));
@@ -2850,6 +2908,27 @@ impl Game {
         self.snapshot = false;
     }
 
+    /// cGallery replay (sub_5040, then sub_48AC0 case 4): the BGM fades out over 3.33 s (sub_9C9B0), G008 =
+    /// the scene id, and 528_ARCHIVE (id 3000) starts with the gallery-start flag set; under `IFSC` it sets
+    /// F024 / F025 (no saves) and F822 (page mode), then jumps by G008 through the JUMPxx / JUMPQA scenes.
+    pub fn start_archive(&mut self, scene_id: i32) -> bool {
+        let Some(idx) = self.assets.scene_by_id(3000) else { return false };
+        self.sound.stop_bgm(10.0 / 3.0);
+        self.reset();
+        self.set_var("G008", scene_id);
+        self.archive = true;
+        self.start_scene(idx, None);
+        self.wait = Wait::None;
+        true
+    }
+
+    /// `reset` that leaves the BGM playing (sub_47A90 keeps BGM 2 when the gallery comes back).
+    pub fn reset_keep_bgm(&mut self) {
+        let bgm = self.sound.take_bgm();
+        self.reset();
+        self.sound.put_bgm(bgm);
+    }
+
     pub fn reset(&mut self) {
         self.history.clear();
         self.backlog_pages.clear();
@@ -2883,6 +2962,9 @@ impl Game {
         self.shake = None;
         self.wait = Wait::Halt;
         self.ended = false;
+        self.replay_done = false;
+        self.auto_skip_hit = false;
+        self.archive = false;
     }
 
     /// Flowchart jump (sub_11A58 -> sub_95800 / sub_178C8, then sub_48AC0 case 2: sub_40CD0, sub_17AF0): the
@@ -2892,7 +2974,17 @@ impl Game {
     /// the scripts' `IF__(F026, ne, 0)` blocks set up the jump entry. Nothing is stored per node.
     pub fn jump_node(&mut self, n: u16) -> bool {
         let Some((row, scene_id)) = crate::flow::node_entry(n) else { return false };
-        let Some(idx) = self.assets.scene_by_id(scene_id) else { return false };
+        self.jump_record(row, i32::from(n), scene_id)
+    }
+
+    /// `jump_node` for the record (table row, id, scene id) under the flowchart cursor. A filler record
+    /// (scene -1, id 0) gets the same rewind, F110 = 0 and F026 = -1, but no scene starts (sub_17AD0 < 0): the
+    /// playthrough stays where it is and the system menu stays open; returns false then.
+    pub fn jump_record(&mut self, row: usize, n: i32, scene_id: i32) -> bool {
+        let idx = self.assets.scene_by_id(scene_id);
+        if scene_id >= 0 && idx.is_none() {
+            return false;
+        }
         let f = |i: usize| format!("F{i:03}");
         // the rows after the target, back to the first phase 0 row: node (RTST) and edge bits off
         for (i, (phase, recs)) in crate::flow_table::ROWS.iter().enumerate().rev() {
@@ -2917,12 +3009,13 @@ impl Game {
             }
         }
         // sub_178C8
-        self.set_var("F110", i32::from(n));
+        self.set_var("F110", n);
         self.set_var("F026", scene_id);
         self.set_var("F1103", 1);
         for w in [823, 847, 1104, 1105, 1106, 1107, 1108, 1109, 1110, 1111, 1112, 1113] {
             self.set_var(&f(w), 0);
         }
+        let Some(idx) = idx else { return false };
         let words: Vec<(usize, i32)> = JUMP_KEEP_WORDS.iter().map(|&w| (w, self.var(&f(w)))).collect();
         // word_34BA16: kept as signed bytes
         let bytes: Vec<(usize, i32)> = JUMP_KEEP_BYTES.iter().map(|&w| (w, i32::from(self.var(&f(w)) as i8))).collect();

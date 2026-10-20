@@ -34,6 +34,59 @@ const PANEL_BTN_Y: f32 = 6.637;
 const BTN_W: f32 = 233.0;
 const BTN_H: f32 = 74.0;
 
+/// The exe's drag tracker (the object at 0xAE2EE8, stepped once a frame by sub_40C) for a list's vertical drag:
+/// a touch that starts inside the screen's rect is followed in the 1280x720 touch space. Each frame the speed
+/// decays by 0.9 (0 below 0.5), then takes the frame's movement (previous y - y, so up is positive) when that
+/// is larger the same way; after release it keeps decaying, so a flick coasts. sub_6C4 reads the speed.
+#[derive(Default)]
+pub(super) struct TouchDrag {
+    /// [previous, current] touch y while the touch lasts
+    y: Option<[i32; 2]>,
+    pub vel: f32,
+}
+
+impl TouchDrag {
+    /// A touch began inside the rect, at canvas y `y`.
+    pub fn press(&mut self, y: f32) {
+        let y = Self::raw(y);
+        self.y = Some([y, y]);
+        self.vel = 0.0;
+    }
+
+    pub fn moved(&mut self, y: f32) {
+        if let Some(p) = &mut self.y {
+            p[1] = Self::raw(y);
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.y = None;
+    }
+
+    /// One 60 Hz frame of sub_40C.
+    pub fn frame(&mut self) {
+        if self.vel.abs() > f32::EPSILON {
+            self.vel *= 0.9;
+            if self.vel.abs() < 0.5 {
+                self.vel = 0.0;
+            }
+        }
+        if let Some([prev, cur]) = &mut self.y {
+            let d = *cur - *prev;
+            let v = -d as f32;
+            if (d >= 1 && self.vel > v) || (d < 0 && self.vel < v) {
+                self.vel = v;
+            }
+            *prev = *cur;
+        }
+    }
+
+    /// Canvas y in touch pixels (720 high).
+    fn raw(y: f32) -> i32 {
+        (y * 720.0 / H) as i32
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Panel {
     #[default]
@@ -57,7 +110,7 @@ pub struct Touch {
     /// merely hovers is no finger on the screen.
     moved: bool,
     visible: f32,
-    down: bool,
+    pub(super) down: bool,
     at: [f32; 2],
     /// drag arrow: alpha (off_AE0600), effect fade (dword_AFECA4), start (units) and stretch
     arrow_a: f32,
@@ -191,7 +244,15 @@ impl Ui {
         }
         self.touch.moved = true;
         self.touch.visible = 256.0;
+        // CG viewer (sub_C56C): a held touch moves the picture twice as far as the finger
+        if matches!(self.screen, Screen::CgView { .. }) && !self.busy() {
+            let [x, y] = self.units();
+            let [ax, ay] = self.touch.at;
+            self.cg_pan[0] += 2.0 * (x - ax) * UX;
+            self.cg_pan[1] += 2.0 * (y - ay) * UY;
+        }
         self.touch.at = self.units();
+        self.drag.moved(self.mouse.1);
         if let Some(p) = self.touch.press {
             let [x, y] = self.units();
             if (x - p[0]).abs() + (y - p[1]).abs() >= DRAG_MIN {
@@ -212,7 +273,25 @@ impl Ui {
         self.touch.visible = 256.0;
         self.touch.down = true;
         self.touch.at = self.units();
-        if self.screen == Screen::Game {
+        // a touch inside the screen's drag rect (sub_6A0 before sub_40C) is tracked; the config only takes
+        // one that is on none of its objects (sub_40C a2 = sub_AE0B0 < 0)
+        let rect = match self.screen {
+            Screen::Flowchart { .. } => Some([0.0, 0.0, 1360.0, 1022.0]),
+            Screen::Gallery => Some([392.0, 109.0, 1440.0, 905.0]),
+            Screen::Music => Some([408.0, 109.0, 926.0, 905.0]),
+            Screen::Config if !self.items(game).iter().any(|(rc, _)| super::rect_hit(*rc, (x, y))) => Some([407.0, 165.0, 1402.0, 858.0]),
+            _ => None,
+        };
+        if let Some([rx, ry, rw, rh]) = rect
+            && (rx..=rx + rw).contains(&x)
+            && (ry..=ry + rh).contains(&y)
+        {
+            self.drag.press(y);
+        }
+        if !self.busy() && self.popup.is_none() && self.bar_grab(y) {
+            return;
+        }
+        if matches!(self.screen, Screen::Game | Screen::CgView { .. }) {
             self.touch.press = Some(self.units());
             self.touch.dragged = false;
             return;
@@ -222,8 +301,14 @@ impl Ui {
 
     pub fn mouse_up(&mut self, game: &mut Game, r: &Renderer) {
         self.touch.down = false;
+        self.drag.release();
+        self.bar = None;
         let Some(start) = self.touch.press.take() else { return };
         let swallow = std::mem::take(&mut self.touch.swallow);
+        if matches!(self.screen, Screen::CgView { .. }) {
+            self.cg_flick(game);
+            return;
+        }
         if self.screen != Screen::Game {
             return;
         }
@@ -283,6 +368,23 @@ impl Ui {
         }
     }
 
+    /// CG viewer release (sub_C56C, swipe bits of sub_AD4E0 at 13+ units): right (0x20) the previous
+    /// picture, left (0x10) the next, up or down (0xC0) closes.
+    fn cg_flick(&mut self, game: &mut Game) {
+        let [x, y] = self.units();
+        let [px, py] = self.touch.trail[1];
+        let (dx, dy) = (x - px, y - py);
+        if dx.abs() > dy.abs() {
+            if dx >= 13.0 {
+                self.cg_step(game, -1);
+            } else if dx <= -13.0 {
+                self.cg_step(game, 1);
+            }
+        } else if dy.abs() >= 13.0 {
+            self.cg_close(game);
+        }
+    }
+
     /// Show the hidden message window by other means than a touch: like the exe (0x41E1C, 0x42158, 0x421C4,
     /// 0x4223C) the remembered touch moves out of the bottom 40 units (y 409+ -> 398) so it does not hide
     /// the window again.
@@ -308,6 +410,17 @@ impl Ui {
         })
     }
 
+    /// Panel buttons 4..6 that sub_4E0C0 leaves enabled: next scene except in a gallery flowchart replay
+    /// (sub_50F0), Q.SAVE / Q.LOAD unless saving is off (F025, sub_47B10); Q.LOAD also needs the quick save.
+    pub(super) fn panel_ok(&self, game: &Game, b: usize) -> bool {
+        match b {
+            4 => self.gal_ret[0] != 2,
+            5 => game.var("F025") == 0,
+            6 => game.var("F025") == 0 && self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some),
+            _ => true,
+        }
+    }
+
     /// A tapped mode panel button (sub_4E170 state 3 cases 0..7; 1 and 3 act while held, see `touch_update`).
     pub(super) fn panel_press(&mut self, game: &mut Game, r: &Renderer, b: usize) {
         self.touch.flash[b] = 10.0;
@@ -322,19 +435,19 @@ impl Ui {
                 self.snd(game, 1);
                 self.toggle_auto(game);
             }
-            4 => {
+            4 if self.panel_ok(game, 4) => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::NextScene);
             }
-            5 if game.can_save() => {
+            5 if game.can_save() && self.panel_ok(game, 5) => {
                 self.snd(game, 1);
                 self.quick_save(game, r);
             }
-            6 if self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some) => {
+            6 if self.panel_ok(game, 6) => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::QuickLoad);
             }
-            0 | 5 | 6 => self.snd(game, 2),
+            0 | 4 | 5 | 6 => self.snd(game, 2),
             7 => game.replay_voice(),
             _ => {}
         }
@@ -586,7 +699,7 @@ impl Ui {
             let pressing = (self.touch.press.is_some() && self.touch.panel_hover.is_some()) || (self.enter_held && self.touch.panel_key.is_some());
             for i in 0..8 {
                 // states (sub_ADE80 flag 2): previous scene unavailable -> dark; auto on -> lit
-                let row = if (i == 0 && !game.can_rewind()) || (i == 6 && !self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some)) {
+                let row = if (i == 0 && !game.can_rewind()) || !self.panel_ok(game, i) {
                     0.0
                 } else if self.touch.flash[i] > 0.0 || (i == 2 && game.auto) || (pressing && hover == Some(i)) {
                     3.0

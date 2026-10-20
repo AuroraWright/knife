@@ -4,14 +4,15 @@
 //! getting it until it reconnects, so knife polls the GameController framework itself (as SDL does). Directions repeat like the exe's pad layer
 //! (sub_B37D0): the d-pad and both sticks fire when first held, again after 15 frames, then every 5 (the rates
 //! sub_F268C stores at +1000 / +1004), one counter that runs while any direction is held. A stick direction is
-//! held past 80 of ±128.
+//! held past 80 of ±128. The game reads the right stick with the d-pad, so it drives `Up`.. `Right`; the left
+//! stick has its own directions and its summed tilt (`left`) scrolls and pans.
 
 use std::collections::HashMap;
 
 
 use crate::ui::Pad;
 
-const PADS: [Pad; 16] = [
+const PADS: [Pad; 19] = [
     Pad::Up,
     Pad::Down,
     Pad::Left,
@@ -24,14 +25,17 @@ const PADS: [Pad; 16] = [
     Pad::R,
     Pad::ZL,
     Pad::ZR,
-    Pad::RUp,
-    Pad::RDown,
+    Pad::LUp,
+    Pad::LDown,
+    Pad::LLeft,
+    Pad::LRight,
     Pad::Minus,
     Pad::Plus,
+    Pad::R3,
 ];
 
 /// d-pad and stick directions (game mask 0xFF00F0), the buttons that repeat
-const DIRECTIONS: [Pad; 6] = [Pad::Up, Pad::Down, Pad::Left, Pad::Right, Pad::RUp, Pad::RDown];
+const DIRECTIONS: [Pad; 8] = [Pad::Up, Pad::Down, Pad::Left, Pad::Right, Pad::LUp, Pad::LDown, Pad::LLeft, Pad::LRight];
 
 /// first repeat after this many frames, then one per `REPEAT` frames
 const REPEAT_DELAY: f32 = 15.0;
@@ -55,12 +59,15 @@ impl Controller {
     fn now_held(&self) -> [bool; PADS.len()] {
         let mut h = self.buttons;
         let [lx, ly] = self.left;
-        h[index(Pad::Up)] |= ly > STICK;
-        h[index(Pad::Down)] |= ly < -STICK;
-        h[index(Pad::Left)] |= lx < -STICK;
-        h[index(Pad::Right)] |= lx > STICK;
-        h[index(Pad::RUp)] |= self.right[1] > STICK;
-        h[index(Pad::RDown)] |= self.right[1] < -STICK;
+        h[index(Pad::LUp)] |= ly > STICK;
+        h[index(Pad::LDown)] |= ly < -STICK;
+        h[index(Pad::LLeft)] |= lx < -STICK;
+        h[index(Pad::LRight)] |= lx > STICK;
+        let [rx, ry] = self.right;
+        h[index(Pad::Up)] |= ry > STICK;
+        h[index(Pad::Down)] |= ry < -STICK;
+        h[index(Pad::Left)] |= rx < -STICK;
+        h[index(Pad::Right)] |= rx > STICK;
         h
     }
 }
@@ -80,6 +87,23 @@ pub struct Gamepads {
 impl Gamepads {
     pub fn new() -> Self {
         Self { backend: backend::Backend::new(), pads: HashMap::new(), held: [false; PADS.len()], repeat: None }
+    }
+
+    /// The left stick summed over the controllers, each axis in -128..128 with y up (sub_B37D0: x * 128
+    /// truncated per controller, the sum clamped).
+    pub fn left(&self) -> [i32; 2] {
+        let mut v = [0i32; 2];
+        for c in self.pads.values() {
+            for (a, s) in v.iter_mut().zip(c.left) {
+                *a = (*a + (s * 128.0) as i32).clamp(-128, 128);
+            }
+        }
+        v
+    }
+
+    /// The right stick's y summed over the controllers like `left` (the CG viewer zoom).
+    pub fn right_y(&self) -> i32 {
+        self.pads.values().fold(0, |a, c| (a + (c.right[1] * 128.0) as i32).clamp(-128, 128))
     }
 
     /// Read the controllers after `frames` 60 Hz frames: presses, releases and direction repeats.
@@ -149,6 +173,7 @@ mod backend {
             Button::DPadDown => Pad::Down,
             Button::DPadLeft => Pad::Left,
             Button::DPadRight => Pad::Right,
+            Button::RightThumb => Pad::R3,
             _ => return None,
         })
     }
@@ -247,6 +272,9 @@ mod backend {
                     set(Pad::R, &g.rightShoulder());
                     set(Pad::ZL, &g.leftTrigger());
                     set(Pad::ZR, &g.rightTrigger());
+                    if let Some(b) = g.rightThumbstickButton() {
+                        set(Pad::R3, &b);
+                    }
                     let d = g.dpad();
                     set(Pad::Up, &d.up());
                     set(Pad::Down, &d.down());
@@ -279,11 +307,15 @@ mod tests {
         }
         let frames: Vec<i32> = log.iter().map(|(f, _)| *f).collect();
         assert_eq!(frames, [0, 15, 20, 25]);
-        assert_eq!(log[0].1, (Pad::Down, true, false));
-        assert_eq!(log[1].1, (Pad::Down, true, true));
+        assert_eq!(log[0].1, (Pad::LDown, true, false));
+        assert_eq!(log[1].1, (Pad::LDown, true, true));
+        assert_eq!(g.left(), [0, -115]);
         // below the threshold the stick lets go
         g.pads.values_mut().next().unwrap().left = [0.0, -0.5];
-        assert_eq!(g.step(1.0), [(Pad::Down, false, false)]);
+        assert_eq!(g.step(1.0), [(Pad::LDown, false, false)]);
         assert!(g.repeat.is_none());
+        // the right stick is the d-pad
+        g.pads.values_mut().next().unwrap().right = [0.9, 0.0];
+        assert_eq!(g.step(1.0), [(Pad::Right, true, false)]);
     }
 }

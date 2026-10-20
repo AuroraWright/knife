@@ -28,25 +28,27 @@ and `re/NOTES.md`.
 
 The keyboard stands in for the Switch controller, with the same key for the same button everywhere; each
 button then does what it does in the Switch game on that screen (the game's own map is Config → 操作説明,
-`conf_manual0_ja`). The left mouse button is the touch screen, and the mouse wheel / trackpad scroll is
-the right stick.
+`conf_manual0_ja`). The left mouse button is the touch screen; the mouse wheel / trackpad scrolls lists and
+zooms the CG viewer.
 
 Game controllers work too (gilrs, as in shin; on macOS the GameController framework, which keeps
 working after another app has used the pad): every controller is the same Switch controller, button for
-button — A / B / X / Y as the controller labels them, Plus / Minus (Start / Back), L / R, ZL / ZR, the d-pad
-and left stick, and the right stick up / down. Held directions repeat like on the Switch (after 15 frames,
-then every 5).
+button — A / B / X / Y as the controller labels them, Plus / Minus (Start / Back), L / R, ZL / ZR, the d-pad,
+both sticks and R3. As in the game, the right stick moves cursors like the d-pad while the left stick scrolls
+lists and pans the CG viewer. Held directions repeat like on the Switch (after 15 frames, then every 5).
 
 | Key | Switch |
 |---|---|
-| Arrow keys | D-pad / left stick |
+| Arrow keys | D-pad |
+| W / A / S / D | left stick (full tilt) |
 | Enter | A (confirm, advance text) |
 | Escape | B (cancel, back) |
 | B | X |
 | M | Y |
 | H / J | L / R |
 | T / Y | ZL / ZR |
-| K / L, mouse wheel / trackpad | right stick up / down (scroll) |
+| K / L | right stick up / down |
+| O | R3 |
 | U / I | Minus / Plus |
 | F | toggle fullscreen |
 | Left Ctrl (hold) | skip text while held |
@@ -63,8 +65,8 @@ then every 5).
 | R | skip mode on / off (stops at unread text unless the config allows skipping it) |
 | ZL (hold) | rewind, faster the longer it is held |
 | ZR (hold) | fast forward, faster the longer it is held |
-| D-pad up, right stick up | open the mode panel |
-| D-pad down, right stick down | advance text, close the mode panel |
+| D-pad / right stick up | open the mode panel |
+| D-pad / right stick down | advance text, close the mode panel |
 | D-pad left / right, A | with the mode panel opened by button: pick a button, press it (rewind and skip act while A is held) |
 | D-pad up / down | move between choices (left / right on a No / Yes question) |
 
@@ -88,16 +90,18 @@ replay.
 
 | Switch | Action |
 |---|---|
-| D-pad / left stick | move the cursor |
+| D-pad / right stick | move the cursor |
 | A | confirm (hold A + left / right to drag a config slider) |
 | B | back |
 | L / R | config tabs, and L / R elsewhere (CG viewer: previous / next picture) |
-| right stick | scroll lists, the flowchart, the backlog; zoom in the CG viewer |
+| left stick | scroll the CG grid, music list, flowchart, config and save list; CG grid: left / right also move the cursor |
+| CG viewer | L / R or left / right: previous / next picture; left stick: move; right stick up / down: zoom; Minus: fill the screen; R3: fit |
 | Y, ZL | also close the system menu |
 | X, ZL | also close the backlog |
-| Minus | CG viewer: toggle between fit and fill zoom |
 
 The system menu is touch-only on the Switch, so mouse hover does not move its cursor; a click opens a tab.
+A mouse drag (a touch drag on the Switch) scrolls the flowchart, CG grid, music list and config, and a flick
+coasts; dragging the scroll bar's slider scrolls the flowchart, CG grid and music list. A gallery movie stops with B or Plus only.
 
 ## Debug options
 

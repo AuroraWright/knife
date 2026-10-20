@@ -97,6 +97,8 @@ pub struct Chart {
 }
 
 struct GridRow {
+    /// the table row (flow_table::ROWS index; the shown row's first field, cFlowchart + 608)
+    index: usize,
     phase: u8,
     cells: Vec<GridCell>,
 }
@@ -491,7 +493,7 @@ pub fn build(flags: Flags, gallery: bool) -> Chart {
         .rows
         .iter()
         .zip(cell_nodes)
-        .map(|(r, ns)| GridRow { phase: r.phase, cells: r.recs.iter().zip(ns).map(|(c, node)| GridCell { f: c.f, node }).collect() })
+        .map(|(r, ns)| GridRow { index: r.index, phase: r.phase, cells: r.recs.iter().zip(ns).map(|(c, node)| GridCell { f: c.f, node }).collect() })
         .collect();
     let sprites = b.sprites;
     Chart { sprites, nodes, titles, limits, row_y, scroll_max: scroll_max.max(0.0), grid, flags, gallery }
@@ -514,6 +516,14 @@ impl Chart {
     fn cell(&self, (j, k): Cell) -> Option<&GridCell> {
         let row = self.grid.get(usize::try_from(k).ok()?)?;
         row.cells.get(usize::try_from(j).ok()?)
+    }
+
+    /// The record under a cell as A acts on it (sub_11418 / sub_11A58): its table row, id (f[0]) and scene
+    /// id (f[3]; -1 for the filler records without a node).
+    pub fn record_at(&self, c: Cell) -> Option<(usize, i32, i32)> {
+        let row = self.grid.get(usize::try_from(c.1).ok()?)?;
+        let cell = row.cells.get(usize::try_from(c.0).ok()?)?;
+        Some((row.index, cell.f[0], cell.f[3]))
     }
 
     /// The node at a cell, if its record has a sprite.

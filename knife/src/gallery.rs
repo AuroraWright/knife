@@ -9,6 +9,7 @@ pub const THUMB_H: f32 = 88.0;
 /// RDED bit that unlocks every CG (set by the final Q&A scene).
 const ALL_CG_BIT: usize = 557;
 
+#[derive(Clone, Copy)]
 pub struct Entry {
     pub name: &'static str,
     pub thumb: u16,
