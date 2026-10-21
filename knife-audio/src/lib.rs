@@ -105,6 +105,56 @@ impl Voice {
     }
 }
 
+/// Taps on each side of the interpolation point and sub-sample phases of the resampling kernel.
+const HALF_TAPS: usize = 12;
+const PHASES: usize = 1024;
+
+/// Windowed-sinc kernel for one source / output rate ratio: band-limited to the lower Nyquist rate, so a
+/// device rate other than the source's (44.1 kHz output of 48 kHz audio) neither drops nor repeats samples.
+struct Kernel {
+    step: f64,
+    /// `PHASES + 1` rows of `2 * HALF_TAPS` weights for the samples at offsets `1 - HALF_TAPS ..= HALF_TAPS`
+    table: Vec<f32>,
+}
+
+impl Kernel {
+    fn new(step: f64) -> Self {
+        let cutoff = (1.0 / step).min(1.0);
+        let w = 2 * HALF_TAPS;
+        let mut table = vec![0f32; (PHASES + 1) * w];
+        for ph in 0..=PHASES {
+            let frac = ph as f64 / PHASES as f64;
+            let row = &mut table[ph * w..(ph + 1) * w];
+            let mut sum = 0.0;
+            for (k, t) in row.iter_mut().enumerate() {
+                let x = (k as f64 + 1.0 - HALF_TAPS as f64) - frac;
+                let sinc = if x.abs() < 1e-9 {
+                    1.0
+                } else {
+                    let a = std::f64::consts::PI * cutoff * x;
+                    a.sin() / a
+                };
+                // Blackman window over |x| < HALF_TAPS
+                let u = (x / HALF_TAPS as f64 + 1.0) * 0.5;
+                let win = if (0.0..=1.0).contains(&u) {
+                    let a = 2.0 * std::f64::consts::PI * u;
+                    0.42 - 0.5 * a.cos() + 0.08 * (2.0 * a).cos()
+                } else {
+                    0.0
+                };
+                let v = sinc * win;
+                *t = v as f32;
+                sum += v;
+            }
+            // unity gain at DC
+            for t in row.iter_mut() {
+                *t = (*t as f64 / sum) as f32;
+            }
+        }
+        Self { step, table }
+    }
+}
+
 struct PcmSound {
     pcm: Arc<Pcm>,
     pos: f64,
@@ -112,12 +162,60 @@ struct PcmSound {
     ctl: Arc<Mutex<Control>>,
     finished: Arc<AtomicBool>,
     done: bool,
+    kernel: Option<Kernel>,
+}
+
+impl PcmSound {
+    /// The source frame at `i`, following the loop (silence before the start and after a one-shot's end).
+    fn at(&self, i: i64) -> [f32; 2] {
+        let n = self.pcm.frames.len() as i64;
+        if i < 0 || n == 0 {
+            return [0.0, 0.0];
+        }
+        let i = if i < n && !(self.looping && self.pcm.loop_range.is_some_and(|(_, le)| i >= le as i64)) {
+            i
+        } else if !self.looping {
+            return [0.0, 0.0];
+        } else if let Some((ls, le)) = self.pcm.loop_range {
+            let (ls, le) = (ls as i64, (le as i64).min(n));
+            if le <= ls {
+                return [0.0, 0.0];
+            }
+            ls + (i - le).rem_euclid(le - ls)
+        } else {
+            i.rem_euclid(n)
+        };
+        self.pcm.frames[i as usize]
+    }
+
+    fn sample(&self, rate: f64) -> [f32; 2] {
+        let base = self.pos.floor();
+        let frac = self.pos - base;
+        let base = base as i64;
+        if rate == 1.0 && frac == 0.0 {
+            return self.at(base);
+        }
+        let Some(k) = &self.kernel else { return self.at(base) };
+        let w = 2 * HALF_TAPS;
+        let ph = ((frac * PHASES as f64).round() as usize).min(PHASES);
+        let row = &k.table[ph * w..(ph + 1) * w];
+        let mut acc = [0f32; 2];
+        for (j, &t) in row.iter().enumerate() {
+            let s = self.at(base + j as i64 + 1 - HALF_TAPS as i64);
+            acc[0] += s[0] * t;
+            acc[1] += s[1] * t;
+        }
+        acc
+    }
 }
 
 impl Sound for PcmSound {
     fn process(&mut self, out: &mut [Frame], dt: f64, _info: &Info) {
         let mut c = self.ctl.lock();
         let rate = self.pcm.sample_rate as f64 * dt;
+        if rate != 1.0 && self.kernel.as_ref().is_none_or(|k| k.step != rate) {
+            self.kernel = Some(Kernel::new(rate));
+        }
         let n = self.pcm.frames.len();
         for f in out.iter_mut() {
             if self.done || c.stop_now {
@@ -147,8 +245,7 @@ impl Sound for PcmSound {
                     continue;
                 }
             }
-            let i = (self.pos as usize).min(n.saturating_sub(1));
-            let s = self.pcm.frames.get(i).copied().unwrap_or([0.0, 0.0]);
+            let s = self.sample(rate);
             let v = c.volume.value();
             let (pl, pr) = if c.pan < 0.0 { (1.0, 1.0 + c.pan) } else { (1.0 - c.pan, 1.0) };
             *f = Frame {
@@ -203,6 +300,11 @@ impl Audio {
 
     /// Start playing. Returns a handle even when audio is disabled.
     pub fn play(&mut self, pcm: Arc<Pcm>, volume: f32, fade_in: f64, looping: bool) -> Voice {
+        self.play_at(pcm, volume, fade_in, looping, 0)
+    }
+
+    /// `play` from source frame `start` (nn::atk StartInfo start offset, type 2 = samples).
+    pub fn play_at(&mut self, pcm: Arc<Pcm>, volume: f32, fade_in: f64, looping: bool, start: usize) -> Voice {
         let ctl = Arc::new(Mutex::new(Control {
             volume: Ramp {
                 from: if fade_in > 0.0 { 0.0 } else { volume },
@@ -225,11 +327,12 @@ impl Audio {
                 let data = PcmSoundData {
                     sound: PcmSound {
                         pcm,
-                        pos: 0.0,
+                        pos: start as f64,
                         looping,
                         ctl,
                         finished,
                         done: false,
+                        kernel: None,
                     },
                 };
                 if m.play(data).is_err() {
@@ -245,5 +348,49 @@ impl Audio {
 impl Default for Audio {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 48 kHz audio at a 44.1 kHz device: a 10 kHz tone comes out clean
+    #[test]
+    fn resamples_band_limited() {
+        let f = 10_000.0f64;
+        let frames = (0..48_000).map(|i| {
+            let v = (2.0 * std::f64::consts::PI * f * i as f64 / 48_000.0).sin() as f32;
+            [v, v]
+        });
+        let pcm = Arc::new(Pcm { sample_rate: 48_000, frames: frames.collect(), loop_range: None });
+        let rate = 48_000.0 / 44_100.0;
+        let mut s = PcmSound {
+            pcm,
+            pos: 0.0,
+            looping: false,
+            ctl: Arc::new(Mutex::new(Control {
+                volume: Ramp { from: 1.0, to: 1.0, len: 0.0, t: 0.0 },
+                pan: 0.0,
+                stop_after_ramp: false,
+                stop_now: false,
+                paused: false,
+            })),
+            finished: Arc::new(AtomicBool::new(false)),
+            done: false,
+            kernel: Some(Kernel::new(rate)),
+        };
+        let (mut err, mut sig) = (0.0f64, 0.0f64);
+        for _ in 0..40_000 {
+            if s.pos > 100.0 {
+                let want = (2.0 * std::f64::consts::PI * f * s.pos / 48_000.0).sin();
+                let got = s.sample(rate)[0] as f64;
+                err += (got - want).powi(2);
+                sig += want * want;
+            }
+            s.pos += rate;
+        }
+        let snr = 10.0 * (sig / err).log10();
+        assert!(snr > 60.0, "SNR {snr:.1} dB");
     }
 }

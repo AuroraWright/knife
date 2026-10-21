@@ -48,7 +48,7 @@ pub fn decode_nopus(data: &[u8]) -> Result<Pcm> {
         if channels == 1 {
             frames.extend(buf[..n].iter().map(|&s| [s, s]));
         } else {
-            frames.extend(buf[..n * 2].chunks_exact(2).map(|c| [c[0], c[1]]));
+            frames.extend(buf[..n * 2].as_chunks::<2>().0.iter().map(|c| [c[0], c[1]]));
         }
     }
     let skip = pre_skip.min(frames.len());
