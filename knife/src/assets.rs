@@ -1,12 +1,13 @@
 //! Game data access: archives, exe tables, scripts, sound archive and a GPU texture cache.
 
+use crate::grade::Bake;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use knife_audio::{Pcm, bfsar::SoundArchive, codec};
 use knife_core::{
     exe::{ExeTables, ImageInfo, Nso},
@@ -20,6 +21,9 @@ use knife_core::{
 };
 use knife_render::{Renderer, TexRef, Upload};
 
+/// Image name prefix that loads the save-list thumbnail copy of an image (`Assets::thumb_name`).
+pub const THUMB: &str = "THUMB:";
+
 /// A texture together with its display metrics.
 pub struct Image {
     pub tex: TexRef,
@@ -28,6 +32,10 @@ pub struct Image {
     pub height: f32,
     pub center_x: f32,
     pub center_y: f32,
+    /// ImageInfo +70 scale (`ImageInfo::level_scale`)
+    pub level: f32,
+    /// ImageInfo +65 bit 1: not moved by the screen shake
+    pub no_shake: bool,
 }
 
 /// Decoded pixels of an image, ready to upload.
@@ -52,6 +60,8 @@ impl Decoded {
 
 pub struct Assets {
     pub romfs: PathBuf,
+    /// The shared system font file (`--sysfont`)
+    pub sysfont: PathBuf,
     pub allpac: Arc<Archive>,
     pub allpachd: Option<Arc<Archive>>,
     pub allpaccg: Option<Arc<Archive>>,
@@ -86,6 +96,7 @@ impl Assets {
         let sar = SoundArchive::parse(std::fs::read(romfs.join("knife1.bfsar")).context("reading knife1.bfsar")?)?;
         Ok(Self {
             romfs: romfs.to_path_buf(),
+            sysfont: PathBuf::new(),
             allpac: Arc::new(Archive::open(romfs, "allpac")?),
             allpachd: Archive::open(romfs, "allpachd").ok().map(Arc::new),
             allpaccg: Archive::open(romfs, "allpaccg").ok().map(Arc::new),
@@ -129,8 +140,21 @@ impl Assets {
         self.image_index.get(&name.to_ascii_uppercase()).copied()
     }
 
+    /// The image a save-list preview draws for a layer showing `name` (sub_895A0): its thumbnail copy, and
+    /// for an `_aa_bb` variant (ImageInfo +67 bit 0) the base image's, the name less its last 6 characters.
+    /// The exe moves the anchor by the centre difference, so the base lands centred where the variant was.
+    pub fn thumb_name(&self, name: &str) -> String {
+        let upper = name.to_ascii_uppercase();
+        let base = match self.image_index_of(&upper).and_then(|i| self.tables.images.get(i)) {
+            Some(im) if im.variant && upper.len() > 6 => &upper[..upper.len() - 6],
+            _ => upper.as_str(),
+        };
+        format!("{THUMB}{base}")
+    }
+
     pub fn image_info(&self, name: &str) -> Option<&ImageInfo> {
         let upper = name.to_ascii_uppercase();
+        let upper = upper.strip_prefix(THUMB).unwrap_or(&upper).to_string();
         if let Some(&i) = self.image_index.get(&upper) {
             return self.tables.images.get(i);
         }
@@ -158,6 +182,13 @@ impl Assets {
     }
 
     fn image_bytes(archives: &[Arc<Archive>], name: &str) -> Option<Vec<u8>> {
+        if let Some(stem) = name.strip_prefix(THUMB) {
+            // sub_895A0: the layer's allpac entry - (bg_top.mzp + 1) + (thumstand_top.mzp + 1), a copy of the
+            // art at 1/6 size (a 4x4 transparent DUMMY.NXZ for the `_aa_bb` variants and IMG7000 / IMG7001)
+            let a = archives.first()?;
+            let i = a.find_stem(stem)?.checked_sub(a.find_stem("BG_TOP")? + 1)? + a.find_stem("THUMSTAND_TOP")? + 1;
+            return a.read(i).inspect_err(|e| tracing::warn!("reading thumbnail {stem}: {e}")).ok();
+        }
         for a in archives {
             if let Some(i) = a.find_stem(name) {
                 match a.read(i) {
@@ -171,13 +202,13 @@ impl Assets {
 
     /// Load (and cache) an image by script name. Returns None when it does not exist.
     pub fn image(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
-        self.image_graded(r, name, 0)
+        self.image_graded(r, name, Bake::NONE)
     }
 
-    /// Load (and cache) an image with an STEC colour grade applied (`grade::apply`; 0 = none). The exe keys
-    /// its texture cache (sub_AAA40) the same way, by image and STEC mode.
-    pub fn image_graded(&mut self, r: &Renderer, name: &str, grade: i32) -> Option<Arc<Image>> {
-        let (name, grade, key) = Self::image_key(name, grade);
+    /// Load (and cache) an image built with an STEC colour grade and the SNX2 / SNX3 tone (`grade::Bake`). The
+    /// exe keys its texture cache (sub_AAA40) the same way, by image and the pre_alter parameters.
+    pub fn image_graded(&mut self, r: &Renderer, name: &str, bake: Bake) -> Option<Arc<Image>> {
+        let (name, grade, key) = Self::image_key(name, bake);
         if let Some(i) = self.images.get(&key) {
             return i.clone();
         }
@@ -185,23 +216,23 @@ impl Assets {
         self.finish_image(r, key, &name, pixels)
     }
 
-    /// Cache key of an image load: (upper-case name, effective grade, key).
-    pub fn image_key(name: &str, grade: i32) -> (String, i32, String) {
-        let grade = if crate::grade::is_grade(grade) { grade } else { 0 };
+    /// Cache key of an image load: (upper-case name, effective bake, key).
+    pub fn image_key(name: &str, bake: Bake) -> (String, Bake, String) {
+        let bake = Bake { grade: if crate::grade::is_grade(bake.grade) { bake.grade } else { 0 }, ..bake };
         let name = name.to_ascii_uppercase();
-        let key = if grade == 0 { name.clone() } else { format!("{name}#{grade}") };
-        (name, grade, key)
+        let key = format!("{name}{}", bake.key());
+        (name, bake, key)
     }
 
-    /// Whether `image_graded(name, grade)` would return without loading anything.
-    pub fn image_cached(&self, name: &str, grade: i32) -> bool {
-        self.images.contains_key(&Self::image_key(name, grade).2)
+    /// Whether `image_graded(name, bake)` would return without loading anything.
+    pub fn image_cached(&self, name: &str, bake: Bake) -> bool {
+        self.images.contains_key(&Self::image_key(name, bake).2)
     }
 
     /// Read and decode an image for `image_graded` on a worker thread; the result arrives on `done`, for
     /// `finish_decoded` to upload and cache. Returns the cache key.
-    pub fn decode_async(&self, name: &str, grade: i32, done: std::sync::mpsc::Sender<Decoded>) {
-        let (name, grade, k) = Self::image_key(name, grade);
+    pub fn decode_async(&self, name: &str, bake: Bake, done: std::sync::mpsc::Sender<Decoded>) {
+        let (name, grade, k) = Self::image_key(name, bake);
         let archives = self.image_archives();
         let spawned = std::thread::Builder::new().name("image decode".into()).spawn(move || {
             let pixels = Self::decode_pixels(&archives, &name, grade);
@@ -240,15 +271,13 @@ impl Assets {
     }
 
     /// The CPU side of an image load (no renderer needed): archive read, BNTX parse or image decode, grade.
-    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: i32) -> Result<Pixels> {
+    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: Bake) -> Result<Pixels> {
         let data = Self::image_bytes(archives, name).context("not found")?;
-        if grade == 0 && bntx::is_bntx(&data) {
+        if grade.is_none() && bntx::is_bntx(&data) {
             return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?));
         }
         let (w, h, mut px) = decode_image(&data)?;
-        if grade != 0 {
-            crate::grade::apply(grade, &mut px);
-        }
+        grade.apply(&mut px);
         Ok(Pixels::Rgba(w, h, px))
     }
 
@@ -257,13 +286,14 @@ impl Assets {
             Pixels::Bntx(t) => upload_bntx(r, &t)?,
             Pixels::Rgba(w, h, px) => r.upload(w, h, Upload::Rgba8(&px), name),
         };
-        let (width, height, center_x, center_y) = match self.image_info(name) {
-            Some(i) => (i.width, i.height, i.center_x, i.center_y),
+        let no_shake = self.image_info(name).is_some_and(|i| i.no_shake);
+        let (width, height, center_x, center_y, level) = match self.image_info(name) {
+            Some(i) => (i.width, i.height, i.center_x, i.center_y, i.level_scale()),
             None => {
                 // 1280x720 textures map to 640 units
                 let w = tex.width as f32 / 2.0;
                 let h = tex.height as f32 / 2.0 * (362.0 / 360.0);
-                (w, h, w / 2.0, h / 2.0)
+                (w, h, w / 2.0, h / 2.0, 1.0)
             }
         };
         Ok(Image {
@@ -272,6 +302,8 @@ impl Assets {
             height,
             center_x,
             center_y,
+            level,
+            no_shake,
         })
     }
 
@@ -293,6 +325,22 @@ impl Assets {
             out.push((t.name.clone(), tex));
         }
         Ok(out)
+    }
+
+    /// BORDER_PARTS (sub_3B9A0 loads it into texture slots 338..355): alphagradation020..512, their `_inv`
+    /// and `_2` variants. For the clip inset mask, the alpha of each one's middle row from the edge to the
+    /// centre texel.
+    pub fn soft_lut_rows(&self) -> Result<Vec<Vec<u8>>> {
+        let i = self.allui.find_stem("BORDER_PARTS").context("BORDER_PARTS not in allui")?;
+        let data = self.allui.read(i)?;
+        bntx::parse(&data)?
+            .iter()
+            .map(|t| {
+                let px = bntx_decode::to_rgba8(t)?;
+                let (w, r) = (t.width as usize, (t.width / 2) as usize);
+                Ok((0..=r).map(|x| px[(r * w + x) * 4 + 3]).collect())
+            })
+            .collect()
     }
 
     /// parts.mrg (no name table; the boot sequence loads entries by index, sub_B4A20 archive slot 27):
@@ -354,21 +402,6 @@ impl Assets {
     pub fn load_stream_file(&self, rel: &str) -> Result<Pcm> {
         let data = std::fs::read(self.romfs.join(rel)).with_context(|| format!("reading {rel}"))?;
         codec::decode_nopus(&data)
-    }
-
-    /// BGM for `MPLY(n)`: BFSAR sound item 0x1000000 + (n - 1).
-    pub fn bgm(&self, n: i32) -> Result<(Pcm, f32)> {
-        if n <= 0 {
-            bail!("no bgm {n}");
-        }
-        let s = self.sar.stream_sound(n as usize - 1)?;
-        let mut pcm = self.load_stream_file(&s.path)?;
-        if let Some((a, b)) = s.loop_range {
-            pcm.loop_range = Some((a, b.min(pcm.frames.len())));
-        } else {
-            pcm.loop_range = Some((0, pcm.frames.len()));
-        }
-        Ok((pcm, s.volume))
     }
 
     pub fn voice(&self, name: &str) -> Result<Pcm> {

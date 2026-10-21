@@ -274,7 +274,7 @@ impl Movie {
             }
         }
         if let Some(f) = latest {
-            r.write_region(&self.tex, 0, 0, W, H, 4, &f);
+            r.write_region(&self.tex, [0, 0, W, H], 4, &f);
             self.has_frame = true;
         }
     }
@@ -340,7 +340,7 @@ mod tests {
             .args(["-vn", "-f", "f32le", "-ac", "2", "-ar", "48000", "-"])
             .output()
             .unwrap();
-        let theirs: Vec<f32> = out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let theirs: Vec<f32> = out.stdout.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
         eprintln!("frames {} vs {}", ours.frames.len(), theirs.len() / 2);
         let n = ours.frames.len().min(theirs.len() / 2);
         let err = (0..n).map(|i| (ours.frames[i][0] - theirs[2 * i]).abs()).fold(0.0f32, f32::max);

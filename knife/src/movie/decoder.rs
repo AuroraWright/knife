@@ -136,7 +136,7 @@ pub fn nv12_to_rgba(f: &Nv12Frame) -> Vec<u8> {
     // the two chroma taps of output coordinate `i` (weights 3 / 1, in quarters)
     let taps = |i: usize, n: usize| -> (usize, usize) {
         let c = i / 2;
-        let o = if i % 2 == 0 {
+        let o = if i.is_multiple_of(2) {
             c.saturating_sub(1)
         } else {
             (c + 1).min(n - 1)

@@ -4,8 +4,14 @@
 //! The exe steps these once per 60 Hz frame in a 960x540 space; here positions are kept in that space and
 //! scaled by 2 when drawn on the 1920x1080 canvas.
 
-/// Small xorshift generator (the exe uses its own rand(); only the distributions matter).
+/// Small xorshift generator standing in for the C rand() the exe's scene effects draw from.
 pub struct Rng(u64);
+
+impl Default for Rng {
+    fn default() -> Self {
+        Self::new(0x9E37_79B9_7F4A_7C15)
+    }
+}
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
@@ -20,8 +26,87 @@ impl Rng {
         (self.0 >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    fn range(&mut self, a: f32, b: f32) -> f32 {
+    /// Like rand(): uniform in 0..=0x7fffffff.
+    pub fn rand(&mut self) -> i32 {
+        self.f();
+        (self.0 >> 33) as i32
+    }
+}
+
+/// The exe's app random source (off_AE0190 + 80, vtable off_AE1588): nn::util::TinyMt (TinyMT32), seeded once
+/// at boot from the system uptime in microseconds (sub_FE234 with seed -1).
+pub struct TinyMt([u32; 4]);
+
+impl TinyMt {
+    const MAT1: u32 = 0x8F70_11EE;
+    const MAT2: u32 = 0xFC78_FF1F;
+    const TMAT: u32 = 0x3793_FDFF;
+
+    pub fn new(seed: u32) -> Self {
+        let mut st = [seed, Self::MAT1, Self::MAT2, Self::TMAT];
+        for i in 1..8u32 {
+            let p = st[(i as usize - 1) & 3];
+            st[i as usize & 3] ^= i.wrapping_add(1_812_433_253u32.wrapping_mul(p ^ (p >> 30)));
+        }
+        if st[0] & 0x7FFF_FFFF == 0 && st[1] == 0 && st[2] == 0 && st[3] == 0 {
+            st = [u32::from(b'T'), u32::from(b'I'), u32::from(b'N'), u32::from(b'Y')];
+        }
+        let mut t = Self(st);
+        for _ in 0..8 {
+            t.next_state();
+        }
+        t
+    }
+
+    /// Seeded from the clock (the exe's boot-time seed differs every run too).
+    pub fn from_time() -> Self {
+        let us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+        Self::new(us as u32)
+    }
+
+    fn next_state(&mut self) {
+        let st = &mut self.0;
+        let mut y = st[3];
+        let mut x = (st[0] & 0x7FFF_FFFF) ^ st[1] ^ st[2];
+        x ^= x << 1;
+        y ^= (y >> 1) ^ x;
+        st[0] = st[1];
+        st[1] = st[2];
+        st[2] = x ^ (y << 10);
+        st[3] = y;
+        if y & 1 != 0 {
+            st[1] ^= Self::MAT1;
+            st[2] ^= Self::MAT2;
+        }
+    }
+
+    /// TinyMt::GenerateRandomU32 (vtable + 32)
+    pub fn u32(&mut self) -> u32 {
+        self.next_state();
+        let st = &self.0;
+        let mut t0 = st[3];
+        let t1 = st[0].wrapping_add(st[2] >> 8);
+        t0 ^= t1;
+        if t1 & 1 != 0 {
+            t0 ^= Self::TMAT;
+        }
+        t0
+    }
+
+    /// sub_F9EF8 (vtable + 40): (u32 >> 8) x 2^-24, in [0, 1).
+    pub fn f(&mut self) -> f32 {
+        (self.u32() >> 8) as f32 * 5.960_464_5e-8
+    }
+
+    /// sub_F9F64: a + (b - a) x f().
+    pub fn uniform(&mut self, a: f32, b: f32) -> f32 {
         a + (b - a) * self.f()
+    }
+
+    /// sub_A8F90 / sub_F9F14: uniform in lo..=hi (either order).
+    pub fn range(&mut self, a: i32, b: i32) -> i32 {
+        let (lo, hi) = (a.min(b), a.max(b));
+        ((self.u32() & 0x7FFF_FFFF) as i32) % (hi - lo + 1) + lo
     }
 }
 
@@ -80,16 +165,16 @@ pub const LOGO_CLIP_Y: f32 = 680.0;
 
 /// Rising, spinning crystal shards and twinkling dots under the title logo.
 pub struct LogoFx {
-    rng: Rng,
+    rng: TinyMt,
     shards: Vec<Shard>,
     dots: Vec<Dot>,
     acc: f32,
 }
 
 impl LogoFx {
-    pub fn new(seed: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            rng: Rng::new(seed),
+            rng: TinyMt::from_time(),
             shards: Vec::new(),
             dots: Vec::new(),
             acc: 0.0,
@@ -109,8 +194,8 @@ impl LogoFx {
             let vy = r.f() * 0.45 + 0.13333;
             let dir = ((r.f() * 20.0 + 80.0) * std::f32::consts::PI / 180.0).cos();
             self.shards.push(Shard {
-                kind: (r.f() * 3.0) as usize % 3,
-                scale: r.range(0.3, 0.75),
+                kind: r.range(0, 2) as usize,
+                scale: r.uniform(0.3, 0.75),
                 life: (r.f() * 150.0 + 120.0).floor(),
                 age: 0.0,
                 vx: vy * dir,
@@ -128,8 +213,8 @@ impl LogoFx {
                 break;
             }
             self.dots.push(Dot {
-                kind: (r.f() * 3.0) as usize % 3,
-                alpha: r.range(0.25, 1.0),
+                kind: r.range(0, 2) as usize,
+                alpha: r.uniform(0.25, 1.0),
                 life: (r.f() * 42.0 + 18.0).floor(),
                 age: 0.0,
                 x: r.f() * 150.0 + 405.0,
@@ -202,7 +287,7 @@ pub struct MenuBg {
     pub t_speed: f32,
     /// sub_1B20: a fade in pauses the title movie, a fade out resumes it (off_AE0210)
     pub movie_paused: bool,
-    rng: Rng,
+    rng: TinyMt,
     sparks: Vec<Spark>,
     acc: f32,
 }
@@ -221,14 +306,14 @@ pub const STRIPS: [(&str, f32, f32, f32, f32); 8] = [
 ];
 
 impl MenuBg {
-    pub fn new(seed: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             a: 0.0,
             speed: 0.0,
             t: 0.0,
             t_speed: 0.0,
             movie_paused: false,
-            rng: Rng::new(seed),
+            rng: TinyMt::from_time(),
             sparks: Vec::new(),
             acc: 0.0,
         }
@@ -270,7 +355,7 @@ impl MenuBg {
             }
             let scale = r.f() * 0.2 + 0.1;
             let life = (r.f() * 150.0 + 120.0).floor();
-            let alpha = r.range(0.25, 0.5);
+            let alpha = r.uniform(0.25, 0.5);
             let x = r.f() * 960.0;
             let y = r.f() * 540.0;
             let vy = r.f() * 0.36667 + 0.13333;
@@ -309,5 +394,16 @@ impl MenuBg {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// TinyMT32 reference output (tinymt32 check, seed 1)
+    #[test]
+    fn tinymt_reference() {
+        let mut t = super::TinyMt::new(1);
+        let v: Vec<u32> = (0..5).map(|_| t.u32()).collect();
+        assert_eq!(v, [2545341989, 981918433, 3715302833, 2387538352, 3591001365]);
     }
 }

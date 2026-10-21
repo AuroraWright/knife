@@ -10,7 +10,7 @@
 //!   +13449 of the page entry. Every other F word reads 0 after a load (sub_82330 clears all 1200).
 
 #[rustfmt::skip]
-pub const SE_NAMES: [&str; 1291] = [
+pub static SE_NAMES: [&str; 1291] = [
     "FATE_SE001", "FATE_SE003", "FATE_SE004", "FATE_SE005", "FATE_SE006", "FATE_SE007", "FATE_SE008", "FATE_SE010",
     "FATE_SE011", "FATE_SE023", "FATE_SE024", "FATE_SE027", "FATE_SE028", "FATE_SE030", "FATE_SE032", "FATE_SE039",
     "FATE_SE040", "FATE_SE041", "FATE_SE049", "FATE_SE050", "FATE_SE053", "FATE_SE055", "FATE_SE057", "FATE_SE058",
@@ -207,7 +207,7 @@ pub const SCENE_NODE: [i16; 527] = [
 ];
 
 #[rustfmt::skip]
-pub const SEEN_ALIAS: [(&str, u16); 2144] = [
+pub static SEEN_ALIAS: [(&str, u16); 2144] = [
     ("AOK_A_21_00_N01", 2701), ("AOK_A_21_00_N02", 2702), ("AOK_A_21_01_N01", 2703), ("AOK_A_21_01_N02", 2704), ("AOK_A_21_02_N01", 2705), ("AOK_A_21_02_N02", 2706),
     ("AOK_A_21_03_N01", 2707), ("AOK_A_21_03_N02", 2708), ("AOK_A_30_00_N00", 2709), ("ARU_A_46_03_N00", 2710), ("ARU_A_46_10_N00", 2711), ("ARU_A_46_10_N02", 2712),
     ("BOY_A_30_00_N00", 2713), ("NOE_A_41_00_N01", 2714), ("NOE_A_65_00_N00", 2715), ("NOE_A_65_01_A00", 2716), ("NOE_A_65_01_A01", 2717), ("NOE_A_65_01_A02", 2718),

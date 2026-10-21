@@ -4,8 +4,8 @@
 //! tint layers of (r, g, b, amount 0..255, blend mode). The shader works on 0..255 gamma-space values:
 //! optional grey (54 r + 183 g + 19 b) / 256 (flag 1 or 2), per-channel levels
 //! low + (high - low) * pow(x / 255, 1 / gain) mixed in by the amount (1 once anything is set), then each
-//! tint layer, then a brightness / contrast stage that is neutral here. Mode 1 (flag 2) is the colour fill,
-//! which knife draws as a layer fill instead.
+//! tint layer, then the brightness / contrast stage (SNX2 / SNX3, `Bake`). Mode 1 (flag 2) is the colour
+//! fill, which knife draws as a layer fill instead (its colour still goes through that last stage).
 
 const UNSET: f32 = -9.0;
 
@@ -168,6 +168,81 @@ fn tint(x: f32, t: f32, a: f32, mode: i32) -> f32 {
     }
 }
 
+/// What sub_3ECC0 builds a layer texture with (sub_B6A20 -> sub_A3180, shader pre_alter): the STEC grade and
+/// the SNX2 / SNX3 factors (render floats 146 / 147: brightness 1 + v / 255, contrast 1 + v / 100).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bake {
+    pub grade: i32,
+    pub bright: f32,
+    pub contrast: f32,
+}
+
+impl Default for Bake {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Bake {
+    pub const NONE: Self = Self { grade: 0, bright: 1.0, contrast: 1.0 };
+
+    /// The bake for an STEC mode and SNX factors (modes without a grade bake no grade).
+    pub fn new(stec: i32, bright: f32, contrast: f32) -> Self {
+        Self { grade: if is_grade(stec) { stec } else { 0 }, bright, contrast }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.grade == 0 && !self.tones()
+    }
+
+    fn tones(&self) -> bool {
+        self.bright != 1.0 || self.contrast != 1.0
+    }
+
+    /// Cache key suffix (empty for no bake).
+    pub fn key(&self) -> String {
+        match (self.grade, self.tones()) {
+            (0, false) => String::new(),
+            (g, false) => format!("#{g}"),
+            (g, true) => format!("#{g}#{}#{}", self.bright.to_bits(), self.contrast.to_bits()),
+        }
+    }
+
+    /// Apply to RGBA8 pixels in place (alpha untouched).
+    pub fn apply(&self, px: &mut [u8]) {
+        if self.grade != 0 {
+            apply(self.grade, px);
+        }
+        if self.tones() {
+            let lut: Vec<u8> = (0..=255u8).map(|x| (self.tone(f32::from(x)) * 255.0).round() as u8).collect();
+            for q in px.as_chunks_mut::<4>().0 {
+                for c in 0..3 {
+                    q[c] = lut[usize::from(q[c])];
+                }
+            }
+        }
+    }
+
+    /// An STEC fill colour (0..1) as the bake leaves it: the fill replaces the colour before the last stage.
+    pub fn fill(&self, rgb: [f32; 3]) -> [f32; 3] {
+        rgb.map(|c| self.tone((c * 255.0).clamp(0.0, 255.0)))
+    }
+
+    /// pre_alter's last stage on a 0..255 value, giving 0..1: x + 255 (b - 1) clamped, then the contrast
+    /// factor k = (55 + 200 c) / 255 for c <= 1, else 127.5 / (127.5 - 100 (c - 1)), around 127.5.
+    fn tone(&self, x: f32) -> f32 {
+        let x = (x + 255.0 * self.bright - 255.0).clamp(0.0, 255.0);
+        let c = self.contrast;
+        let k = if c <= 1.0 {
+            (c * 200.0 + 55.0) / 255.0
+        } else {
+            let t = c * 100.0 - 100.0;
+            (t / (127.5 - t) * 127.5 + 127.5) * (1.0 / 127.5)
+        };
+        (((x - 127.5) * k + 127.5).clamp(0.0, 255.0)) / 255.0
+    }
+}
+
 /// Whether STEC `mode` changes the image (modes 2..=82 with parameters; 0 and 1 do not go through here).
 pub fn is_grade(mode: i32) -> bool {
     mode >= 2 && params(mode).is_some()
@@ -180,13 +255,13 @@ pub fn apply(mode: i32, px: &mut [u8]) {
     // value is a 1/256 multiple, so it is indexed by the integer weighted sum)
     if p.grey {
         let lut: Vec<[u8; 3]> = (0..=255 * 256).map(|s| channels(&p, [s as f32 / 256.0; 3])).collect();
-        for q in px.chunks_exact_mut(4) {
+        for q in px.as_chunks_mut::<4>().0 {
             let s = usize::from(q[0]) * 54 + usize::from(q[1]) * 183 + usize::from(q[2]) * 19;
             q[..3].copy_from_slice(&lut[s]);
         }
     } else {
         let lut: Vec<[u8; 3]> = (0..=255u8).map(|x| channels(&p, [f32::from(x); 3])).collect();
-        for q in px.chunks_exact_mut(4) {
+        for q in px.as_chunks_mut::<4>().0 {
             for c in 0..3 {
                 q[c] = lut[usize::from(q[c])][c];
             }
@@ -198,8 +273,8 @@ pub fn apply(mode: i32, px: &mut [u8]) {
 fn channels(p: &Params, mut v: [f32; 3]) -> [u8; 3] {
     let amount = p.amount.clamp(0.0, 1.0);
     if amount > 0.0 {
-        for c in 0..3 {
-            let x = v[c];
+        for (c, vc) in v.iter_mut().enumerate() {
+            let x = *vc;
             if p.keep_zero && c > 0 && x == 0.0 {
                 continue;
             }
@@ -212,7 +287,7 @@ fn channels(p: &Params, mut v: [f32; 3]) -> [u8; 3] {
                 (x / 255.0).powf(1.0 / g) * 255.0
             };
             let lv = 255.0 * p.low[c] + (p.high[c] - p.low[c]) * curve;
-            v[c] = x + amount * (lv - x);
+            *vc = x + amount * (lv - x);
         }
     }
     for &(rgb, a, mode) in &p.tints {
@@ -230,7 +305,7 @@ mod tests {
     /// The direct per-pixel form the tables replace.
     fn reference(mode: i32, px: &mut [u8]) {
         let Some(p) = params(mode) else { return };
-        for q in px.chunks_exact_mut(4) {
+        for q in px.as_chunks_mut::<4>().0 {
             let mut v = [q[0], q[1], q[2]].map(f32::from);
             if p.grey {
                 v = [(v[0] * 54.0 + v[1] * 183.0 + v[2] * 19.0) / 256.0; 3];

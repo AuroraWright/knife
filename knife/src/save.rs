@@ -27,14 +27,14 @@ pub struct LayerSave {
     pub base: Option<usize>,
     #[serde(default)]
     pub absolute: bool,
-    /// SSW2: amp min/max, period min/max, strength, remaining ms
+    /// quake slots 0 / 1 as the stage block keeps them: mode, delay frames, remaining frames, parameters
     #[serde(default)]
-    pub sway: Option<[f32; 6]>,
-    /// SQK2: amp x / y, remaining ms (negative = forever), elapsed ms, then the SQK2 arguments 3..7
-    #[serde(default)]
-    pub quake: Option<([f32; 4], [i32; 5])>,
+    pub quake: [(u8, i16, i16, [i16; 6]); 2],
     #[serde(default)]
     pub rule: Option<i32>,
+    /// STTR b
+    #[serde(default)]
+    pub rule_flip: u8,
     #[serde(default)]
     pub noise: Option<i32>,
     pub blend: u8,
@@ -44,16 +44,40 @@ pub struct LayerSave {
     #[serde(default)]
     pub grade: i32,
     pub motion: Option<(i32, f32)>,
+    /// clip window x, y, w, h (px) and the scissor inset (STCH arg 16)
     #[serde(default)]
     pub clip: Option<[f32; 5]>,
+    /// STCH arg 17: the inset's mode
+    #[serde(default)]
+    pub clip_mode: i8,
+    /// SNX2 brightness (1 + v / 255)
     #[serde(default)]
     pub bright: Option<f32>,
+    /// SNX3 contrast (1 + v / 100)
+    #[serde(default)]
+    pub contrast: Option<f32>,
     /// STBR mode as given (-1 none)
     #[serde(default)]
     pub stbr: Option<i32>,
-    /// STRR rotation, degrees
+    /// STRR clip rotation (stage word 1522: 1/100 degree, -32768 = the child's own rotation)
     #[serde(default)]
-    pub motion_rot: f32,
+    pub rot2: i16,
+    /// STPV / motion pivot (stage anchor, 640x362 units) when not the image centre
+    #[serde(default)]
+    pub pivot: Option<[f32; 2]>,
+    /// render colour a motion set on a layer that is not a fill (stage colour at +5850)
+    #[serde(default)]
+    pub tint: Option<[f32; 3]>,
+    /// SOXY draw offset (stage words 1222 / 1262)
+    #[serde(default)]
+    pub soxy: (i16, i16),
+}
+
+impl LayerSave {
+    /// What a load builds the layer texture with (the STEC grade and SNX tone the record keeps).
+    pub fn bake(&self) -> crate::grade::Bake {
+        crate::grade::Bake::new(self.grade, self.bright.unwrap_or(1.0), self.contrast.unwrap_or(1.0))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -80,15 +104,15 @@ pub struct SaveData {
     pub timestamp: u64,
     /// text shown in the slot list
     pub preview: String,
-    /// FADE 40 full-screen blur active
-    #[serde(default)]
-    pub blur: bool,
     /// per empty layer: what STCC left of it (see `Stage::kept`)
     #[serde(default)]
     pub kept: Vec<Option<Kept>>,
     /// the stage backup block (record +6664, see `Game::stage_backup`)
     #[serde(default)]
     pub backup: Option<Vec<u8>>,
+    /// the FCLN effect (stage byte 6569; 0 = none)
+    #[serde(default)]
+    pub focus: u8,
     /// the rewind-ring entry before this one, kept by a save (record count / previous entry)
     #[serde(default)]
     pub prev: Option<Box<SaveData>>,
@@ -103,6 +127,10 @@ pub struct SaveData {
     /// the current `_Z` read key (entry +26 / +28: the message's own, or the last marker's)
     #[serde(default)]
     pub read_key: Option<(usize, u8)>,
+    /// the entry's raw text (+13956, byte_146EC28): a message's text up to its end code with MSAD's additions,
+    /// ATSV(1)'s copy of the last message's, empty otherwise
+    #[serde(default)]
+    pub text: String,
 }
 
 /// What an empty layer keeps in the stage block: the negated anchor at +5844+2 / +4 of the last image shown

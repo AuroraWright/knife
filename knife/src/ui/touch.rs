@@ -30,9 +30,10 @@ const DRAG_MIN: f32 = 7.0;
 const PANEL_X0: f32 = 25.333;
 const PANEL_DX: f32 = 73.667;
 const PANEL_BTN_Y: f32 = 6.637;
-/// mode_panel_btn_ja cells (8 columns; rows: disabled, normal, hover, pressed)
-const BTN_W: f32 = 233.0;
-const BTN_H: f32 = 74.0;
+/// mode_panel_btn_ja cells (8 columns; rows: disabled, normal, hover, pressed): the sprite defs at 0x591cf8 take
+/// 224x64 from (8 + 232 column, 8 + 72 row), drawn from the object's position
+const BTN_W: f32 = 224.0;
+const BTN_H: f32 = 64.0;
 
 /// The exe's drag tracker (the object at 0xAE2EE8, stepped once a frame by sub_40C) for a list's vertical drag:
 /// a touch that starts inside the screen's rect is followed in the 1280x720 touch space. Each frame the speed
@@ -105,8 +106,8 @@ pub struct Touch {
     dragged: bool,
     swallow: bool,
     /// the touch moved this frame / frames left of touch visibility (off_AE02C8 + 0xC: 256 while a finger
-    /// is down, then counting down), the button / finger is down (+ 8), and where it last was (units,
-    /// + 0x2C / + 0x30: it stays there after the release). Only a held button moves the touch: a mouse that
+    /// is down, then counting down), the button / finger is down (+8), and where it last was (units,
+    /// +0x2C / +0x30: it stays there after the release). Only a held button moves the touch: a mouse that
     /// merely hovers is no finger on the screen.
     moved: bool,
     visible: f32,
@@ -118,6 +119,13 @@ pub struct Touch {
     /// sub_3C510's mode icon (dword_AFEC9C): mode_disp cell (0 none, 1 previous scene, 2 rewind, 3 fast
     /// forward, 4 next scene, 5 skip mode)
     mode_icon: usize,
+    /// sub_40ED0's scene countdowns: next scene (off_AE0680 3 / off_AE06B0 3, 20 frames; 4 for an RDAS hit
+    /// without the confirmation) or previous scene (off_AE0680 6, 20 frames), frames left and the 60 Hz
+    /// frames owed; the script and the story input wait meanwhile
+    pub(super) scene_cd: Option<(bool, i32)>,
+    cd_tick: f32,
+    /// sub_3F110 / sub_3EF20: black over the story at min(v, 1), v falling 0.04 per frame once set
+    cd_black: f32,
     arrow_at: [f32; 2],
     arrow_dx: f32,
     /// the gesture currently drives game.skip / a rewind at this speed
@@ -134,19 +142,16 @@ pub struct Touch {
     panel_hover: Option<usize>,
     held_frames: f32,
     flash: [f32; 8],
-    /// The panel was opened with a button (HIDWORD(qword_B35A14)): only then do the D-pad and A drive it.
-    pub panel_pad: bool,
-    /// its selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad, which
-    /// the next button opening starts on (LODWORD)
+    /// The panel's selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad,
+    /// which the next opening starts on (LODWORD)
     pub panel_key: Option<usize>,
     pub panel_last: usize,
     /// pointer two frames back (units): the release flick compares against it (sub_AD4E0 slot fields 7 / 9)
     trail: [[f32; 2]; 2],
     trail_t: f32,
-    /// ZL / ZR held (frames), and the R skip mode (off_AE0660 bit 1)
+    /// ZL / ZR held (frames)
     pub zl: Option<f32>,
     pub zr: Option<f32>,
-    pub skip_mode: bool,
 }
 
 impl Touch {
@@ -166,6 +171,9 @@ impl Touch {
             arrow_fx: 0.0,
             arrow_at: [0.0; 2],
             mode_icon: 0,
+            scene_cd: None,
+            cd_tick: 0.0,
+            cd_black: 0.0,
             rewind_t: 0.0,
             arrow_dx: 0.0,
             drag_skip: false,
@@ -176,14 +184,13 @@ impl Touch {
             panel_hover: None,
             held_frames: 0.0,
             flash: [0.0; 8],
-            panel_pad: false,
             panel_key: None,
-            panel_last: 0,
+            // sub_4DCC0: the panel's cursor starts on fast forward
+            panel_last: 3,
             trail: [[0.0; 2]; 2],
             trail_t: 0.0,
             zl: None,
             zr: None,
-            skip_mode: false,
         }
     }
 
@@ -395,6 +402,17 @@ impl Ui {
         }
     }
 
+    /// Help balloon of the focused panel button once the panel is open (state 3 focuses object 207 + button,
+    /// sub_AE0E0): object table unk_5918C8, SYSMES 169 171 173 172 170 174 175 176, rect (4, -10) 70x36, flags 0x320.
+    pub(super) fn panel_help(&self) -> Option<(usize, [f32; 2], [f32; 4], u32)> {
+        if self.touch.panel != Panel::Open {
+            return None;
+        }
+        let i = self.touch.panel_hover.or(self.touch.panel_key)?;
+        let id = [169, 171, 173, 172, 170, 174, 175, 176][i];
+        Some((id, [PANEL_X0 + PANEL_DX * i as f32, self.panel_y() + PANEL_BTN_Y], [4.0, -10.0, 70.0, 36.0], 0x320))
+    }
+
     fn panel_y(&self) -> f32 {
         // sub_4DE10: quad-out from -43.14 to 0 units over the slide
         let t = self.touch.panel_t;
@@ -411,12 +429,11 @@ impl Ui {
     }
 
     /// Panel buttons 4..6 that sub_4E0C0 leaves enabled: next scene except in a gallery flowchart replay
-    /// (sub_50F0), Q.SAVE / Q.LOAD unless saving is off (F025, sub_47B10); Q.LOAD also needs the quick save.
+    /// (sub_50F0), Q.SAVE / Q.LOAD unless saving is off (F025, sub_47B10).
     pub(super) fn panel_ok(&self, game: &Game, b: usize) -> bool {
         match b {
             4 => self.gal_ret[0] != 2,
-            5 => game.var("F025") == 0,
-            6 => game.var("F025") == 0 && self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some),
+            5 | 6 => game.var("F025") == 0,
             _ => true,
         }
     }
@@ -427,7 +444,7 @@ impl Ui {
         // sub_4E170: a button that acts plays system sound 1 (before its dialog), an unavailable one sound 2
         match b {
             // previous / next scene and quick load ask first (dialogs 11, 10, 9)
-            0 if game.can_rewind() => {
+            0 if game.can_prev_scene() => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::PrevScene);
             }
@@ -443,7 +460,8 @@ impl Ui {
                 self.snd(game, 1);
                 self.quick_save(game, r);
             }
-            6 if self.panel_ok(game, 6) => {
+            // case 6: sound 2 without a quick save (sub_52BF0(139) < 1)
+            6 if self.panel_ok(game, 6) && self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some) => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::QuickLoad);
             }
@@ -463,7 +481,9 @@ impl Ui {
                 }
             }
         }
-        let in_game = self.screen == Screen::Game && !game.in_choice();
+        // no story touches during a scene countdown (sub_40ED0 returns first)
+        // nor during the staff roll task (off_AE0650 = 1; only taps and ZR act)
+        let in_game = self.screen == Screen::Game && !game.in_choice() && self.touch.scene_cd.is_none() && !game.mode_task();
         let held = self.touch.press.is_some();
         let [x, y] = self.touch.at;
         let pointer_moved = self.touch.moved;
@@ -532,17 +552,31 @@ impl Ui {
 
         // ZR / ZL held (sub_40ED0, masks [19] / [20] = 0x200 / 0x100): speed 1 for the first 4 frames held,
         // then frames / 15 up to 64
-        let ramp = |t: f32| -> u32 { if t < 4.0 { 1 } else { ((t as u64 * 0x22_2222_2240 >> 32) >> 7).min(64) as u32 } };
-        let zr = if in_game && self.touch.panel == Panel::Closed { self.touch.zr.map(ramp) } else { None };
+        let ramp = |t: f32| -> u32 { if t < 4.0 { 1 } else { (((t as u64 * 0x22_2222_2240) >> 32) >> 7).min(64) as u32 } };
+        // sub_40ED0: while a story movie or the staff roll runs (off_AE0650) skip mode is cleared every frame;
+        // the staff roll takes ZR (its pressure past 71 of 255: any press of a digital ZR) at 32
+        // (the inits set the drag arrow's alpha to 0 with sub_3B5C0, and nothing raises it while it is set)
+        if game.mode_task() {
+            game.skip_mode = false;
+            self.touch.arrow_a = 0.0;
+        }
+        let staff = self.screen == Screen::Game && game.mode_task() && !game.in_choice();
+        let zr = if staff {
+            self.touch.zr.map(|_| 32)
+        } else if in_game && self.touch.panel == Panel::Closed {
+            self.touch.zr.map(ramp)
+        } else {
+            None
+        };
         let zl = if in_game && self.touch.panel == Panel::Closed { self.touch.zl.map(ramp) } else { None };
         // forward: skip at the speed (unread text still stops it unless the config allows it);
-        // backward: rewind, one message each time the restored one has settled
+        // backward: rewind, one ring entry a frame without running the script
         let fwd = if panel_skip { 64 } else { zr.unwrap_or(speed.max(0) as u32) };
-        if self.touch.skip_mode && self.screen == Screen::Game {
+        if game.skip_mode && self.screen == Screen::Game {
             // R skip mode: on until B, R again, or unread text stops the skip
             game.set_skip(true);
             if !game.skip {
-                self.touch.skip_mode = false;
+                game.skip_mode = false;
                 game.set_skip(false);
             }
             self.touch.drag_skip = true;
@@ -566,35 +600,42 @@ impl Ui {
         } else {
             0
         };
-        if back > 0 && game.can_rewind() {
+        // (off_AE05B8 stays set while held, also once the ring has run out)
+        if back > 0 && (game.can_rewind() || game.rewinding) {
             self.touch.rewind = back;
             game.speed = back;
-            // sub_814C0 runs once per 60 Hz frame, whatever the display rate
+            // sub_40ED0 runs sub_814C0 instead of the script: no message is shown while rewinding, and each
+            // 60 Hz frame restores the stage of the previous ring entry (whatever the display rate)
+            game.rewinding = true;
             self.touch.rewind_t = (self.touch.rewind_t + f).min(1.0);
             if self.touch.rewind_t >= 1.0 && game.settled() {
                 self.touch.rewind_t -= 1.0;
                 game.rewind_step(r);
             }
         } else if self.touch.rewind > 0 {
+            // released: the script runs again from the restored message, which shows and types out
             self.touch.rewind = 0;
+            game.end_rewind();
             game.speed = 1;
         }
         // sub_3C510: the effect fade (dword_AFECA4) rises 0.05 per frame (x5 while rewinding) while rewinding,
         // at speed 2 or more (a skip; ZR from its 30th frame), in auto mode (dword_AFEC98), or while the drag
         // gesture runs (off_AE0610), and falls otherwise
         let rate = 0.05 * f * if self.touch.rewind > 0 { 5.0 } else { 1.0 };
-        let fx_on = self.touch.rewind > 0 || (in_game && (game.speed >= 2 || game.auto)) || arrow_on;
+        let story = self.screen == Screen::Game && !game.in_choice();
+        let fx_on = self.touch.rewind > 0 || (story && (game.speed >= 2 || game.auto)) || arrow_on;
         // the mode icon (sub_3B5B0, set each frame by sub_40ED0): 5 in skip mode, then 2 while rewinding or 3
         // while skipping fast (off_AE0670)
         self.touch.mode_icon = if self.touch.rewind > 0 {
             2
         } else if self.touch.drag_skip && in_game {
             3
-        } else if self.touch.skip_mode {
+        } else if game.skip_mode {
             5
         } else {
             0
         };
+        self.scene_countdown(game, r, f);
         self.touch.arrow_fx = if fx_on {
             (self.touch.arrow_fx + rate).min(1.0)
         } else {
@@ -619,8 +660,11 @@ impl Ui {
         // 0.05 per frame, stays until a tap below it or an upward swipe
         match self.touch.panel {
             Panel::Closed => {
+                // state 1 sets the button request (HIDWORD(qword_B35A14) = 1) however it opens, so a panel
+                // opened by touch also starts on its last button and takes the pad
                 if in_game && !self.touch.hidden && self.touch.visible > 0.0 && y < 25.0 {
                     self.touch.panel = Panel::Opening;
+                    self.touch.panel_key = Some(self.touch.panel_last);
                 }
             }
             Panel::Opening => {
@@ -629,11 +673,13 @@ impl Ui {
                     self.touch.panel_t = 1.0;
                     self.touch.panel = Panel::Open;
                     self.show_window();
+                    // state 3 reads the pointed object every frame: a pointer resting on a button takes it
+                    self.touch.moved = true;
                 }
             }
             Panel::Open => {
                 if pointer_moved {
-                    let before = self.touch.panel_hover;
+                    let before = self.touch.panel_hover.or(self.touch.panel_key);
                     self.touch.panel_hover = if y <= 43.0 { self.panel_button() } else { None };
                     if let Some(h) = self.touch.panel_hover {
                         // sub_4E170: sound 0 when the touch moves onto another button
@@ -641,9 +687,7 @@ impl Ui {
                             game.play_sys_sound(0);
                         }
                         self.touch.panel_last = h;
-                        if self.touch.panel_pad {
-                            self.touch.panel_key = Some(h);
-                        }
+                        self.touch.panel_key = Some(h);
                     }
                 }
                 if self.screen == Screen::Game && game.in_choice() {
@@ -657,14 +701,62 @@ impl Ui {
                     self.touch.panel = Panel::Closed;
                     self.touch.panel_hover = None;
                     self.touch.panel_key = None;
-                    self.touch.panel_pad = false;
                 }
             }
         }
     }
 
     /// Story overlays: drag arrow and mode panel.
-    pub(super) fn draw_touch_game(&self, game: &Game, out: &mut Vec<Quad>) {
+    /// Start a next (dialog 10, an RDAS hit) / previous (dialog 11) scene countdown of `frames`; the mode panel
+    /// closes (sub_4E9A0) and the window comes back (off_AE0690 = 0).
+    pub(super) fn start_scene_countdown(&mut self, next: bool, frames: i32) {
+        self.touch.scene_cd = Some((next, frames));
+        self.touch.cd_tick = 0.0;
+        if matches!(self.touch.panel, Panel::Open | Panel::Opening) {
+            self.touch.panel = Panel::Closing;
+        }
+        self.touch.hidden = false;
+    }
+
+    /// sub_40ED0 states 3 / 6: per frame the count goes down, the next-scene one sets sub_3F110(1.5 - n / 30) and
+    /// mode icon 4, the previous-scene one icon 1; at 0 the seek starts (sub_53950(1) / sub_85510 + (-1)).
+    fn scene_countdown(&mut self, game: &mut Game, r: &Renderer, f: f32) {
+        self.touch.cd_tick += f;
+        while self.touch.cd_tick >= 1.0 {
+            self.touch.cd_tick -= 1.0;
+            // sub_3EF20 after drawing
+            if self.touch.cd_black > 0.0 {
+                self.touch.cd_black = (self.touch.cd_black - 0.04).max(0.0);
+            }
+            let Some((next, n)) = &mut self.touch.scene_cd else { continue };
+            *n -= 1;
+            if *next {
+                self.touch.cd_black = 1.5 - *n as f32 / 30.0;
+            }
+            if *n <= 0 {
+                let next = *next;
+                self.touch.scene_cd = None;
+                if next {
+                    game.next_scene();
+                } else {
+                    game.prev_scene(r);
+                }
+            }
+        }
+        if self.touch.scene_cd.is_none() && self.touch.cd_tick > 1.0 {
+            self.touch.cd_tick = 0.0;
+        }
+        if let Some((next, _)) = self.touch.scene_cd {
+            self.touch.mode_icon = if next { 4 } else { 1 };
+        }
+        game.hold = self.touch.scene_cd.is_some();
+    }
+
+    pub(super) fn draw_touch_game(&self, game: &Game, r: &Renderer, out: &mut Vec<Quad>) {
+        // sub_3EF20, first in sub_3C510: the countdown's black over the screen
+        if self.touch.cd_black > 0.0 {
+            out.push(Quad::rect(r.white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, self.touch.cd_black.min(1.0)]));
+        }
         // sub_3C510: mode_skip_0 anchored at its left middle on the touch start, x scale
         // stretch / 88 * 0.5 (negative points left) and y scale 0.5 in the 640x448 space
         let a = self.touch.arrow_a * self.touch.arrow_fx * 0.6;
@@ -699,7 +791,7 @@ impl Ui {
             let pressing = (self.touch.press.is_some() && self.touch.panel_hover.is_some()) || (self.enter_held && self.touch.panel_key.is_some());
             for i in 0..8 {
                 // states (sub_ADE80 flag 2): previous scene unavailable -> dark; auto on -> lit
-                let row = if (i == 0 && !game.can_rewind()) || !self.panel_ok(game, i) {
+                let row = if (i == 0 && !game.can_prev_scene()) || !self.panel_ok(game, i) {
                     0.0
                 } else if self.touch.flash[i] > 0.0 || (i == 2 && game.auto) || (pressing && hover == Some(i)) {
                     3.0
@@ -709,7 +801,7 @@ impl Ui {
                     1.0
                 };
                 let x = (PANEL_X0 + PANEL_DX * i as f32) * UX;
-                self.sprite(out, "mode_panel_btn_ja", [x, top, BTN_W, BTN_H], Some([i as f32 * BTN_W, row * BTN_H, BTN_W, BTN_H]));
+                self.sprite(out, "mode_panel_btn_ja", [x, top, BTN_W, BTN_H], Some([8.0 + i as f32 * 232.0, 8.0 + row * 72.0, BTN_W, BTN_H]));
             }
         }
     }

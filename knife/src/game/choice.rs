@@ -286,7 +286,7 @@ impl Game {
             ChoiceKind::Page => (0..c.opts.len())
                 .map(|i| {
                     let top = c.top + i as f32 * LAYOUT.line_height - ASCENT;
-                    let w = c.placed[i].last().map_or(0.0, |p| p.x + p.size - LAYOUT.left);
+                    let w = c.placed[i].last().map_or(0.0, |p| p.x + p.width() - LAYOUT.left);
                     [LAYOUT.left, top, w, LAYOUT.line_height]
                 })
                 .collect(),
@@ -422,7 +422,7 @@ impl Game {
         // So the glow source is the glyph and its edge, all white; the edge is the message text's rim.
         for p in c.placed.iter().flatten() {
             for (dx, dy) in [(0.0, 0.0), (-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0), (-1.5, -1.5), (1.5, -1.5), (-1.5, 1.5), (1.5, 1.5)] {
-                if let Some(q) = self.font.quad(r, p.c, p.size, p.x + dx, p.baseline + dy, [1.0; 4]) {
+                if let Some(q) = self.font.placed_quad(r, p, dx, dy, [1.0; 4]) {
                     quads.push(q);
                 }
             }

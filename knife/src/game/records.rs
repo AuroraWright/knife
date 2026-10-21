@@ -28,6 +28,8 @@ const EDGE_WORDS: usize = crate::flow::EDGE_BITS.div_ceil(16);
 const TYPE_MESSAGE: u16 = 0;
 const TYPE_CHOICE: u16 = 12;
 const TYPE_ATSV: u16 = 6;
+/// ATSV(1): the last message's text kept (0x78fb0)
+const TYPE_ATSV_TEXT: u16 = 7;
 
 fn alias_bits() -> &'static HashMap<&'static str, u16> {
     static MAP: OnceLock<HashMap<&'static str, u16>> = OnceLock::new();
@@ -125,8 +127,8 @@ impl Game {
         let cmds = &script.commands;
         // a choice resumes at its first option (conditional ones are `IF__` .. `ZYxxxxx` label pairs), so the
         // choice is built again on load
-        let (kind, at) = if d.kind == TYPE_ATSV {
-            (TYPE_ATSV, d.pc)
+        let (kind, at) = if matches!(d.kind, TYPE_ATSV | TYPE_ATSV_TEXT) {
+            (d.kind, d.pc)
         } else if d.choice.is_some() {
             let mut i = d.pc.checked_sub(1)?;
             while i > 0 && (matches!(cmds[i - 1].name.as_str(), "SELR" | "IF__") || cmds[i - 1].name.starts_with("ZY")) {
@@ -157,11 +159,10 @@ impl Game {
             put_i16(&mut p, sd::P_READ_IDX, i as i16);
             put_i16(&mut p, sd::P_READ_SUB, s.into());
         }
-        if kind == TYPE_MESSAGE {
-            let raw = c.args.first().map_or(&[][..], |a| a.as_bytes());
-            let n = raw.len().min(0x1ff);
-            p[sd::P_TEXT..sd::P_TEXT + n].copy_from_slice(&raw[..n]);
-        }
+        // +13956: the entry's text (0x1FE bytes and a 0)
+        let raw = d.text.as_bytes();
+        let n = raw.len().min(0x1fe);
+        p[sd::P_TEXT..sd::P_TEXT + n].copy_from_slice(&raw[..n]);
         if let Some((id, vol)) = d.bgm {
             put_i16(&mut p, sd::P_BGM, sd::clamp16(id));
             put_i16(&mut p, sd::P_BGM_VOL, (vol * 100.0).round() as i16);
@@ -177,7 +178,7 @@ impl Game {
         }
         let vars: HashMap<&str, i32> = d.vars.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         sd::write_f(&mut p, |n| sd::clamp16(vars.get(format!("F{n:03}").as_str()).copied().unwrap_or(0)));
-        let stage = self.encode_stage(&d.layers, &d.kept);
+        let stage = self.encode_stage(&d.layers, &d.kept, d.focus);
         p[sd::P_STAGE..sd::P_STAGE + sd::STAGE_SIZE].copy_from_slice(&stage);
         let backup = d.backup.as_deref().filter(|b| b.len() == sd::STAGE_SIZE).unwrap_or(&stage);
         p[sd::P_STAGE_PREV..sd::P_STAGE_PREV + sd::STAGE_SIZE].copy_from_slice(backup);
@@ -203,7 +204,7 @@ impl Game {
             sd::read_f(p).into_iter().filter(|&(_, v)| v != 0).map(|(n, v)| (format!("F{n:03}"), i32::from(v))).collect();
         let raw = &p[sd::P_TEXT..sd::P_TEXT + 0x200];
         let raw = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
-        let preview = if get_u16(p, sd::P_TYPE) == TYPE_MESSAGE && raw.starts_with('$') {
+        let preview = if raw.starts_with('$') {
             text::parse_markup(&self.resolve_text(&raw))
                 .into_iter()
                 .filter_map(|r| match r {
@@ -230,6 +231,7 @@ impl Game {
             vars,
             layers: self.decode_stage(&p[sd::P_STAGE..sd::P_STAGE + sd::STAGE_SIZE]),
             kept: Self::decode_kept(&p[sd::P_STAGE..sd::P_STAGE + sd::STAGE_SIZE]),
+            focus: p[sd::P_STAGE + st::FOCUS],
             backup: Some(p[sd::P_STAGE_PREV..sd::P_STAGE_PREV + sd::STAGE_SIZE].to_vec()),
             page_texts: Vec::new(),
             choice: None,
@@ -237,22 +239,25 @@ impl Game {
             loops,
             timestamp,
             preview,
-            blur: false,
             prev: None,
-            kind: if get_u16(p, sd::P_TYPE) == TYPE_ATSV { TYPE_ATSV } else { 0 },
+            kind: match get_u16(p, sd::P_TYPE) {
+                k @ (TYPE_ATSV | TYPE_ATSV_TEXT) => k,
+                _ => 0,
+            },
             voice: crate::voice_ids::name(get_i32(p, sd::P_VOICE)).map(str::to_string),
             speaker: i16::from(p[sd::P_SPEAKER_LAST]),
             read_key: {
                 let (i, s) = (get_i16(p, sd::P_READ_IDX), get_i16(p, sd::P_READ_SUB));
                 (i > 0 || s > 0).then(|| (i.max(0) as usize, s as u8))
             },
+            text: raw,
         })
     }
 
     /// Stage block of a snapshot's layers (array layout in savedata::st).
     /// The current stage as a record's stage block.
     pub(crate) fn stage_bytes(&self) -> Vec<u8> {
-        self.encode_stage(&self.layer_saves(), &self.stage.kept)
+        self.encode_stage(&self.layer_saves(), &self.stage.kept, self.focus_saved)
     }
 
     /// Image table index and anchor (ImageInfo centre truncated toward zero) of a layer's image.
@@ -304,8 +309,9 @@ impl Game {
             .collect()
     }
 
-    fn encode_stage(&self, layers: &[Option<LayerSave>], kept: &[Option<Kept>]) -> Vec<u8> {
+    fn encode_stage(&self, layers: &[Option<LayerSave>], kept: &[Option<Kept>], focus: u8) -> Vec<u8> {
         let mut s = sd::empty_stage();
+        s[st::FOCUS] = focus;
         for (l, k) in kept.iter().enumerate().take(sd::LAYERS) {
             if let (Some(k), None) = (k, layers.get(l).and_then(|x| x.as_ref())) {
                 if k.stcc {
@@ -324,6 +330,8 @@ impl Game {
                 (None, None) => continue,
             };
             let (idx, (ax, ay)) = self.image_anchor(&name);
+            // STPV / motion pivots replace the anchor
+            let (ax, ay) = ls.pivot.map_or((ax, ay), |[x, y]| (x, y));
             let w = |s: &mut [u8], o: usize, v: f32| put_i16(s, o + 2 * l, v.round().clamp(-32768.0, 32767.0) as i16);
             put_i16(&mut s, st::IMAGE + 2 * l, idx.map_or(-1, |i| i as i16));
             s[st::FLAGS + l] = if ls.absolute { 0x40 } else { 0 };
@@ -333,7 +341,7 @@ impl Game {
             // a running motion's alpha is its value at the saved whole frame, truncated (the epsilon keeps
             // n / 255 at n); knife's motion clock runs between frames
             let frame = ls.motion.map(|(id, t)| (id, (t * 60.0 / 1000.0).round() * 1000.0 / 60.0));
-            let alpha = frame.and_then(|(id, t)| self.motions.alpha_at(id, t)).unwrap_or(ls.alpha * 255.0);
+            let alpha = frame.and_then(|(id, t)| self.motions.alpha_at(id, t, ls.alpha * 255.0)).unwrap_or(ls.alpha * 255.0);
             w(&mut s, st::ALPHA, (alpha + 1.0e-3).trunc());
             put_i16(&mut s, st::PRIO + 2 * l, sd::clamp16(ls.prio));
             put_i32(&mut s, st::ROT + 4 * l, (ls.rotation * 100.0).round() as i32);
@@ -343,41 +351,31 @@ impl Game {
             w(&mut s, st::ZOOM_Y, ls.zoom_y * 1000.0);
             put_i16(&mut s, st::PARENT + 2 * l, ls.parent.map_or(-1, |p| p as i16));
             put_i16(&mut s, st::BASE + 2 * l, ls.base.map_or(-1, |b| b as i16));
-            put_i16(&mut s, st::RULE + 2 * l, ls.rule.map_or(-1, |n| sd::clamp16(n - 1)));
-            if let Some([x, y, cw, ch, rot]) = ls.clip {
+            put_i16(&mut s, st::RULE + 2 * l, ls.rule.map_or(-1, |n| sd::clamp16(n - 1) | i16::from(ls.rule_flip & 7) << 12));
+            if let Some([x, y, cw, ch, inset]) = ls.clip {
                 for (k, v) in [x, y, cw, ch].into_iter().enumerate() {
                     put_i16(&mut s, st::CLIP + 8 * l + 2 * k, v.round() as i16);
                 }
-                w(&mut s, st::CLIP_ROT, rot * 10.0);
+                w(&mut s, st::CLIP_INSET, inset);
             }
-            w(&mut s, st::ROT2, ls.motion_rot * 100.0);
+            s[st::CLIP_MODE + l] = ls.clip_mode as u8;
+            put_i16(&mut s, st::ROT2 + 2 * l, ls.rot2);
+            put_i16(&mut s, st::SOXY_X + 2 * l, ls.soxy.0);
+            put_i16(&mut s, st::SOXY_Y + 2 * l, ls.soxy.1);
             if let Some((id, t)) = ls.motion {
                 put_i16(&mut s, st::MOTION + 12 * l, sd::clamp16(id));
                 put_i32(&mut s, st::MOTION + 12 * l + 4, (t * 60.0 / 1000.0).round() as i32);
             }
-            if let Some([a0, a1, p0, p1, strength, left]) = ls.sway {
-                // SSW2 (sub_91CF0 -> sub_63520 mode 3, slot 1): amplitudes, periods and duration in frames
-                s[st::QK_MODE + 2 * l + 1] = 3;
-                let dur = if left < 0.0 { -1.0 } else { left * 3.0 / 50.0 };
-                put_i16(&mut s, st::QK_DUR + 4 * l + 2, dur.round() as i16);
-                for (k, v) in [a0, a1, p0 * 3.0 / 50.0, p1 * 3.0 / 50.0, strength].into_iter().enumerate() {
-                    put_i16(&mut s, st::QK_PARAM + 24 * l + 12 + 2 * k, v.round() as i16);
+            // quake slots (sub_63520): mode bytes +3604, delay +3684, remaining +3844, parameters +4004
+            for (k, &(mode, delay, remaining, params)) in ls.quake.iter().enumerate() {
+                if mode == 0 {
+                    continue;
                 }
-            }
-            if let Some(([ax, ay, left, _], [period, dur, fade, a6, a7])) = ls.quake {
-                // SQK2 (sub_91540 -> sub_63520 mode 1, slot 0); arguments in ms become frames (3 / 50)
-                s[st::QK_MODE + 2 * l] = 1;
-                put_i16(&mut s, st::QK_FADE + 4 * l, sd::clamp16(3 * fade / 50));
-                put_i16(&mut s, st::QK_DUR + 4 * l, if left < 0.0 { -1 } else { (left * 3.0 / 50.0).round() as i16 });
-                let frames = match period {
-                    i32::MIN => 2,
-                    p if p < 0 => 1,
-                    p if 3 * p + 49 < 99 => 2,
-                    p => 3 * p / 50 + 1,
-                };
-                let total = if dur >= 0 && 3 * a7 <= 49 { 3 * dur / 50 } else { 0 };
-                for (k, v) in [ax.round() as i32, ay.round() as i32, frames, 3 * a7 / 50, total, a6].into_iter().enumerate() {
-                    put_i16(&mut s, st::QK_PARAM + 24 * l + 2 * k, sd::clamp16(v));
+                s[st::QK_MODE + 2 * l + k] = mode;
+                put_i16(&mut s, st::QK_FADE + 4 * l + 2 * k, delay);
+                put_i16(&mut s, st::QK_DUR + 4 * l + 2 * k, remaining);
+                for (j, v) in params.into_iter().enumerate() {
+                    put_i16(&mut s, st::QK_PARAM + 24 * l + 12 * k + 2 * j, v);
                 }
             }
             if let Some(n) = ls.noise {
@@ -388,13 +386,16 @@ impl Game {
             if ls.grade != 0 {
                 put_i16(&mut s, st::EFFECT + 2 * l, ls.grade as i16);
             }
-            if let Some(rgb) = ls.fill {
+            if ls.fill.is_some() {
                 put_i16(&mut s, st::EFFECT + 2 * l, 1);
+            }
+            if let Some(rgb) = ls.fill.or(ls.tint) {
                 for (k, v) in rgb.into_iter().enumerate() {
                     s[e + 6 + k] = (v * 255.0).round() as u8;
                 }
             }
             put_f32(&mut s, st::TONE + 16 * l, ls.bright.unwrap_or(1.0));
+            put_f32(&mut s, st::TONE + 16 * l + 4, ls.contrast.unwrap_or(1.0));
             put_i16(&mut s, e + 2, -(ax as i16));
             put_i16(&mut s, e + 4, -(ay as i16));
         }
@@ -414,30 +415,21 @@ impl Game {
                 let h = |o: usize| f32::from(get_i16(s, o + 2 * l));
                 let opt = |o: usize| usize::try_from(get_i16(s, o + 2 * l)).ok();
                 let zoom = h(st::ZOOM) / 1000.0;
-                let q = st::QK_PARAM + 24 * l + 12;
-                let sway = (s[st::QK_MODE + 2 * l + 1] == 3).then(|| {
-                    let p = |k: usize| f32::from(get_i16(s, q + 2 * k));
-                    let dur = f32::from(get_i16(s, st::QK_DUR + 4 * l + 2));
-                    [p(0), p(1), p(2) * 50.0 / 3.0, p(3) * 50.0 / 3.0, p(4), if dur < 0.0 { -1.0 } else { dur * 50.0 / 3.0 }]
-                });
-                let q0 = st::QK_PARAM + 24 * l;
-                let quake = (s[st::QK_MODE + 2 * l] == 1).then(|| {
-                    let p = |k: usize| i32::from(get_i16(s, q0 + 2 * k));
-                    let dur = get_i16(s, st::QK_DUR + 4 * l);
-                    let ms = |f: i32| f * 50 / 3;
-                    let period = match p(2) {
-                        f if f <= 1 => -1,
-                        2 => 0,
-                        f => ms(f - 1),
-                    };
-                    let total = if dur < 0 { -1 } else if p(4) > 0 { ms(p(4)) } else { ms(i32::from(dur)) };
-                    let left = if dur < 0 { -1.0e10 } else { f32::from(dur) * 50.0 / 3.0 };
-                    let fade = ms(i32::from(get_i16(s, st::QK_FADE + 4 * l)));
-                    ([p(0) as f32, p(1) as f32, left, 0.0], [period, total, fade, p(5), ms(p(3))])
+                let quake = [0, 1].map(|k| {
+                    let mode = s[st::QK_MODE + 2 * l + k];
+                    let params = [0, 1, 2, 3, 4, 5].map(|j| get_i16(s, st::QK_PARAM + 24 * l + 12 * k + 2 * j));
+                    match mode {
+                        0 => (0, 0, 0, [0; 6]),
+                        _ => (mode, get_i16(s, st::QK_FADE + 4 * l + 2 * k), get_i16(s, st::QK_DUR + 4 * l + 2 * k), params),
+                    }
                 });
                 let e = st::EXTRA + 18 * l;
                 let clip = [0, 1, 2, 3].map(|k| f32::from(get_i16(s, st::CLIP + 8 * l + 2 * k)));
                 let rot2 = get_i16(s, st::ROT2 + 2 * l);
+                let colour = [0, 1, 2].map(|k| f32::from(s[e + 6 + k]) / 255.0);
+                let effect = get_i16(s, st::EFFECT + 2 * l);
+                let centre = self.assets.tables.images.get(idx).map_or((0.0, 0.0), |im| (im.center_x.trunc(), im.center_y.trunc()));
+                let anchor = (get_f32(s, st::ANCHOR_X + 4 * l), get_f32(s, st::ANCHOR_Y + 4 * l));
                 let motion = get_i16(s, st::MOTION + 12 * l);
                 let blend = s[st::BLEND + l] as i8;
                 Some(LayerSave {
@@ -453,20 +445,25 @@ impl Game {
                     parent: opt(st::PARENT),
                     base: opt(st::BASE),
                     absolute: s[st::FLAGS + l] & 0x40 != 0,
-                    sway,
                     quake,
                     rule: (get_i16(s, st::RULE + 2 * l) >= 0).then(|| i32::from(get_i16(s, st::RULE + 2 * l) & 0xfff) + 1),
+                    rule_flip: (get_i16(s, st::RULE + 2 * l).max(0) >> 12 & 7) as u8,
                     noise: (s[st::NOISE + l] > 0).then(|| i32::from(s[st::NOISE + l])),
                     blend: 0,
                     shade: 0,
-                    fill: (get_i16(s, st::EFFECT + 2 * l) == 1).then(|| [0, 1, 2].map(|k| f32::from(s[e + 6 + k]) / 255.0)),
+                    fill: (effect == 1).then_some(colour),
                     grade: Some(i32::from(get_i16(s, st::EFFECT + 2 * l))).filter(|&m| m >= 2).unwrap_or(0),
                     motion: (motion > 0).then(|| (i32::from(motion), get_i32(s, st::MOTION + 12 * l + 4) as f32 * 1000.0 / 60.0)),
-                    clip: (clip[2] != 0.0 || clip[3] != 0.0).then(|| [clip[0], clip[1], clip[2], clip[3], h(st::CLIP_ROT) / 10.0]),
+                    clip: (clip[2] != 0.0 || clip[3] != 0.0).then(|| [clip[0], clip[1], clip[2], clip[3], h(st::CLIP_INSET)]),
+                    clip_mode: s[st::CLIP_MODE + l] as i8,
                     bright: Some(get_f32(s, st::TONE + 16 * l)),
+                    contrast: Some(get_f32(s, st::TONE + 16 * l + 4)),
                     stbr: (blend >= 0).then_some(i32::from(blend)),
-                    // STRR -99999 is stored as 0x8000 and means no rotation
-                    motion_rot: if rot2 == i16::MIN { 0.0 } else { f32::from(rot2) / 100.0 },
+                    rot2,
+                    pivot: (anchor != centre).then_some([anchor.0, anchor.1]),
+                    // the stage colour is white for a layer that is not a fill unless a motion coloured it
+                    tint: (effect != 1 && colour != [1.0; 3] && colour != [0.0; 3]).then_some(colour),
+                    soxy: (get_i16(s, st::SOXY_X + 2 * l), get_i16(s, st::SOXY_Y + 2 * l)),
                 })
             })
             .collect()

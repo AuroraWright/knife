@@ -71,6 +71,7 @@ impl Ui {
             // sub_4CEA0 mask [11] (Y | B | ZL) closes the system menu; sub_28A90 mask [18] (B | X | ZL) the backlog
             Pad::Y | Pad::ZL if self.screen == Screen::Menu => self.cancel(game, r),
             Pad::X | Pad::ZL if matches!(self.screen, Screen::Backlog { .. }) => self.cancel(game, r),
+            Pad::ZR if matches!(self.screen, Screen::Backlog { .. }) => self.shoulder(game, r, -1),
             // CG viewer (sub_C56C): Minus zooms to fill the screen, R3 back to the fit scale, centred; sound 0
             // the gallery movie player takes B / Plus (mask 0x4008) only
             Pad::Plus if self.screen == Screen::MoviePlay => self.gal_movie_skip(game),
@@ -89,6 +90,10 @@ impl Ui {
 
     /// sub_40ED0 / sub_4E170 with the story on screen.
     fn pad_story(&mut self, game: &mut Game, r: &Renderer, b: Pad, repeat: bool) {
+        // a scene countdown: sub_40ED0 returns before reading the buttons
+        if self.touch.scene_cd.is_some() {
+            return;
+        }
         let panel = self.touch.panel;
         // a story movie (sub_40480) takes only B / Plus, which skip it when it may be skipped
         if game.in_movie() {
@@ -96,6 +101,18 @@ impl Ui {
                 Pad::B | Pad::Plus if !repeat => game.skip_movie(),
                 Pad::A if !repeat => game.advance(),
                 _ => {}
+            }
+            return;
+        }
+        // the staff roll task (off_AE0650 = 1): the system menu, backlog, panel, auto, skip and rewind wait; A
+        // advances (ZR fast-forwards, see touch_update)
+        if game.mode_task() && !game.in_choice() {
+            if b == Pad::A && !repeat {
+                if self.touch.hidden {
+                    self.show_window();
+                } else {
+                    game.advance();
+                }
             }
             return;
         }
@@ -112,11 +129,11 @@ impl Ui {
             return;
         }
         if panel != Panel::Closed {
-            // state 3 of a panel opened with a button: left / right move along the buttons (wrapping only on
-            // a fresh press), A presses one (1 and 3 act while held, see touch_update); any of down, R-stick
-            // down, B or Y closes it (masks [22] | [10], less left / right). A panel opened by touch ignores
-            // the pad, and the story keys wait until it has closed.
-            if panel == Panel::Open && self.touch.panel_pad {
+            // state 3 (however the panel opened, state 1 sets the button request): left / right move along
+            // the buttons (wrapping only on a fresh press), A presses one (1 and 3 act while held, see
+            // touch_update); any of down, R-stick down, B or Y closes it (masks [22] | [10], less left / right).
+            // The story keys wait until it has closed.
+            if panel == Panel::Open {
                 let k = self.touch.panel_key.unwrap_or(self.touch.panel_last);
                 let key = match b {
                     Pad::Right if k < 7 => Some(k + 1),
@@ -151,12 +168,12 @@ impl Ui {
             Pad::A | Pad::Down if self.touch.hidden => self.show_window(),
             Pad::A | Pad::Down => game.advance(),
             // B: stops skip mode first, else hides / shows the window
-            Pad::B if self.touch.skip_mode => self.touch.skip_mode = false,
+            Pad::B if game.skip_mode => game.skip_mode = false,
             Pad::B if self.touch.hidden => self.show_window(),
             Pad::B => self.touch.hidden = true,
             // Y opens the system menu, ending skip mode and showing the window
-            Pad::Y => {
-                self.touch.skip_mode = false;
+            Pad::Y if !game.menu_lock => {
+                game.skip_mode = false;
                 self.show_window();
                 self.cancel(game, r);
             }
@@ -167,11 +184,10 @@ impl Ui {
             }
             Pad::L => self.toggle_auto(game),
             // R toggles skip mode (off_AE0660 bit 1) unless the window is hidden
-            Pad::R if !self.touch.hidden => self.touch.skip_mode = !self.touch.skip_mode,
+            Pad::R if !self.touch.hidden => game.skip_mode = !game.skip_mode,
             // mask [21] opens the mode panel on its last button
             Pad::Up if !self.touch.hidden => {
                 self.touch.panel = Panel::Opening;
-                self.touch.panel_pad = true;
                 self.touch.panel_key = Some(self.touch.panel_last);
             }
             _ => {}
@@ -206,15 +222,40 @@ impl Ui {
     /// - save list (sub_50FC0): past ±12, v² adds up (dword_F1F478, cleared at |v| <= 11) and every 14401 steps
     ///   the cursor a save up / down like the d-pad without wrapping.
     pub(super) fn stick_frame(&mut self, game: &mut Game, r: &Renderer) {
-        let v = self.stick[1];
         if self.busy() || self.popup.is_some() {
+            self.wheel = 0.0;
+            self.wheel_press = 0.0;
+            self.wheel_steps = 0.0;
             return;
+        }
+        // the mouse wheel / trackpad holds the stick tilted (`Ui::wheel`) while a controller or WASD does not
+        let mut v = self.stick[1];
+        if self.wheel != 0.0 {
+            let s = self.wheel.signum();
+            if v == 0 {
+                v = super::WHEEL_TILT * s as i32;
+            }
+            self.wheel -= s * self.wheel.abs().min(1.0);
+            // the flowchart reads the stick per press, repeated every 5 frames: one press per notch's frames
+            if matches!(self.screen, Screen::Backlog { .. }) {
+                self.wheel_press += s;
+            }
+            if matches!(self.screen, Screen::Flowchart { .. }) {
+                self.wheel_press += s;
+                if self.wheel_press.abs() >= super::WHEEL_FRAMES {
+                    self.wheel_press = 0.0;
+                    let d = -((v.abs() - 40) * v.signum()) as f32 * 0.022727 * 504.0;
+                    self.flow_scroll_by_hand(self.flow_ref + d);
+                }
+            }
+        } else {
+            self.wheel_press = 0.0;
         }
         match self.screen {
             // CG viewer (sub_C56C): the left stick moves the picture by (-x, y) / 8 per frame (sub_D270); the
             // right stick past ±40 zooms by y / 4000 per frame about the picture centre
             Screen::CgView { .. } => {
-                let [x, y] = self.stick;
+                let [x, y] = [self.stick[0], v];
                 self.cg_pan[0] -= x as f32 * 0.125;
                 self.cg_pan[1] += y as f32 * 0.125;
                 let ry = self.rstick;
@@ -226,16 +267,28 @@ impl Ui {
                 }
             }
             Screen::Gallery | Screen::Music if !self.gal_side && v.abs() > 40 => {
+                // the list scrolls whenever it has the focus (sub_9CBC / sub_1A7FC run for the list, not for the
+                // music panel); the mouse leaving every row does not take the focus away
                 let cur = self.hover.and_then(|h| self.items(game).get(h).map(|(_, a)| *a));
-                let k = match cur {
-                    Some(super::Action::Cg(_)) => 0.011364 * 486.5,
-                    Some(super::Action::Track(_)) => 0.0087413 * 767.0,
+                let k = match (self.screen, cur) {
+                    (_, Some(super::Action::MusicCtl(_) | super::Action::MusicVol)) => return,
+                    (Screen::Gallery, Some(super::Action::Cg(_)) | None) => 0.011364 * 486.5,
+                    (Screen::Music, Some(super::Action::Track(_)) | None) => 0.0087413 * 767.0,
                     _ => return,
                 };
                 let max = self.gal_scroll_max();
                 let d = -((v.abs() - 40) * v.signum()) as f32 * k;
                 self.gal_scroll.to((self.gal_scroll.pos + d).trunc(), max, true);
-                self.gal_keep_cursor(game);
+                self.gal_track = true;
+            }
+            // the backlog ignores the left stick; the wheel steps pages as the touch scroll does (sub_28A90:
+            // touch + 60 >= 1 older, < 0 newer, without wrapping), one page per notch
+            Screen::Backlog { scroll } if self.wheel_press.abs() >= super::WHEEL_FRAMES => {
+                let up = self.wheel_press > 0.0;
+                self.wheel_press = 0.0;
+                let max = game.backlog_len().saturating_sub(1);
+                let next = if up { (scroll + 1).min(max) } else { scroll.saturating_sub(1) };
+                self.backlog_to(game, next);
             }
             Screen::Config if !self.side && v != 0 => {
                 self.conf_scroll_to(self.conf_target[self.conf_tab] - (v / 3) as f32);
@@ -257,6 +310,13 @@ impl Ui {
                     self.stick_acc = 0;
                     self.nav_repeat = true;
                     self.key_nav(game, r, dy, 0, false);
+                }
+                // the wheel / trackpad scrolls the four frames a row per notch (frame height of travel); the
+                // cursor stays on its save unless that leaves the view
+                while self.wheel_steps.abs() >= 1.0 {
+                    let s = self.wheel_steps.signum();
+                    self.wheel_steps -= s;
+                    self.save_scroll_by(game, -s as i32);
                 }
             }
             _ => {}

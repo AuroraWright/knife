@@ -12,6 +12,16 @@ CARGO_INCREMENTAL=0 cargo build --release -p knife
 `build/Tsukihime.command` starts the copied build with normal saves. `build/Tsukihime (Unlocked).command` starts it
 with everything unlocked (see `tools/unlocked_save.py`). Saves go to `KNIFE_SAVE_DIR` when it is set.
 
+The menus, help lines and music list use the Switch's shared system font, which is not in the game data. Dump
+`nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (title 0100000000000811, the NCA of
+that title under an emulator's `bis/system/Contents/registered/`) into `switch_sysfont/`:
+
+```sh
+hactoolnet -k prod.keys --romfsdir switch_sysfont <FontStandard>.nca
+```
+
+knife reads it from `switch_sysfont/` in the working directory (or `--sysfont PATH`).
+
 Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the Media
 Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, and the GStreamer development
 packages to build). An `ffmpeg` executable on the `PATH` is the fallback; `--features ffmpeg` always uses it.
@@ -28,8 +38,10 @@ and `re/NOTES.md`.
 
 The keyboard stands in for the Switch controller, with the same key for the same button everywhere; each
 button then does what it does in the Switch game on that screen (the game's own map is Config → 操作説明,
-`conf_manual0_ja`). The left mouse button is the touch screen; the mouse wheel / trackpad scrolls lists and
-zooms the CG viewer.
+`conf_manual0_ja`). The left mouse button is the touch screen; the mouse wheel / trackpad tilts the left
+stick (scrolling lists, the flowchart and config, panning the CG viewer) and does nothing else; in the save
+list it scrolls the frames instead, a row per notch or per 1.5 save frame heights of trackpad travel, keeping
+the cursor on its save while that stays in view.
 
 Game controllers work too (gilrs, as in shin; on macOS the GameController framework, which keeps
 working after another app has used the pad): every controller is the same Switch controller, button for
@@ -60,7 +72,7 @@ lists and pans the CG viewer. Held directions repeat like on the Switch (after 1
 | A | advance text; shows a hidden message window |
 | B | stop skip mode, else hide / show the message window |
 | X | backlog |
-| Y | system menu |
+| Y | system menu (not until the first message after a story start or a load) |
 | L | auto mode on / off |
 | R | skip mode on / off (stops at unread text unless the config allows skipping it) |
 | ZL (hold) | rewind, faster the longer it is held |
@@ -84,7 +96,9 @@ Touch (left mouse button):
 | right click | system menu |
 
 The mode panel holds previous scene, rewind (hold), auto, skip (hold), next scene, Q.SAVE, Q.LOAD and voice
-replay.
+replay. Next / previous scene darken the screen for 20 frames before the jump.
+
+During the staff roll only A (advance) and ZR (hold: fast forward at a fixed speed) work, as on the Switch.
 
 ### Menus and gallery
 
@@ -108,8 +122,6 @@ coasts; dragging the scroll bar's slider scrolls the flowchart, CG grid and musi
 `knife --help` lists them. Useful ones: `--load-slot N`, `--scene NAME`, `--shots DIR --shot-every MS
 --exit-after MS` for screenshots, and `--keys MS:KEY,...` for scripted input. `--keys` accepts the buttons up, down, left,
 right, a, b, x, y, l, r, zl, zr, rup, rdown, minus and plus (tapped, or held from `NAME+` to `NAME-`), and
-menu, click, press, release and move/X/Y in canvas pixels. `--skip-movies` lets every story movie be skipped
+menu, click, press, release, move/X/Y in canvas pixels and wheel/N (mouse wheel notches, + up). `--skip-movies` lets every story movie be skipped
 (the Switch plays an unwatched opening, prologue or ending through), `--jump-node N` starts at a flowchart node, `--var F822=0,...` sets script variables after the start (F822 = 0 shows the
 one-message-per-window layout of records made without START_SCRIPT).
-
-Research notes live in `re/NOTES.md`.

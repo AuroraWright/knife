@@ -6,12 +6,22 @@ struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) hx: vec4<f32>,
+    @location(4) hy: vec4<f32>,
+    @location(5) s0: vec4<f32>,
+    @location(6) s1: vec4<f32>,
+    @location(7) s2: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) hx: vec4<f32>,
+    @location(3) hy: vec4<f32>,
+    @location(4) s0: vec4<f32>,
+    @location(5) s1: vec4<f32>,
+    @location(6) s2: vec4<f32>,
 };
 
 @vertex
@@ -20,16 +30,66 @@ fn vs_main(v: VsIn) -> VsOut {
     o.pos = vec4<f32>(v.pos, 0.0, 1.0);
     o.uv = v.uv;
     o.color = v.color;
+    o.hx = v.hx;
+    o.hy = v.hy;
+    o.s0 = v.s0;
+    o.s1 = v.s1;
+    o.s2 = v.s2;
     return o;
+}
+
+// STRA haze (nexl_nxshader_haze): both offsets are waves along the texture's v axis.
+// h = (amplitude in uv, waves per uv.y, phase in cycles, -); zero amplitude is a plain lookup.
+fn haze_uv(i: VsOut) -> vec2<f32> {
+    let tau = 6.2831853;
+    let dx = sin(tau * (fract(i.uv.y * i.hx.y) + fract(i.hx.z))) * i.hx.x;
+    let dy = cos(tau * (fract(i.uv.y * i.hy.y) + fract(i.hy.z))) * i.hy.x;
+    return i.uv + vec2<f32>(dx, dy);
 }
 
 @group(0) @binding(0) var tex0: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
+@group(1) @binding(0) var soft_lut: texture_2d<f32>;
+
+// Clip inset mask (sub_32E30): 1 inside the inner rectangle s0 (relative to the pivot s1.xy, turned by
+// asin(s1.z)), fading over s2.x target pixels past it along an alphagradation texture's radial profile (LUT row
+// s2.y of s2.z + 1 texels, edge first), sampled bilinearly as the scaled 9-slice draws it.
+fn soft_mask(i: VsOut) -> f32 {
+    if (i.s2.x <= 0.0) {
+        return 1.0;
+    }
+    let p = i.pos.xy - i.s1.xy;
+    let q = vec2<f32>(p.x * i.s1.w + p.y * i.s1.z, p.y * i.s1.w - p.x * i.s1.z);
+    let d = max(max(i.s0.xy - q, q - i.s0.zw), vec2<f32>(0.0));
+    if (d.x <= 0.0 && d.y <= 0.0) {
+        return 1.0;
+    }
+    let n = i.s2.z;
+    let t = clamp((1.0 - length(d) / i.s2.x) * n - 0.5, 0.0, n);
+    let row = i32(i.s2.y);
+    let k = i32(floor(t));
+    let a = textureLoad(soft_lut, vec2<i32>(k, row), 0).r;
+    let b = textureLoad(soft_lut, vec2<i32>(min(k + 1, i32(n)), row), 0).r;
+    return mix(a, b, t - f32(k));
+}
+
+// A layer image texel. Haze layers (hx.w = 1) are first drawn into an intermediate with blend state 0 (colour
+// SrcAlpha / OneMinusSrcAlpha, alpha One / One) on transparent black, so the layer's blend then reads
+// (rgb * a, a); other layers go through blend state 4 (a straight copy).
+fn sample_img(i: VsOut) -> vec4<f32> {
+    let t = textureSample(tex0, samp, haze_uv(i));
+    let a = t.a * soft_mask(i);
+    if (i.hx.w > 0.5) {
+        return vec4<f32>(t.rgb * a, a);
+    }
+    return vec4<f32>(t.rgb, a);
+}
+
 // Straight-alpha sprite tinted by vertex color (rgb multiply, a = opacity).
 @fragment
 fn fs_sprite(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = sample_img(i);
     let a = t.a * i.color.a;
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
@@ -38,23 +98,64 @@ fn fs_sprite(i: VsOut) -> @location(0) vec4<f32> {
 // (used for silhouettes / color fills such as STEC mode 1).
 @fragment
 fn fs_fill(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = sample_img(i);
     let a = t.a * i.color.a;
-    return vec4<f32>(i.color.rgb * a, a);
+    // the fill is baked into the texture's rgb, so the haze intermediate premultiplies it too
+    let k = select(1.0, t.a, i.hx.w > 0.5);
+    return vec4<f32>(i.color.rgb * k * a, a);
 }
 
-// Single-channel coverage texture (glyph atlas) tinted by vertex color.
+// Single-channel coverage texture (glyph atlas) tinted by vertex color. The Switch text writer renders its
+// glyphs into an offscreen texture and composites that (sub_C6A58 -> sub_D4A38 / sub_D56F8): the colour keeps
+// the coverage c while the alpha builds up to 1 - (1 - c)^2, so dark text on a light ground comes out heavier
+// and light text on a dark ground stays as is (Switch: flowchart panel / chapter name / music list).
 @fragment
 fn fs_text(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
-    let a = t.r * i.color.a;
-    return vec4<f32>(i.color.rgb * a, a);
+    var c = textureSample(tex0, samp, i.uv).r;
+    // hy.w = 1 (exfont sheet glyphs, scaled): the mean over the pixel's footprint, 4 x 4 taps
+    let dx = dpdx(i.uv);
+    let dy = dpdy(i.uv);
+    if i.hy.w > 0.5 {
+        var sum = 0.0;
+        for (var y = 0; y < 4; y++) {
+            for (var x = 0; x < 4; x++) {
+                let o = (vec2<f32>(f32(x), f32(y)) + 0.5) / 4.0 - 0.5;
+                sum += textureSampleLevel(tex0, samp, i.uv + dx * o.x + dy * o.y, 0.0).r;
+            }
+        }
+        c = sum / 16.0;
+    }
+    return vec4<f32>(i.color.rgb * c * i.color.a, c * (2.0 - c) * i.color.a);
+}
+
+// Glyph coverage inside the uv rect hx (0 outside it, so neighbouring atlas cells never bleed in).
+fn rim_cov(i: VsOut, uv: vec2<f32>) -> f32 {
+    if any(uv < i.hx.xy) || any(uv > i.hx.zw) {
+        return 0.0;
+    }
+    return textureSampleLevel(tex0, samp, uv, 0.0).r;
+}
+
+// White glyph over a black rim of 8 taps (2 px orthogonal, 1.5 px diagonal) at hy.z each, composited per
+// pixel and output once, so the vertex alpha fades rim and fill together (sub_391A0's read fade: a faded line
+// is B + a (full - B)). hy.xy = uv per canvas pixel.
+@fragment
+fn fs_rim_text(i: VsOut) -> @location(0) vec4<f32> {
+    let c = rim_cov(i, i.uv);
+    var keep = 1.0;
+    let taps = array<vec2<f32>, 8>(vec2(-2.0, 0.0), vec2(2.0, 0.0), vec2(0.0, -2.0), vec2(0.0, 2.0),
+        vec2(-1.5, -1.5), vec2(1.5, -1.5), vec2(-1.5, 1.5), vec2(1.5, 1.5));
+    for (var k = 0; k < 8; k++) {
+        keep *= 1.0 - i.hy.z * rim_cov(i, i.uv - taps[k] * i.hy.xy);
+    }
+    let a = c + (1.0 - keep) * (1.0 - c);
+    return vec4<f32>(i.color.rgb * c * i.color.a, a * i.color.a);
 }
 
 // Monochrome (grayscale) sprite.
 @fragment
 fn fs_mono(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = sample_img(i);
     let l = dot(t.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let a = t.a * i.color.a;
     return vec4<f32>(vec3<f32>(l) * i.color.rgb * a, a);
@@ -63,7 +164,7 @@ fn fs_mono(i: VsOut) -> @location(0) vec4<f32> {
 // Negative sprite.
 @fragment
 fn fs_nega(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = sample_img(i);
     let a = t.a * i.color.a;
     return vec4<f32>((vec3<f32>(1.0) - t.rgb) * i.color.rgb * a, a);
 }
@@ -71,9 +172,9 @@ fn fs_nega(i: VsOut) -> @location(0) vec4<f32> {
 // ---- transitions: old frame (tex0) -> new frame (tex1) through a rule image (tex2)
 
 struct TransUniform {
-    // x: progress 0..1, y: vagueness (0..1), z: use rule (0/1), w: invert rule
+    // x: progress 0..1, y: rule flags (`rule_at`), z: use rule (0/1)
     params: vec4<f32>,
-    // backdrop blends: rule progress (< 0: no rule), vagueness
+    // backdrop blends: rule progress (< 0: no rule), rule flags
     params2: vec4<f32>,
 };
 
@@ -81,27 +182,40 @@ struct TransUniform {
 @group(0) @binding(3) var tex2: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> tu: TransUniform;
 
+// The rule value at screen uv: flags bit 0 / 1 mirror it in x / y (STTR's b, c3[0x3c]), bit 2 reads 1 - rule.
+fn rule_at(uv: vec2<f32>, flags: f32) -> f32 {
+    let f = u32(flags + 0.5);
+    var q = uv;
+    if ((f & 1u) != 0u) { q.x = 1.0 - q.x; }
+    if ((f & 2u) != 0u) { q.y = 1.0 - q.y; }
+    let r = textureSample(tex2, samp, q).r;
+    return select(r, 1.0 - r, (f & 4u) != 0u);
+}
+
+// nexl_nxshader_transition (c3[0x30] progress, c3[0x34] = 128 * width / 1920 in 0..255 rule units): the edge
+// sits at (255 + 2v) p - v and fades over v with a smoothstep; visible where the rule is below it.
+fn rule_mask(r: f32, p: f32) -> f32 {
+    let v = 128.0 / 255.0;
+    let t = clamp((r - ((1.0 + 2.0 * v) * p - v) + 0.5 * v) / v, 0.0, 1.0);
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
 @fragment
 fn fs_transition(i: VsOut) -> @location(0) vec4<f32> {
     let a = textureSample(tex0, samp, i.uv);
     let b = textureSample(tex1, samp, i.uv);
     var t = tu.params.x;
     if (tu.params.z > 0.5) {
-        var r = textureSample(tex2, samp, i.uv).r;
-        if (tu.params.w > 0.5) { r = 1.0 - r; }
-        let v = max(tu.params.y, 0.001);
-        t = clamp((tu.params.x * (1.0 + v) - r) / v, 0.0, 1.0);
+        t = rule_mask(rule_at(i.uv, tu.params.y), tu.params.x);
     }
     return vec4<f32>(mix(a.rgb, b.rgb, t), 1.0);
 }
 
-// Sprite masked by a screen-space rule image: params = (progress, vague, target w, target h).
+// Sprite masked by a screen-space rule image: params = (progress, rule flags, target w, target h).
 @fragment
 fn fs_rule(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
-    let r = textureSample(tex2, samp, i.pos.xy / tu.params.zw).r;
-    let v = max(tu.params.y, 0.001);
-    let m = clamp((tu.params.x * (1.0 + v) - r) / v, 0.0, 1.0);
+    let t = sample_img(i);
+    let m = rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params.y), tu.params.x);
     let a = t.a * i.color.a * m;
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
@@ -132,7 +246,7 @@ fn fs_copy(i: VsOut) -> @location(0) vec4<f32> {
 
 // Backdrop-reading layer blends (the exe's nexl_nxshader_ps_* family, blend state 7): tex0 = sprite,
 // tex1 = copy of the target taken before this quad, tex2 = optional rule mask.
-// params = (op, fill, target w, target h), params2 = (rule progress or -1, rule vagueness, -, -).
+// params = (op, fill, target w, target h), params2 = (rule progress or -1, rule flags, -, -).
 // Formulas follow the shader disassembly; s = texture rgb * colour rgb, a = texture alpha * colour alpha.
 fn ps_mix(d: vec3<f32>, r: vec3<f32>, a: f32) -> vec3<f32> {
     return d + a * (r - d);
@@ -140,15 +254,13 @@ fn ps_mix(d: vec3<f32>, r: vec3<f32>, a: f32) -> vec3<f32> {
 
 @fragment
 fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = sample_img(i);
     let d = textureLoad(tex1, vec2<i32>(i.pos.xy), 0).rgb;
     var s = t.rgb * i.color.rgb;
     if (tu.params.y > 0.5) { s = i.color.rgb; }
     var ca = i.color.a;
     if (tu.params2.x >= 0.0) {
-        let r = textureSample(tex2, samp, i.pos.xy / tu.params.zw).r;
-        let v = max(tu.params2.y, 0.001);
-        ca *= clamp((tu.params2.x * (1.0 + v) - r) / v, 0.0, 1.0);
+        ca *= rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params2.y), tu.params2.x);
     }
     let a = t.a * ca;
     let one = vec3<f32>(1.0);

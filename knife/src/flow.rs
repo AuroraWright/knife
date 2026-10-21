@@ -298,7 +298,7 @@ impl Builder<'_> {
     }
 
     /// sub_153B8: draw connector `kind` above a node; `first`: first row of a section.
-    fn line(&mut self, k: usize, j: usize, first: bool, lit: bool, kind: i32, x: f32, y: f32) {
+    fn line(&mut self, k: usize, j: usize, first: bool, lit: bool, kind: i32, [x, y]: [f32; 2]) {
         let base = if lit { 13 } else { 0 };
         let prio = if lit { 440 } else { 450 };
         let kind = if (0..=25).contains(&kind) { kind as usize } else { 12 };
@@ -347,7 +347,7 @@ impl Builder<'_> {
         if kind < 0 {
             return false;
         }
-        self.line(k, j, first, false, kind, x, y);
+        self.line(k, j, first, false, kind, [x, y]);
         true
     }
 
@@ -374,7 +374,7 @@ impl Builder<'_> {
             kind => kind,
         };
         if kind >= 0 {
-            self.line(k, j, first, true, kind, x, y);
+            self.line(k, j, first, true, kind, [x, y]);
         }
         true
     }
@@ -428,7 +428,7 @@ pub fn build(flags: Flags, gallery: bool) -> Chart {
     let (mut limits, mut row_y) = (Vec::new(), Vec::new());
     let (mut y, mut title_y, mut band_top) = (0.0f32, 0.0f32, 0.0f32);
     let (mut phase, mut count, mut last_title) = (0u8, 0, -1);
-    for k in 0..b.rows.len() {
+    for (k, row_nodes) in cell_nodes.iter_mut().enumerate() {
         let first = b.rows[k].phase != phase;
         if first {
             band_top = b.band(band_top, y + 8.0);
@@ -447,7 +447,7 @@ pub fn build(flags: Flags, gallery: bool) -> Chart {
             titles.resize_with(slot + 1, Vec::new);
         }
         let title_at = |y: f32, cell: [f32; 4]| Sprite { tex: "flow_phasetitle", dst: [208.0, y, cell[2], cell[3]], src: cell, prio: 430 };
-        for j in 0..b.rows[k].recs.len() {
+        for (j, cell_node) in row_nodes.iter_mut().enumerate() {
             let f = b.rows[k].recs[j].f;
             let title = f[4];
             if title >= 0 && count <= 2 && title > last_title && fl.edge(f[2]) {
@@ -465,7 +465,7 @@ pub fn build(flags: Flags, gallery: bool) -> Chart {
             }
             let x = j as f32 * 96.0 + 438.0;
             if b.node(k, j, gallery, x, node_y) {
-                cell_nodes[k][j] = Some(nodes.len());
+                *cell_node = Some(nodes.len());
                 nodes.push(Node { node: f[0], pos: [x, node_y], preview: f[6], name: f[7], desc: f[8] });
             }
             if b.grey(k, j, first, x, node_y - 5.0) {
@@ -830,7 +830,7 @@ impl Chart {
                     }
                     k += 1;
                 }
-                3 | 4 | 5 => return self.trace_down(j, k + 1),
+                3..=5 => return self.trace_down(j, k + 1),
                 7 | 8 => j -= 1,
                 _ => return None,
             }

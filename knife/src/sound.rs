@@ -48,11 +48,15 @@ pub struct Bgm {
     base: f32,
 }
 
+/// A finished background BGM decode: (request generation, track, PCM and its BFSAR volume).
+type BgmLoaded = (u64, i32, anyhow::Result<(Pcm, f32)>);
+
 struct PendingBgm {
     id: i32,
     generation: u64,
     volume: f32,
     fade_in: f64,
+    start: usize,
 }
 
 pub struct Sound {
@@ -63,14 +67,16 @@ pub struct Sound {
     /// looping effects by channel (name, volume) so saves can restore them
     loops: HashMap<i32, (String, f32)>,
     voice: Option<Voice>,
+    /// sound player 4: the config's voice test (sub_2B930), apart from the scene voices on players 2 / 3
+    test_voice: Option<Voice>,
     movie: Option<Voice>,
     /// sound players 4..7 for system sounds; sub_ACEF0 and sub_ACFA0 each cycle them with their own counter
     /// (dword_18C04E8 / dword_18C04EC), stopping what the player was playing
     sys: [Option<Voice>; 4],
     sys_next: [usize; 2],
     bgm_cache: HashMap<i32, (Arc<Pcm>, f32)>,
-    tx: mpsc::Sender<(u64, i32, anyhow::Result<(Pcm, f32)>)>,
-    rx: mpsc::Receiver<(u64, i32, anyhow::Result<(Pcm, f32)>)>,
+    tx: mpsc::Sender<BgmLoaded>,
+    rx: mpsc::Receiver<BgmLoaded>,
     pending: Option<PendingBgm>,
     generation: u64,
 }
@@ -85,6 +91,7 @@ impl Sound {
             se: HashMap::new(),
             loops: HashMap::new(),
             voice: None,
+            test_voice: None,
             movie: None,
             sys: Default::default(),
             sys_next: [0; 2],
@@ -102,6 +109,7 @@ impl Sound {
         id: i32,
         volume: f32,
         fade_in: f64,
+        start: usize,
         loader: impl FnOnce() -> anyhow::Result<(Pcm, f32)> + Send + 'static,
     ) {
         if let Some(b) = &self.bgm
@@ -114,7 +122,7 @@ impl Sound {
         self.stop_bgm(0.0);
         self.generation += 1;
         if let Some((pcm, base)) = self.bgm_cache.get(&id).cloned() {
-            self.start_bgm(id, pcm, base, volume, fade_in);
+            self.start_bgm(id, pcm, base, volume, fade_in, start);
             return;
         }
         self.pending = Some(PendingBgm {
@@ -122,6 +130,7 @@ impl Sound {
             generation: self.generation,
             volume,
             fade_in,
+            start,
         });
         let tx = self.tx.clone();
         let generation = self.generation;
@@ -130,8 +139,8 @@ impl Sound {
         });
     }
 
-    fn start_bgm(&mut self, id: i32, pcm: Arc<Pcm>, base: f32, volume: f32, fade_in: f64) {
-        let v = self.audio.play(pcm, volume * base * self.vol.bgm_level() * self.vol.master, fade_in, true);
+    fn start_bgm(&mut self, id: i32, pcm: Arc<Pcm>, base: f32, volume: f32, fade_in: f64, start: usize) {
+        let v = self.audio.play_at(pcm, volume * base * self.vol.bgm_level() * self.vol.master, fade_in, true, start);
         self.bgm = Some(Bgm {
             id,
             voice: Some(v),
@@ -151,7 +160,7 @@ impl Sound {
                     }
                     self.bgm_cache.insert(id, (pcm.clone(), base));
                     if let Some(p) = self.pending.take_if(|p| p.generation == generation) {
-                        self.start_bgm(id, pcm, base, p.volume, p.fade_in);
+                        self.start_bgm(id, pcm, base, p.volume, p.fade_in, p.start);
                     }
                 }
                 Err(e) => {
@@ -175,6 +184,13 @@ impl Sound {
         {
             v.stop(fade);
         }
+    }
+
+    /// sub_9C9B0(rate): the exe fades the BGM out by `rate` volume points (of 100) per 60 Hz frame, so the
+    /// time depends on the volume it plays at (MPLY's fade gives 1666.7 / ms, i.e. ms at full volume).
+    pub fn stop_bgm_rate(&mut self, rate: f32) {
+        let vol = self.bgm.as_ref().map_or(1.0, |b| b.volume);
+        self.stop_bgm(f64::from(vol * 100.0 / (rate * 60.0)));
     }
 
     /// Take the playing BGM out (with `put_bgm`, a stop that leaves it alone).
@@ -236,6 +252,11 @@ impl Sound {
         }
     }
 
+    /// The looping SE on channel `ch` (its name and volume).
+    pub fn looping_on(&self, ch: i32) -> Option<&(String, f32)> {
+        self.loops.get(&ch)
+    }
+
     pub fn looping_effects(&self) -> Vec<(i32, String, f32)> {
         self.loops.iter().map(|(c, (n, v))| (*c, n.clone(), *v)).collect()
     }
@@ -247,9 +268,11 @@ impl Sound {
             .or(self.pending.as_ref().map(|p| (p.id, p.volume)))
     }
 
+    /// sub_5F200 / sub_5EF10: the BGM (sub_9C650: 416.67 points a frame) and every SE channel (sub_9CF90)
+    /// stop at once.
     pub fn stop_all(&mut self) {
-        self.stop_bgm(0.3);
-        self.stop_se(-1, 0.3);
+        self.stop_bgm(0.0);
+        self.stop_se(-1, 0.0);
         self.stop_voice();
         self.stop_movie_audio();
     }
@@ -267,14 +290,6 @@ impl Sound {
                 *vol = volume;
                 v.set_volume(volume * k, secs);
             }
-        }
-    }
-
-    pub fn se_playing(&self, ch: i32) -> bool {
-        if ch < 0 {
-            self.se.values().any(|(v, _)| !v.finished())
-        } else {
-            self.se.get(&ch).is_some_and(|(v, _)| !v.finished())
         }
     }
 
@@ -298,6 +313,31 @@ impl Sound {
     pub fn play_voice_gain(&mut self, pcm: Arc<Pcm>, gain: f32) {
         self.stop_voice();
         self.voice = Some(self.audio.play(pcm, gain * self.vol.voice * self.vol.master, 0.0, false));
+    }
+
+    /// sub_9D240: the playing scene voice changes to `gain` times the voice volume.
+    pub fn set_voice_gain(&mut self, gain: f32) {
+        if let Some(v) = &self.voice {
+            v.set_volume(gain * self.vol.voice * self.vol.master, 0.0);
+        }
+    }
+
+    /// The config voice test on player 4 (sub_9B740(4) stops the last one, sub_EE6B4 plays without a fade).
+    pub fn play_test_voice(&mut self, pcm: Arc<Pcm>, gain: f32) {
+        self.stop_test_voice();
+        self.test_voice = Some(self.audio.play(pcm, gain * self.vol.voice * self.vol.master, 0.0, false));
+    }
+
+    /// sub_9B740(4)
+    pub fn stop_test_voice(&mut self) {
+        if let Some(v) = self.test_voice.take() {
+            v.stop(0.0);
+        }
+    }
+
+    /// sub_9CD30: SE channel `ch` is playing.
+    pub fn se_busy(&self, ch: i32) -> bool {
+        self.se.get(&ch).is_some_and(|(v, _)| !v.finished())
     }
 
     pub fn stop_voice(&mut self) {

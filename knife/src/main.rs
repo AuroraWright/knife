@@ -43,6 +43,10 @@ struct Cli {
     /// Extracted exefs directory (uncompressed_main is read for engine tables)
     #[arg(long, default_value = "switch_exefs")]
     exefs: PathBuf,
+    /// The Switch shared system font (`nintendo_udsg-r_std_003.bfttf` from system title 0100000000000811, or
+    /// a plain TTF): the engine's UI text slots draw in it (nn::pl::GetSharedFont)
+    #[arg(long, default_value = "switch_sysfont/nintendo_udsg-r_std_003.bfttf")]
+    sysfont: PathBuf,
     /// Start in this scene (allscr name or index) instead of START_SCRIPT
     #[arg(long)]
     scene: Option<String>,
@@ -54,6 +58,9 @@ struct Cli {
     shots: Option<PathBuf>,
     #[arg(long, default_value_t = 2000)]
     shot_every: u32,
+    /// Debug: take the first screenshot at this many ms
+    #[arg(long, default_value_t = 0)]
+    shot_from: u32,
     /// Debug: exit after this many ms
     #[arg(long)]
     exit_after: Option<u32>,
@@ -66,6 +73,10 @@ struct Cli {
     /// Debug: save to slot 99 after this many ms
     #[arg(long)]
     save_at: Option<u32>,
+    /// Debug: skip (as --skip) to this command index of the start scene, then save to slot 99 at the first
+    /// message there and exit
+    #[arg(long)]
+    save_pc: Option<usize>,
     /// Debug: load this slot at startup
     #[arg(long)]
     load_slot: Option<usize>,
@@ -102,7 +113,7 @@ struct Cli {
     /// Debug: scripted input, comma-separated MS:KEY: a controller button (up, down, left, right, a, b, x, y, l, r,
     /// zl, zr, minus, plus, r3, lup, ldown, lleft, lright (left stick), rup, rdown (right stick): tapped, or held
     /// from NAME+ to NAME-), menu, click,
-    /// move/X/Y in canvas pixels, press / release of the left button
+    /// move/X/Y in canvas pixels, press / release of the left button, wheel/N notches of the mouse wheel (+ up)
     #[arg(long, value_delimiter = ',')]
     keys: Vec<String>,
 }
@@ -166,16 +177,15 @@ fn work_area(
 impl App {
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let mut attrs = Window::default_attributes()
-            .with_title("Tsukihime (knife)")
+            .with_title("月姫 -A piece of blue glass moon-")
             .with_inner_size(winit::dpi::LogicalSize::new(1920.0, 1080.0));
         #[cfg(windows)]
         let mut centering_area = None;
         if let Some(monitor) = el.primary_monitor().or_else(|| el.available_monitors().next()) {
             #[cfg(windows)]
-            let area = work_area(&monitor);
+            let (area_size, area_position) = work_area(&monitor).unwrap_or_else(|| (monitor.size(), monitor.position()));
             #[cfg(not(windows))]
-            let area = None;
-            let (area_size, area_position) = area.unwrap_or_else(|| (monitor.size(), monitor.position()));
+            let (area_size, area_position) = (monitor.size(), monitor.position());
             let (size, position) = centered_window(area_size, area_position, monitor.scale_factor());
             attrs = attrs.with_inner_size(size).with_position(position);
             #[cfg(windows)]
@@ -203,12 +213,34 @@ impl App {
         window.focus_window();
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
-        let assets = assets::Assets::open(&self.cli.romfs, &self.cli.exefs)?;
+        let mut assets = assets::Assets::open(&self.cli.romfs, &self.cli.exefs)?;
+        assets.sysfont = self.cli.sysfont.clone();
+        match assets.soft_lut_rows() {
+            Ok(rows) => renderer.set_soft_lut(&rows),
+            Err(e) => tracing::warn!("clip inset mask: {e:#}"),
+        }
         let nso = knife_core::exe::Nso::parse(std::fs::read(self.cli.exefs.join("uncompressed_main"))?)?;
         let motions = motion::MotionTable::load(&nso)?;
         let font_data = std::fs::read(self.cli.romfs.join("ja/TT_TsukuMin-D.ttf")).context("reading font")?;
-        let font = text::FontAtlas::new(&renderer, font_data)?;
+        let mut font = text::FontAtlas::new(&renderer, font_data)?;
+        match std::fs::read(self.cli.romfs.join("exfont_nx01.bffnt")) {
+            Ok(d) => font.load_exfont(&renderer, &d).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}")),
+            Err(e) => tracing::warn!("exfont: {e}"),
+        }
         let mut game = game::Game::new(assets, motions, font, &renderer);
+        // the QA bubble text font (Game::msg_font), with the same exfont runs
+        match std::fs::read(self.cli.romfs.join("ja3/FOT-SeuratPro-M.otf")) {
+            Ok(d) => match text::FontAtlas::new(&renderer, d) {
+                Ok(mut f) => {
+                    if let Ok(ex) = std::fs::read(self.cli.romfs.join("exfont_nx01.bffnt")) {
+                        f.load_exfont(&renderer, &ex).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}"));
+                    }
+                    game.set_bubble_font(f);
+                }
+                Err(e) => tracing::warn!("ja3 font: {e:#}"),
+            },
+            Err(e) => tracing::warn!("ja3 font: {e}"),
+        }
         let start = match &self.cli.scene {
             Some(s) => s
                 .parse::<usize>()
@@ -244,8 +276,8 @@ impl App {
         }
         game.auto = self.cli.auto;
         game.skip_movies = self.cli.skip_movies;
-        game.skip = self.cli.skip;
-        game.skip_all = self.cli.skip;
+        game.skip = self.cli.skip || self.cli.save_pc.is_some();
+        game.skip_all = game.skip;
         game.auto_choice = self.cli.auto_choice;
         if let Some(n) = self.cli.jump_node {
             if game.jump_node(n) {
@@ -296,10 +328,27 @@ impl App {
         if self.cli.hold_skip {
             g.set_skip(ui.in_game());
         }
+        // --save-pc keeps skipping past what stops a skip on the way (a TOMP movie)
+        if let Some(pc) = self.cli.save_pc
+            && g.current_pc() < pc
+        {
+            g.skip = true;
+            g.skip_all = true;
+        }
         g.update(r, dt.min(100.0));
         ui.update(g, r, dt);
         g.render(r, &mut |g, r, out| ui.draw(g, r, out));
         self.elapsed += dt;
+        if let Some(pc) = self.cli.save_pc
+            && g.current_pc() >= pc
+        {
+            g.skip = false;
+            g.skip_all = false;
+            if ui.debug_save(g, r, 99) {
+                self.cli.save_pc = None;
+                self.cli.exit_after = Some(0);
+            }
+        }
         if let Some(t) = self.cli.save_at
             && self.elapsed >= t as f32
         {
@@ -364,6 +413,11 @@ impl App {
                 "click" => ui.click(g, r),
                 "press" => ui.mouse_down(g, r),
                 "release" => ui.mouse_up(g, r),
+                _ if k.starts_with("wheel/") => {
+                    if let Ok(n) = k[6..].parse::<f32>() {
+                        ui.wheel(n, n);
+                    }
+                }
                 _ if k.starts_with("move/") => {
                     let v: Vec<f32> = k[5..].split('/').filter_map(|n| n.parse().ok()).collect();
                     if let [x, y] = v[..] {
@@ -457,15 +511,23 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y,
+                // in notches; a trackpad's pixels count 40 to the notch. Save list rows: a notch, or the
+                // trackpad's displacement (momentum included) in `SAVE_WHEEL_ROW`s on screen
+                let (dy, rows) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y, y),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let s = self.window.as_ref().map_or(1.0, |w| {
+                            let s = w.inner_size();
+                            (s.width as f32 / CANVAS_W as f32).min(s.height as f32 / CANVAS_H as f32)
+                        });
+                        (p.y as f32 / 40.0, p.y as f32 / (ui::SAVE_WHEEL_ROW * s))
+                    }
                 };
-                // the wheel / trackpad scrolls a step (no Switch control)
-                if let (Some(g), Some(ui)) = (&mut self.game, &mut self.ui)
+                // the wheel / trackpad tilts the left stick (no Switch control)
+                if let Some(ui) = &mut self.ui
                     && dy != 0.0
                 {
-                    ui.wheel(g, dy > 0.0);
+                    ui.wheel(dy, rows);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -540,6 +602,7 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let shot_from = cli.shot_from as f32;
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     let mut app = App {
@@ -551,7 +614,7 @@ fn main() -> Result<()> {
         last: Instant::now(),
         cursor: (0.0, 0.0),
         elapsed: 0.0,
-        next_shot: 0.0,
+        next_shot: shot_from,
         shot_n: 0,
         gamepads: gamepad::Gamepads::new(),
         wasd: [false; 4],

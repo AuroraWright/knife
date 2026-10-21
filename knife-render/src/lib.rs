@@ -20,6 +20,11 @@ pub struct Vertex {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
+    /// STRA haze (nexl_nxshader_haze): x and y each (amplitude in uv, waves per uv.y, phase, unused)
+    pub haze: [[f32; 4]; 2],
+    /// soft clip mask (see `SoftClip`): inner rect, (pivot, sin, cos), (radius, LUT row, texels, -);
+    /// radius 0 = no mask
+    pub soft: [[f32; 4]; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -85,6 +90,9 @@ pub enum Shade {
     Sprite,
     Fill,
     Text,
+    /// glyph coverage with its black rim composited in one pass (fill over the rim taps), so a faded glyph
+    /// blends once like nn::font's bordered glyph; `Quad::haze` = [uv clamp rect, (u, v per canvas px, rim alpha, -)]
+    RimText,
     Mono,
     Nega,
 }
@@ -101,12 +109,50 @@ enum PipeKey {
     Copy,
 }
 
-/// Screen-space rule mask for a quad: visible where `rule < progress` (with soft edge `vague`).
+/// The clip inset mask (sub_32E30): a rounded rectangle whose edge band of `radius` target pixels fades out
+/// along the radial profile of an alphagradation texture (BORDER_PARTS, LUT `row`, `texels` = its radius).
+/// `inner` (x0, y0, x1, y1) is relative to `pivot` before the rectangle is turned by `rot` (radians).
+#[derive(Clone, Copy, Debug)]
+pub struct SoftClip {
+    pub inner: [f32; 4],
+    pub pivot: [f32; 2],
+    pub rot: f32,
+    pub radius: f32,
+    pub row: u32,
+    pub texels: u32,
+}
+
+impl SoftClip {
+    fn vertex(&self) -> [[f32; 4]; 3] {
+        let (s, c) = self.rot.sin_cos();
+        [self.inner, [self.pivot[0], self.pivot[1], s, c], [self.radius, self.row as f32, self.texels as f32, 0.0]]
+    }
+}
+
+/// Rows of the soft clip LUT: alpha along the middle row of each alphagradation texture, edge first.
+pub const SOFT_LUT_ROWS: u32 = 18;
+pub const SOFT_LUT_W: u32 = 257;
+
+/// Screen-space rule mask for a quad (nexl_nxshader_transition): visible where the rule value is below the
+/// progress, over a smoothstep 128 / 255 wide. `flip` is STTR's b (bit 0 mirrors the rule in x, bit 1 in y);
+/// `invert` reads 1 - rule (the sprite draws of sub_9FE00, whose c3[0x38] is +1).
 #[derive(Clone)]
 pub struct RuleMask {
     pub tex: TexRef,
     pub progress: f32,
-    pub vague: f32,
+    pub flip: u8,
+    pub invert: bool,
+}
+
+impl RuleMask {
+    pub fn new(tex: TexRef, progress: f32) -> Self {
+        Self { tex, progress, flip: 0, invert: false }
+    }
+
+    /// The flag word the shaders read: flip bits, invert at bit 2.
+    fn flags(&self) -> f32 {
+        ((self.flip & 3) as u32 | (self.invert as u32) << 2) as f32
+    }
 }
 
 pub struct GpuTexture {
@@ -146,6 +192,9 @@ pub struct Quad {
     /// Optional convex clip polygon (canvas pixels, any winding).
     pub clip: Option<[[f32; 2]; 4]>,
     pub rule: Option<RuleMask>,
+    /// STRA haze parameters (see `Vertex::haze`); zero amplitude leaves the texture unshifted.
+    pub haze: [[f32; 4]; 2],
+    pub soft: Option<SoftClip>,
 }
 
 /// Clip a convex polygon against a convex clip polygon (Sutherland-Hodgman).
@@ -187,6 +236,21 @@ fn clip_poly(subject: Vec<[f32; 4]>, clip: &[[f32; 2]; 4]) -> Vec<[f32; 4]> {
 }
 
 impl Quad {
+    /// The same quad drawn into a target `s` times the canvas size: positions, clip and soft clip scaled.
+    pub fn scaled(mut self, s: f32) -> Self {
+        let sc = |p: &mut [f32; 2]| *p = [p[0] * s, p[1] * s];
+        self.pos.iter_mut().for_each(sc);
+        if let Some(c) = &mut self.clip {
+            c.iter_mut().for_each(sc);
+        }
+        if let Some(m) = &mut self.soft {
+            m.inner = m.inner.map(|v| v * s);
+            sc(&mut m.pivot);
+            m.radius *= s;
+        }
+        self
+    }
+
     /// Axis-aligned quad covering `rect` (x, y, w, h) in canvas pixels with the whole texture.
     pub fn rect(tex: TexRef, rect: [f32; 4], color: [f32; 4]) -> Self {
         let [x, y, w, h] = rect;
@@ -199,6 +263,8 @@ impl Quad {
             shade: Shade::Sprite,
             clip: None,
             rule: None,
+            haze: [[0.0; 4]; 2],
+            soft: None,
         }
     }
 
@@ -224,6 +290,8 @@ pub struct Renderer {
     /// per target size: the copy of the target that backdrop blends read
     backdrops: HashMap<(u32, u32), RenderTarget>,
     pub white: TexRef,
+    soft_lut: wgpu::Texture,
+    lut_group: wgpu::BindGroup,
 }
 
 pub enum Upload<'a> {
@@ -330,18 +398,47 @@ impl Renderer {
                 },
             ],
         });
+        let lut_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("soft lut"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let soft_lut = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("soft lut"),
+            size: wgpu::Extent3d { width: SOFT_LUT_W, height: SOFT_LUT_ROWS, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let lut_view = soft_lut.create_view(&Default::default());
+        let lut_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("soft lut"),
+            layout: &lut_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&lut_view) }],
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("knife shaders"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
         let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sprite"),
-            bind_group_layouts: &[Some(&sprite_layout)],
+            bind_group_layouts: &[Some(&sprite_layout), Some(&lut_layout)],
             immediate_size: 0,
         });
         let trans_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transition"),
-            bind_group_layouts: &[Some(&trans_layout)],
+            bind_group_layouts: &[Some(&trans_layout), Some(&lut_layout)],
             immediate_size: 0,
         });
 
@@ -361,6 +458,8 @@ impl Renderer {
             pipelines: HashMap::new(),
             backdrops: HashMap::new(),
             white,
+            soft_lut,
+            lut_group,
         })
     }
 
@@ -377,6 +476,27 @@ impl Renderer {
         make_bind_group(&self.device, &self.sprite_layout, &self.sampler, view)
     }
 
+    /// Fill the soft clip LUT: per row, the alpha of an alphagradation texture's middle row from the edge to
+    /// the centre (radius + 1 texels, at most `SOFT_LUT_W`).
+    pub fn set_soft_lut(&self, rows: &[Vec<u8>]) {
+        let mut data = vec![0u8; (SOFT_LUT_W * SOFT_LUT_ROWS) as usize];
+        for (i, row) in rows.iter().take(SOFT_LUT_ROWS as usize).enumerate() {
+            let n = row.len().min(SOFT_LUT_W as usize);
+            data[i * SOFT_LUT_W as usize..][..n].copy_from_slice(&row[..n]);
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.soft_lut,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SOFT_LUT_W), rows_per_image: None },
+            wgpu::Extent3d { width: SOFT_LUT_W, height: SOFT_LUT_ROWS, depth_or_array_layers: 1 },
+        );
+    }
+
     /// Upload a texture. `width`/`height` are the logical size; block data must cover
     /// whole 4x4 blocks.
     pub fn upload(&self, width: u32, height: u32, data: Upload, label: &str) -> TexRef {
@@ -384,7 +504,7 @@ impl Renderer {
     }
 
     /// Update a sub-rectangle of an RGBA8/R8 texture (glyph atlas, movie frames).
-    pub fn write_region(&self, tex: &GpuTexture, x: u32, y: u32, w: u32, h: u32, bpp: u32, data: &[u8]) {
+    pub fn write_region(&self, tex: &GpuTexture, [x, y, w, h]: [u32; 4], bpp: u32, data: &[u8]) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex.texture,
@@ -472,6 +592,7 @@ impl Renderer {
                         Shade::Sprite => "fs_sprite",
                         Shade::Fill => "fs_fill",
                         Shade::Text => "fs_text",
+                        Shade::RimText => "fs_rim_text",
                         Shade::Mono => "fs_mono",
                         Shade::Nega => "fs_nega",
                     },
@@ -494,7 +615,7 @@ impl Renderer {
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4],
                     })],
                 },
                 primitive: wgpu::PrimitiveState::default(),
@@ -531,6 +652,8 @@ impl Renderer {
                 pos: [p[0] / tw * 2.0 - 1.0, 1.0 - p[1] / th * 2.0],
                 uv: [p[2], p[3]],
                 color: q.color,
+                haze: q.haze,
+                soft: q.soft.map_or([[0.0; 4]; 3], |m| m.vertex()),
             };
             let corners: Vec<[f32; 4]> = (0..4).map(|i| [q.pos[i][0], q.pos[i][1], q.uv[i][0], q.uv[i][1]]).collect();
             let poly = match &q.clip {
@@ -561,15 +684,15 @@ impl Renderer {
             .iter()
             .map(|q| match (q.blend, &q.rule) {
                 (Blend::Ps(op), m) => {
-                    let (rule, progress, vague) = match m {
-                        Some(m) => (&m.tex.view, m.progress, m.vague),
+                    let (rule, progress, flags) = match m {
+                        Some(m) => (&m.tex.view, m.progress, m.flags()),
                         None => (&self.white.view, -1.0, 0.0),
                     };
                     let fill = if q.shade == Shade::Fill { 1.0 } else { 0.0 };
                     let bd = backdrop.as_ref().unwrap();
-                    Some(self.effect_bind_group(&q.tex.view, &bd.view, rule, [op as u32 as f32, fill, tw, th, progress, vague, 0.0, 0.0]))
+                    Some(self.effect_bind_group(&q.tex.view, &bd.view, rule, [op as u32 as f32, fill, tw, th, progress, flags, 0.0, 0.0]))
                 }
-                (_, Some(m)) => Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.vague, tw, th])),
+                (_, Some(m)) => Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.flags(), tw, th])),
                 (_, None) => None,
             })
             .collect();
@@ -613,6 +736,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.set_pipeline(&self.pipelines[&(PipeKey::Ps, TARGET_FORMAT)]);
                 pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.lut_group, &[]);
                 pass.draw(a..b, 0..1);
             }
             i = end + 1;
@@ -634,6 +758,7 @@ impl Renderer {
             if let Some(bg) = &groups[i] {
                 pass.set_pipeline(&self.pipelines[&(PipeKey::Rule(q.blend), TARGET_FORMAT)]);
                 pass.set_bind_group(0, bg, &[]);
+                pass.set_bind_group(1, &self.lut_group, &[]);
                 let (a, b) = ranges[i];
                 if b > a {
                     pass.draw(a..b, 0..1);
@@ -653,6 +778,7 @@ impl Renderer {
             let p = &self.pipelines[&(PipeKey::Sprite(q.shade, q.blend), TARGET_FORMAT)];
             pass.set_pipeline(p);
             pass.set_bind_group(0, &q.tex.bind_group, &[]);
+            pass.set_bind_group(1, &self.lut_group, &[]);
             let (a, b) = (ranges[i].0, ranges[j - 1].1);
             if b > a {
                 pass.draw(a..b, 0..1);
@@ -661,8 +787,7 @@ impl Renderer {
         }
     }
 
-    /// Full-target transition from `old` to `new` (optionally through a rule image).
-    #[allow(clippy::too_many_arguments)]
+    /// Full-target transition from `old` to `new`: a crossfade, or through a rule image as `RuleMask` reads it.
     pub fn transition(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -671,11 +796,9 @@ impl Renderer {
         new: &GpuTexture,
         rule: Option<&GpuTexture>,
         progress: f32,
-        vague: f32,
-        invert: bool,
     ) {
         self.pipeline(PipeKey::Transition, TARGET_FORMAT);
-        let params: [f32; 4] = [progress, vague, rule.is_some() as u32 as f32, invert as u32 as f32];
+        let params: [f32; 4] = [progress, 0.0, rule.is_some() as u32 as f32, 0.0];
         let rule_view = rule.map(|r| &r.view).unwrap_or(&self.white.view);
         let bg = self.trans_bind_group(&old.view, &new.view, rule_view, params);
         let verts = fullscreen_verts([1.0; 4]);
@@ -703,6 +826,7 @@ impl Renderer {
         });
         pass.set_pipeline(p);
         pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(1, &self.lut_group, &[]);
         pass.set_vertex_buffer(0, vbuf.slice(..));
         pass.draw(0..6, 0..1);
     }
@@ -788,6 +912,7 @@ impl Renderer {
         });
         pass.set_pipeline(p);
         pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(1, &self.lut_group, &[]);
         pass.set_vertex_buffer(0, vbuf.slice(..));
         pass.draw(0..6, 0..1);
     }
@@ -831,7 +956,7 @@ impl Renderer {
         let (x, y) = ((sw - w) / 2.0, (sh - h) / 2.0);
         let ndc = |px: f32, py: f32| [px / sw * 2.0 - 1.0, 1.0 - py / sh * 2.0];
         let c = [1.0; 4];
-        let v = |p: [f32; 2], uv: [f32; 2]| Vertex { pos: p, uv, color: c };
+        let v = |p: [f32; 2], uv: [f32; 2]| Vertex { pos: p, uv, color: c, haze: [[0.0; 4]; 2], soft: [[0.0; 4]; 3] };
         let verts = [
             v(ndc(x, y), [0.0, 0.0]),
             v(ndc(x + w, y), [1.0, 0.0]),
@@ -865,6 +990,7 @@ impl Renderer {
             });
             pass.set_pipeline(p);
             pass.set_bind_group(0, &canvas.tex.bind_group, &[]);
+            pass.set_bind_group(1, &self.lut_group, &[]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
             pass.draw(0..6, 0..1);
         }
@@ -917,6 +1043,8 @@ fn fullscreen_verts(color: [f32; 4]) -> [Vertex; 6] {
         pos: [x, y],
         uv: [u, w],
         color,
+        haze: [[0.0; 4]; 2],
+        soft: [[0.0; 4]; 3],
     };
     [
         v(-1.0, 1.0, 0.0, 0.0),

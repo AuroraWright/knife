@@ -110,10 +110,16 @@ pub mod st {
     pub const RULE: usize = 2284;
     /// i16 SBAS transform base (-1 none)
     pub const BASE: usize = 2364;
-    /// i16 x 4 clip x, y, w, h (STCH args 12..15) and i16 clip rotation (arg 16)
+    /// i16 SOXY args 3 / 4: draw offset x (1920-wide pixels / 3) and y (x 0.41481)
+    pub const SOXY_X: usize = 2444;
+    pub const SOXY_Y: usize = 2524;
+    /// i16 x 4 clip x, y, w, h (STCH args 12..15)
     pub const CLIP: usize = 2604;
-    pub const CLIP_ROT: usize = 2924;
-    /// i16 STRR / STCH arg 19 rotation (1/100 degree)
+    /// i16 scissor inset (STCH arg 16, motion field 16)
+    pub const CLIP_INSET: usize = 2924;
+    /// i8 inset mode (STCH arg 17, motion field 15)
+    pub const CLIP_MODE: usize = 3004;
+    /// i16 STRR / STCH arg 19 clip rotation (1/100 degree, -32768 = follow the layer rotation)
     pub const ROT2: usize = 3044;
     /// 12 bytes motion state: u16 id, u16, i32 frame, u8 paused
     pub const MOTION: usize = 3124;
@@ -128,12 +134,14 @@ pub mod st {
     pub const NOISE_MODE: usize = 5084;
     /// i16 STEC mode (1 = colour fill)
     pub const EFFECT: usize = 5124;
-    /// f32 x 4: SNX2 brightness (1 + v / 255), 1, 0, 0
+    /// f32 x 4: SNX2 brightness (1 + v / 255), SNX3 contrast (1 + v / 100), 0, 0
     pub const TONE: usize = 5204;
     /// 18 bytes: i16 0, i16 -anchor x, i16 -anchor y, rgb fill (STEC colour, ff = none), rgb, 6 x 0
     pub const EXTRA: usize = 5844;
     /// layer-independent tail (tone table, FCLN, quake): 6564..6584
     pub const GLOBALS: usize = 6564;
+    /// i8 FCLN effect (sub_92120; 0 after FCSP), restarted by the load replay
+    pub const FOCUS: usize = 6569;
 }
 
 /// Default stage block: every layer as STCC leaves it.
@@ -439,6 +447,11 @@ impl SaveFile {
         (n < SLOTS)
             .then(|| &self.buf[Self::rec_range(n)])
             .filter(|r| get_u16(r, 0) != 0 && get_u16(r, 2) != 0)
+    }
+
+    /// sub_4EEB0: the manual records (0..100) whose u16 +2 is set; the title opens on LOAD GAME when any is.
+    pub fn manual_count(&self) -> usize {
+        (0..AUTO_FIRST).filter(|&n| get_u16(&self.buf[Self::rec_range(n)], 2) != 0).count()
     }
 
     pub fn set_record(&mut self, n: usize, rec: &[u8]) {
