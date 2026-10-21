@@ -18,6 +18,7 @@ mod movie;
 mod sound;
 mod stage;
 mod text;
+mod text_stream;
 mod ui;
 mod voice_ids;
 
@@ -35,68 +36,94 @@ use winit::{
     window::{Window, WindowId},
 };
 
+// Options marked "Debug" (and --scene, --label, --auto) exist only with `--features debug`.
 #[derive(Parser, Clone)]
 struct Cli {
-    /// Extracted romfs directory
-    #[arg(long, default_value = "switch_romfs")]
-    romfs: PathBuf,
-    /// Extracted exefs directory (uncompressed_main is read for engine tables)
-    #[arg(long, default_value = "switch_exefs")]
-    exefs: PathBuf,
-    /// The Switch shared system font (`nintendo_udsg-r_std_003.bfttf` from system title 0100000000000811, or
-    /// a plain TTF): the engine's UI text slots draw in it (nn::pl::GetSharedFont)
-    #[arg(long, default_value = "switch_sysfont/nintendo_udsg-r_std_003.bfttf")]
-    sysfont: PathBuf,
+    /// The game data: the extracted romfs directory, with the Switch's shared system font
+    /// (`nintendo_udsg-r_std_003.bfttf`, system title 0100000000000811) added.
+    ///
+    /// Defaults to "assets" next to the executable (inside a macOS app bundle, also
+    /// Contents/Resources/assets).
+    #[arg(short, long)]
+    assets_dir: Option<PathBuf>,
+    /// Read and write saves in this file (the Switch's savedata000 format).
+    ///
+    /// Defaults to "knife/savedata000" in the OS application data directory
+    /// (e.g. ~/Library/Application Support on macOS, %APPDATA% on Windows).
+    #[arg(short, long)]
+    save_file: Option<PathBuf>,
+    /// Serve displayed text over WebSocket at HOST:PORT (e.g. 127.0.0.1:6677)
+    ///
+    /// Every connected client receives each message as plain text, and each choice's options one per line.
+    #[arg(short, long, value_name = "HOST:PORT")]
+    text_websocket: Option<String>,
     /// Start in this scene (allscr name or index) instead of START_SCRIPT
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     scene: Option<String>,
     /// Label to start at within --scene
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     label: Option<String>,
     /// Debug: save a screenshot to this directory every --shot-every ms
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     shots: Option<PathBuf>,
-    #[arg(long, default_value_t = 2000)]
+    #[cfg_attr(feature = "debug", arg(long, default_value_t = 2000))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     shot_every: u32,
     /// Debug: take the first screenshot at this many ms
-    #[arg(long, default_value_t = 0)]
+    #[cfg_attr(feature = "debug", arg(long, default_value_t = 0))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     shot_from: u32,
     /// Debug: exit after this many ms
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     exit_after: Option<u32>,
     /// Start in auto-advance mode
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     auto: bool,
     /// Debug: simulate a held skip key
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     skip: bool,
     /// Debug: save to slot 99 after this many ms
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     save_at: Option<u32>,
     /// Debug: skip (as --skip) to this command index of the start scene, then save to slot 99 at the first
     /// message there and exit
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     save_pc: Option<usize>,
     /// Debug: load this slot at startup
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     load_slot: Option<usize>,
     /// Debug: stay on the title screen even with --shots
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     title: bool,
     /// Debug: automatically pick the first option of every choice
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     auto_choice: bool,
     /// Debug: behave as if the skip key is held (stops at unread text, unlike --skip)
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     hold_skip: bool,
     /// Debug: open a UI screen at startup (menu, config, save, load, backlog, flowchart, extra, gallery, cg:GROUP, music, track:N, movies, movie:N, endings, ending:N)
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     screen: Option<String>,
     /// Debug: open --screen only after this many ms (e.g. to show a backlog after --auto)
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     screen_after: Option<u32>,
     /// Debug: jump to a reached flowchart node at startup
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     jump_node: Option<u16>,
     /// Skip the TYPE-MOON logo movie and the notice shown before the title
     #[arg(long)]
@@ -105,17 +132,59 @@ struct Cli {
     #[arg(long)]
     skip_movies: bool,
     /// Debug: set script variables after the start, comma-separated NAME=VALUE (e.g. F822=0)
-    #[arg(long, value_delimiter = ',')]
+    #[cfg_attr(feature = "debug", arg(long, value_delimiter = ','))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     var: Vec<String>,
     /// Debug: run the launch sequence even with debug options (e.g. --shots)
-    #[arg(long)]
+    #[cfg_attr(feature = "debug", arg(long))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     boot: bool,
     /// Debug: scripted input, comma-separated MS:KEY: a controller button (up, down, left, right, a, b, x, y, l, r,
     /// zl, zr, minus, plus, r3, lup, ldown, lleft, lright (left stick), rup, rdown (right stick): tapped, or held
     /// from NAME+ to NAME-), menu, click,
     /// move/X/Y in canvas pixels, press / release of the left button, wheel/N notches of the mouse wheel (+ up)
-    #[arg(long, value_delimiter = ',')]
+    #[cfg_attr(feature = "debug", arg(long, value_delimiter = ','))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
     keys: Vec<String>,
+}
+
+impl Cli {
+    /// The selected assets directory, or the default next to the executable.
+    fn assets_dir(&self) -> PathBuf {
+        self.assets_dir.clone().unwrap_or_else(default_assets_dir)
+    }
+}
+
+const ASSETS_DIR_NAME: &str = "assets";
+
+/// Folders searched for the default assets directory: the executable's own folder, then, inside a macOS app
+/// bundle (`Name.app/Contents/MacOS/<executable>`), `Contents/Resources`.
+fn executable_dirs(executable: &std::path::Path) -> Vec<PathBuf> {
+    let Some(directory) = executable.parent() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![directory.to_path_buf()];
+    if directory.ends_with("Contents/MacOS")
+        && let Some(contents) = directory.parent()
+        && contents.parent().and_then(std::path::Path::extension).is_some_and(|e| e.eq_ignore_ascii_case("app"))
+    {
+        dirs.push(contents.join("Resources"));
+    }
+    dirs
+}
+
+/// The first existing "assets" folder among [`executable_dirs`], else the one next to the executable.
+fn default_assets_dir() -> PathBuf {
+    let Ok(executable) = std::env::current_exe() else {
+        return PathBuf::from(ASSETS_DIR_NAME);
+    };
+    let candidates: Vec<_> = executable_dirs(&executable).into_iter().map(|dir| dir.join(ASSETS_DIR_NAME)).collect();
+    candidates
+        .iter()
+        .find(|path| path.is_dir())
+        .or(candidates.first())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(ASSETS_DIR_NAME))
 }
 
 struct App {
@@ -213,26 +282,26 @@ impl App {
         window.focus_window();
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
-        let mut assets = assets::Assets::open(&self.cli.romfs, &self.cli.exefs)?;
-        assets.sysfont = self.cli.sysfont.clone();
+        let nso = assets::exe_tables()?;
+        let assets_dir = self.cli.assets_dir();
+        let assets = assets::Assets::open(&assets_dir, &nso)?;
         match assets.soft_lut_rows() {
             Ok(rows) => renderer.set_soft_lut(&rows),
             Err(e) => tracing::warn!("clip inset mask: {e:#}"),
         }
-        let nso = knife_core::exe::Nso::parse(std::fs::read(self.cli.exefs.join("uncompressed_main"))?)?;
         let motions = motion::MotionTable::load(&nso)?;
-        let font_data = std::fs::read(self.cli.romfs.join("ja/TT_TsukuMin-D.ttf")).context("reading font")?;
+        let font_data = std::fs::read(assets_dir.join("ja/TT_TsukuMin-D.ttf")).context("reading font")?;
         let mut font = text::FontAtlas::new(&renderer, font_data)?;
-        match std::fs::read(self.cli.romfs.join("exfont_nx01.bffnt")) {
+        match std::fs::read(assets_dir.join("exfont_nx01.bffnt")) {
             Ok(d) => font.load_exfont(&renderer, &d).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}")),
             Err(e) => tracing::warn!("exfont: {e}"),
         }
         let mut game = game::Game::new(assets, motions, font, &renderer);
         // the QA bubble text font (Game::msg_font), with the same exfont runs
-        match std::fs::read(self.cli.romfs.join("ja3/FOT-SeuratPro-M.otf")) {
+        match std::fs::read(assets_dir.join("ja3/FOT-SeuratPro-M.otf")) {
             Ok(d) => match text::FontAtlas::new(&renderer, d) {
                 Ok(mut f) => {
-                    if let Ok(ex) = std::fs::read(self.cli.romfs.join("exfont_nx01.bffnt")) {
+                    if let Ok(ex) = std::fs::read(assets_dir.join("exfont_nx01.bffnt")) {
                         f.load_exfont(&renderer, &ex).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}"));
                     }
                     game.set_bubble_font(f);
@@ -602,6 +671,15 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if let Some(f) = &cli.save_file {
+        save::set_file(f.clone());
+    }
+    // a busy port must not keep the game from starting
+    if let Some(address) = &cli.text_websocket
+        && let Err(error) = text_stream::start(address)
+    {
+        tracing::error!("Text WebSocket server disabled: {error:#}");
+    }
     let shot_from = cli.shot_from as f32;
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);

@@ -397,7 +397,7 @@ impl SaveFile {
     }
 
     pub fn path() -> PathBuf {
-        crate::save::dir().join("savedata.bin")
+        crate::save::file()
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
@@ -417,7 +417,7 @@ impl SaveFile {
         Ok(f)
     }
 
-    /// The save directory's savedata.bin, or an empty file when there is none (or it is unreadable).
+    /// The save file, or an empty file when there is none (or it is unreadable).
     pub fn load() -> Self {
         let path = Self::path();
         if !path.exists() {
@@ -431,7 +431,9 @@ impl SaveFile {
 
     pub fn store(&self) -> Result<()> {
         let path = Self::path();
-        std::fs::create_dir_all(crate::save::dir())?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &self.buf)?;
         std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))

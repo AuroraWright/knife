@@ -6,25 +6,38 @@ A Rust reimplementation of the Tsukihime -A piece of blue glass moon- Switch eng
 
 ```sh
 CARGO_INCREMENTAL=0 cargo build --release -p knife
-./target/release/knife   # reads switch_romfs/ and switch_exefs/ (see --romfs / --exefs)
+./target/release/knife -a switch_romfs   # the game data (romfs); -a defaults to assets/ next to the executable
 ```
 
+The tables knife needs from the game executable are compiled in (`knife/data/exe_tables.bin`, build
+f4b3318d561e0345). `kdu exe-tables` regenerates them from `switch_exefs/uncompressed_main`.
+
 `build/Tsukihime.command` starts the copied build with normal saves. `build/Tsukihime (Unlocked).command` starts it
-with everything unlocked (see `tools/unlocked_save.py`). Saves go to `KNIFE_SAVE_DIR` when it is set.
+with everything unlocked (see `tools/unlocked_save.py`). `-s` / `--save-file PATH` picks the save file (the Switch's
+`savedata000` format; by default `knife/savedata000` in the OS application data directory), `-a` / `--assets-dir`
+the game data (by default `assets` next to the executable, or `Contents/Resources/assets` inside a macOS app
+bundle).
+
+`-t` / `--text-websocket HOST:PORT` (e.g. `127.0.0.1:6677`) serves the displayed text over WebSocket for text
+hookers: every client receives each message as plain text (ruby readings and markup dropped) and each choice's
+options one per line; a client that connects late first gets the most recent text.
 
 The menus, help lines and music list use the Switch's shared system font, which is not in the game data. Dump
 `nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (title 0100000000000811, the NCA of
-that title under an emulator's `bis/system/Contents/registered/`) into `switch_sysfont/`:
+that title under an emulator's `bis/system/Contents/registered/`) and put it in the assets dir next to the game
+data (here `switch_romfs/`):
 
 ```sh
-hactoolnet -k prod.keys --romfsdir switch_sysfont <FontStandard>.nca
+hactoolnet -k prod.keys --romfsdir fontstandard <FontStandard>.nca
+cp fontstandard/nintendo_udsg-r_std_003.bfttf switch_romfs/
 ```
 
-knife reads it from `switch_sysfont/` in the working directory (or `--sysfont PATH`).
+`--skip-intro` leaves out the TYPE-MOON logo movie and the notice before the title; `--skip-movies` lets every
+story movie be skipped (the Switch plays an unwatched opening, prologue or ending through).
 
 Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the Media
 Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, and the GStreamer development
-packages to build). An `ffmpeg` executable on the `PATH` is the fallback; `--features ffmpeg` always uses it.
+packages to build). An `ffmpeg` executable on the `PATH` is the fallback.
 
 ## Saves
 
@@ -119,40 +132,12 @@ coasts; dragging the scroll bar's slider scrolls the flowchart, CG grid and musi
 
 ## Debug options
 
+They exist only in a build with the `debug` feature (`cargo build --release -p knife --features debug`);
 `knife --help` lists them. Useful ones: `--load-slot N`, `--scene NAME`, `--shots DIR --shot-every MS
 --exit-after MS` for screenshots, and `--keys MS:KEY,...` for scripted input. `--keys` accepts the buttons up, down, left,
 right, a, b, x, y, l, r, zl, zr, rup, rdown, minus and plus (tapped, or held from `NAME+` to `NAME-`), and
-menu, click, press, release, move/X/Y in canvas pixels and wheel/N (mouse wheel notches, + up). `--skip-movies` lets every story movie be skipped
-(the Switch plays an unwatched opening, prologue or ending through), `--jump-node N` starts at a flowchart node, `--var F822=0,...` sets script variables after the start (F822 = 0 shows the
+menu, click, press, release, move/X/Y in canvas pixels and wheel/N (mouse wheel notches, + up). `--jump-node N`
+starts at a flowchart node, `--var F822=0,...` sets script variables after the start (F822 = 0 shows the
 one-message-per-window layout of records made without START_SCRIPT).
-
-## Comparing with the Switch original (Astris)
-
-`tools/emu/` drives the original in the Astris emulator and captures it, for side-by-side checks against
-knife. Setup: start `python3 tools/emu/dsu_server.py` (a DSU / cemuhook controller server on 127.0.0.1:26760,
-control socket 26761), set Astris Input to DSU Controller at 127.0.0.1:26760 and pick slot 0, and run the
-game on the save in `switch_emu_save` (knife only ever uses a copy of it). Astris reads the controller only
-while focused; the commands bring it to the front.
-
-- `tools/emu/emu press a` (also hold / release / stick L X Y / reset): one input to the Switch.
-- `tools/emu/emu shot out.png`: the game area at 1920x1080.
-- `tools/emu/emu tap X Y [MS]` / `drag X0 Y0 X1 Y1 [MS]`: a touch at game coordinates (1920x1080). Astris
-  turns the mouse into the touch screen, but only for events posted at the HID level, and the first touch after
-  it gains focus only switches touch on. Between touches the resting pointer still counts as the Switch's
-  mouse (a pointer left at the top reopens the story's mode panel), so both park it at the picture's centre
-  afterwards. A drag holds still for 100 ms after the press, since Astris registers a touch a few frames late.
-- `tools/emu/emu run NAME "500:down,1000:a"`: the inputs (knife `--keys` syntax) with captures every
-  `--every` ms until `--until` ms into `build/emu/NAME/` (real capture times in `emu_times.txt`).
-- `tools/emu/emu knife NAME "KEYS" --title`: the same keys through knife on a copy of the emulator save;
-  `--title` boots to the title like a normal start, and other trailing arguments (e.g. `--load-slot 7`) pass
-  through to knife. `tools/emu/emu compare NAME` puts both side by side.
-
-Window captures come in the display's colour space (their ICC profile, Display P3 here); `emu.py` converts
-them to sRGB so they compare with knife pixel for pixel. QuickTime recordings of the emulator window are not
-colour-faithful. The emulator's live save is `savedata000` in both
-`~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/bis/user/save/0000000000000004/{0,1}/`
-(`switch_emu_save` is a separate copy). Replace it only while the game is stopped (the running game writes it
-back), then restart: Astris's stop button, then double-click the game in the list. The load list shows the
-registered slots sorted by save date.
 
 Research notes live in `re/NOTES.md`.

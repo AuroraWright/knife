@@ -13,7 +13,7 @@ u16 at +2. System block:
   +5662   CONTINUE record index, +5666 word_F1F43C
 With --patch, an existing savedata.bin keeps its records and settings and only gains the unlock bits.
 
-knife: knife uses the same savedata.bin, in its save directory (KNIFE_SAVE_DIR), patching an existing one. With
+knife: knife uses the same savedata.bin (OUT_DIR/savedata.bin, run with --save-file), patching an existing one. With
 --nodes (`kdu nodes` output: {node: [scene, pc, scene name, offset, next offset]}) record 0, when free, gets a
 save at the start of node 1 whose playthrough has every route node and edge (F201.. / F600.., 8 bits per word,
 both in the record's F subset), so the system menu's flowchart opens fully lit. Flowchart jumps need nothing

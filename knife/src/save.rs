@@ -1,6 +1,6 @@
 //! Save data types: in-memory game snapshots (saves, rewind history) and the save directory.
 //!
-//! Saves and system data live in the Switch format (`savedata.rs`, `savedata.bin` in the save directory), and
+//! Saves and system data live in the Switch format (`savedata.rs`, `savedata.bin`, or the `--save-file`), and
 //! nothing else is kept. Save list previews are rendered from each record's stage block, as on the Switch.
 
 use std::path::PathBuf;
@@ -144,12 +144,19 @@ pub struct Kept {
     pub stcc: bool,
 }
 
-pub fn dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("KNIFE_SAVE_DIR") {
-        return PathBuf::from(d);
-    }
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("knife").join("saves")
+static SAVE_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Use this save file (`--save-file`) instead of the default; call before the first save access.
+pub fn set_file(path: PathBuf) {
+    let _ = SAVE_FILE.set(path);
+}
+
+/// The save file: `--save-file`, else `knife/savedata000` in the OS application data directory (the working
+/// directory when the OS has none), as shin does.
+pub fn file() -> PathBuf {
+    SAVE_FILE
+        .get_or_init(|| dirs::data_dir().unwrap_or_default().join("knife").join("savedata000"))
+        .clone()
 }
 
 /// The local wall-clock time as seconds since 1970-01-01 00:00 of the same clock: save records store the date

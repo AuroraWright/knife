@@ -116,23 +116,12 @@ impl Ui {
             }
             return;
         }
-        if game.in_choice() {
-            match b {
-                Pad::Up => game.choice_move(-1),
-                Pad::Down => game.choice_move(1),
-                Pad::Left => game.choice_side(false),
-                Pad::Right => game.choice_side(true),
-                Pad::A => game.advance(),
-                Pad::Y => self.cancel(game, r),
-                _ => {}
-            }
-            return;
-        }
         if panel != Panel::Closed {
             // state 3 (however the panel opened, state 1 sets the button request): left / right move along
             // the buttons (wrapping only on a fresh press), A presses one (1 and 3 act while held, see
             // touch_update); any of down, R-stick down, B or Y closes it (masks [22] | [10], less left / right).
-            // The story keys wait until it has closed.
+            // The story keys and a choice wait until it has closed (sub_83E50 returns while sub_4E170 reports
+            // the panel busy, AE06C0).
             if panel == Panel::Open {
                 let k = self.touch.panel_key.unwrap_or(self.touch.panel_last);
                 let key = match b {
@@ -151,11 +140,24 @@ impl Ui {
                     _ => None,
                 };
                 if let Some(k) = key {
-                    // sub_4E170: sound 0 as the selection moves
+                    // sub_4E170: sound 0 as the selection moves; the pad takes the focus from the pointer
                     game.play_sys_sound(0);
+                    self.touch.panel_hover = None;
                     self.touch.panel_key = Some(k);
                     self.touch.panel_last = k;
                 }
+            }
+            return;
+        }
+        if game.in_choice() {
+            match b {
+                Pad::Up => game.choice_move(-1),
+                Pad::Down => game.choice_move(1),
+                Pad::Left => game.choice_side(false),
+                Pad::Right => game.choice_side(true),
+                Pad::A => game.advance(),
+                Pad::Y => self.cancel(game, r),
+                _ => {}
             }
             return;
         }

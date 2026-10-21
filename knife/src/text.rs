@@ -462,9 +462,11 @@ pub fn layout(
         // a run crosses n full-width cells
         let adv = if ex.is_some() { lay.size } else { atlas.advance(c, lay.size) };
         let width = n * (adv + lay.spacing) - lay.spacing;
-        // nn::font wraps when the glyph would end past the slot width (464 units): 28 full-width glyphs a line;
+        // nn::font sizes a line in characters (sub_BD7EC): N = floor((W - g / 2) / (g + spacing)) + 1 for the
+        // slot width W and the glyph width g, i.e. a character fits while its cell starts at most W - g / 2
+        // from the left (28 full-width glyphs in the 464-unit message slot, 17 in the save note's 130 units);
         // kinsoku chars never start a line, so they overhang the right edge
-        if *x + width > lay.right && !no_line_start(c) {
+        if *x + (n - 1.0) * (adv + lay.spacing) + lay.size / 2.0 > lay.right && !no_line_start(c) {
             *x = lay.left;
             *baseline += lay.line_height;
         }
@@ -509,7 +511,9 @@ pub fn layout(
             }
             Run::Ruby { base, ruby } => {
                 let bw: f32 = base.chars().map(|c| atlas.advance(c, lay.size) + lay.spacing).sum();
-                if x + bw - lay.spacing > lay.right {
+                // the base's last character must fit (the line size in characters above)
+                let last = base.chars().last().map_or(0.0, |c| atlas.advance(c, lay.size) + lay.spacing);
+                if x + bw - last + lay.size / 2.0 > lay.right {
                     x = lay.left;
                     baseline += lay.line_height;
                 }

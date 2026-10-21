@@ -106,7 +106,17 @@ enum PipeKey {
     Ps,
     Transition,
     Blur,
-    Copy,
+    /// canvas -> window through the Switch's output curve (see `output_level`)
+    Present,
+}
+
+/// The level the Switch displays for a frame level `v`: the final blit (sub_D7BD0) draws the frame target into
+/// the swapchain (sub_D683C: format 2822, R8G8B8A8 sRGB) with shader 1, noalpha_srgb (rgb^2.2), and the sRGB
+/// target encodes the result, so dark levels sink (12 -> 4, 21 -> 13, 63 -> 61) while 90..255 barely move.
+pub fn output_level(v: u8) -> u8 {
+    let l = (f32::from(v) / 255.0).powf(2.2);
+    let e = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+    (e * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// The clip inset mask (sub_32E30): a rounded rectangle whose edge band of `radius` target pixels fades out
@@ -603,7 +613,9 @@ impl Renderer {
                 PipeKey::Ps => ("fs_ps", None, &self.trans_pl),
                 PipeKey::Transition => ("fs_transition", None, &self.trans_pl),
                 PipeKey::Blur => ("fs_blur", None, &self.trans_pl),
-                PipeKey::Copy => ("fs_copy", None, &self.sprite_pl),
+                // an sRGB surface encodes on write itself, like the Switch's swapchain
+                PipeKey::Present if format.is_srgb() => ("fs_present_srgb", None, &self.sprite_pl),
+                PipeKey::Present => ("fs_present", None, &self.sprite_pl),
             };
             let p = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
@@ -933,7 +945,7 @@ impl Renderer {
         self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
     }
 
-    /// Scale `canvas` into the window (letterboxed), then submit and present.
+    /// Scale `canvas` into the window (letterboxed) through the output curve, then submit and present.
     pub fn present(&mut self, mut encoder: wgpu::CommandEncoder, canvas: &RenderTarget) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -949,7 +961,7 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
         let format = self.config.format;
-        self.pipeline(PipeKey::Copy, format);
+        self.pipeline(PipeKey::Present, format);
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
         let scale = (sw / CANVAS_W as f32).min(sh / CANVAS_H as f32);
         let (w, h) = (CANVAS_W as f32 * scale, CANVAS_H as f32 * scale);
@@ -971,7 +983,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
         {
-            let p = &self.pipelines[&(PipeKey::Copy, format)];
+            let p = &self.pipelines[&(PipeKey::Present, format)];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1191,4 +1203,14 @@ fn upload_texture(
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn output_curve_matches_switch_captures() {
+        // train scene 004 levels: knife frame -> Switch screen (Astris, sRGB-converted)
+        let f = super::output_level;
+        assert_eq!((f(0), f(8), f(12), f(21), f(63), f(255)), (0, 2, 4, 13, 61, 255));
+    }
 }

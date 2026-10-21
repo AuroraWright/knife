@@ -3,18 +3,13 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use knife_core::exe::Nso;
+use knife_core::exe::{
+    MOTION_COUNT, MOTION_ENDS as ENDS_VA, MOTION_KEY_COUNT as KEY_COUNT, MOTION_KEYS as KEYS_VA,
+    MOTION_LENS as LENS_VA, MOTION_MASK_COUNT as MASK_COUNT, MOTION_MASKS as MASKS_VA, Nso,
+};
 
 use crate::motion_loops::MOTION_LOOPS;
 
-const KEYS_VA: u64 = 0x65CE18;
-const KEY_COUNT: usize = 0x118E1;
-const ENDS_VA: u64 = 0x3B1940;
-const LENS_VA: u64 = 0x399F40;
-const MOTION_COUNT: usize = 0xBD * 128;
-/// `qword_36AB38[id]` (sub_99960): the fields a motion drives, one or more bits per field (`gate`).
-const MASKS_VA: u64 = 0x36AB38;
-const MASK_COUNT: usize = 0x5E81;
 /// sub_99950: this motion's clock is eased as a whole by its first key's ease, its segments run linear.
 const EASED_WHOLE: i32 = 9999;
 

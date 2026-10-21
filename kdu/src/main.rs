@@ -33,6 +33,13 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Write the executable ranges knife uses (knife_core::exe::BUNDLED) as knife's bundled tables
+    ExeTables {
+        #[arg(long, default_value = "switch_exefs/uncompressed_main")]
+        exe: PathBuf,
+        #[arg(default_value = "knife/data/exe_tables.bin")]
+        out: PathBuf,
+    },
     /// Parse every scene and report command counts
     ParseAll,
     /// Flowchart node starts: JSON {node: [scene, pc, scene name, offset, next offset]} of the first RDST of each
@@ -66,6 +73,13 @@ fn main() -> Result<()> {
                 std::fs::write(out.join(format!("{i:03}_{name}.txt")), s.scene(i).unwrap())?;
             }
             println!("{} scenes, {} names", s.scene_count(), s.names.len());
+        }
+        Cmd::ExeTables { exe, out } => {
+            let nso = knife_core::exe::Nso::parse(std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?)?;
+            knife_core::exe::ExeTables::load(&nso)?;
+            let z = nso.bundle()?;
+            std::fs::write(&out, &z)?;
+            println!("{}: {} bytes", out.display(), z.len());
         }
         Cmd::Tables { exe, all } => {
             let nso = knife_core::exe::Nso::parse(std::fs::read(exe)?)?;

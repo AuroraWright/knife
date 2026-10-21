@@ -151,18 +151,36 @@ impl SoundArchive {
     /// Decode a wave sound by name (e.g. `WSD_moon_se03001`).
     pub fn load_wave_sound(&self, name: &str) -> Result<Pcm> {
         let item = *self.names.get(&name.to_ascii_lowercase()).with_context(|| format!("sound {name} not found"))?;
+        self.load_wave_sound_id(item).with_context(|| format!("sound {name}"))
+    }
+
+    /// Decode a wave sound by item id (`0x01xxxxxx`); some sounds (system sounds 1 and 7) have no name.
+    pub fn load_wave_sound_id(&self, item: u32) -> Result<Pcm> {
         if item >> 24 != 1 {
-            bail!("{name} is not a sound");
+            bail!("item {item:#x} is not a sound");
         }
         let si = self.sounds.get((item & 0xFFFFFF) as usize).copied().flatten().context("bad sound index")?;
         let file_id = u32_(&self.data, si)?;
+        // detail reference (wave sound info, 0x2202) at +12: its first field is the sound's index in the FWSD
+        if u16_(&self.data, si + 12)? != 0x2202 {
+            bail!("item {item:#x} is not a wave sound");
+        }
+        let detail = si + i32_(&self.data, si + 16)? as usize;
+        let index = u32_(&self.data, detail)? as usize;
         let fwsd = self.file(file_id)?;
-        let (warc_item, wave_index) = fwsd_first_wave(fwsd)?;
+        let (warc_item, wave_index) = fwsd_wave(fwsd, index)?;
         let wi = self.warcs.get((warc_item & 0xFFFFFF) as usize).copied().flatten().context("bad warc")?;
         let warc_file = u32_(&self.data, wi)?;
         let fwar = self.file(warc_file)?;
         let fwav = fwar_wave(fwar, wave_index as usize)?;
-        decode_fwav(fwav)
+        let mut pcm = decode_fwav(fwav)?;
+        // the sound's initial volume (0..127, 96 for every sound here), as streams get it in `stream_sound`
+        let volume = u8_(&self.data, si + 8)? as f32 / 127.0;
+        for f in &mut pcm.frames {
+            f[0] *= volume;
+            f[1] *= volume;
+        }
+        Ok(pcm)
     }
 
     #[allow(dead_code)]
@@ -204,17 +222,24 @@ impl SoundArchive {
     }
 }
 
-fn fwsd_first_wave(d: &[u8]) -> Result<(u32, u32)> {
+/// The wave (wave archive item, index in it) of wave sound `index` of an FWSD: its first note's wave id.
+/// An FWSD holds several sounds, so the index from the sound's info picks the right one.
+fn fwsd_wave(d: &[u8], index: usize) -> Result<(u32, u32)> {
     let secs = sections(d, b"FWSD")?;
     let (info, _) = *secs.get(&0x6800).context("FWSD INFO missing")?;
     let body = info + 8;
-    // ref to wave id table (type 0x0100)
-    let tab = body + i32_(d, body + 4)? as usize;
-    let n = u32_(d, tab)?;
-    if n == 0 {
-        bail!("FWSD without waves");
+    // refs: wave id table (0x0100), wave sound data table (0x0101)
+    let ids = body + i32_(d, body + 4)? as usize;
+    let sounds = ref_table(d, body + i32_(d, body + 12)? as usize)?;
+    let wsd = sounds.get(index).copied().flatten().context("FWSD sound index out of range")?;
+    // wave sound data refs: info (+0), track table (+8), note table (+16)
+    let notes = ref_table(d, wsd + i32_(d, wsd + 20)? as usize)?;
+    let note = notes.first().copied().flatten().context("FWSD sound without notes")?;
+    let id = u32_(d, note)? as usize;
+    if id >= u32_(d, ids)? as usize {
+        bail!("FWSD wave id out of range");
     }
-    Ok((u32_(d, tab + 4)?, u32_(d, tab + 8)?))
+    Ok((u32_(d, ids + 4 + id * 8)?, u32_(d, ids + 8 + id * 8)?))
 }
 
 fn fwar_wave(d: &[u8], index: usize) -> Result<&[u8]> {
@@ -283,4 +308,20 @@ pub fn decode_fwav(d: &[u8]) -> Result<Pcm> {
         frames,
         loop_range: looping.then_some((loop_start, samples)),
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    /// Wave sounds that share an FWSD each decode their own wave (system sounds 0x10040d4.. live in one).
+    #[test]
+    fn wave_sounds_sharing_a_file_differ() {
+        let Ok(data) = std::fs::read("../switch_romfs/knife1.bfsar") else { return };
+        let sar = super::SoundArchive::parse(data).unwrap();
+        let lens: Vec<_> = (0x10040d4..=0x10040dc).map(|id| sar.load_wave_sound_id(id).unwrap().frames.len()).collect();
+        let mut distinct = lens.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), lens.len(), "{lens:?}");
+    }
 }

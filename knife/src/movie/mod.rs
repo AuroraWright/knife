@@ -112,11 +112,9 @@ fn spawn_video(
     start: f32,
     fps: f32,
 ) -> Result<(Option<Child>, mpsc::Receiver<Vec<u8>>)> {
-    if !cfg!(feature = "ffmpeg") {
-        match decoder::spawn(path, start, fps) {
-            Ok(rx) => return Ok((None, rx)),
-            Err(e) => tracing::warn!("platform movie decoder unavailable, trying ffmpeg: {e:#}"),
-        }
+    match decoder::spawn(path, start, fps) {
+        Ok(rx) => return Ok((None, rx)),
+        Err(e) => tracing::warn!("platform movie decoder unavailable, trying ffmpeg: {e:#}"),
     }
     let (child, rx) = spawn_ffmpeg(path, start)?;
     Ok((Some(child), rx))

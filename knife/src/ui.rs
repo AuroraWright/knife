@@ -52,6 +52,11 @@ pub enum Confirm {
 }
 
 impl Confirm {
+    /// Panel quick load (sub_4E170 case 6): the dialog shows the quick save's thumbnail (sub_4B4A0(1)).
+    fn thumbnail(self) -> bool {
+        self == Confirm::QuickLoad
+    }
+
     /// SYSMES message (sub_49710 -> table dword_3C9340) and whether the cursor starts on "No"
     /// (sub_4AD40's second argument selects the initial button; 1 = No).
     fn message(self) -> (usize, bool) {
@@ -182,6 +187,17 @@ struct Popup {
     age: f32,
 }
 
+/// A confirm dialog answered (sub_49F00 states 3 / 4): it stays `hold` frames (15 after A, 1 after B), then
+/// dword_B34B54 clears, the caller acts and the dialog fades out over the screen below at 0.07 per frame
+/// (sub_4AE90: shrinking after Yes, cursor 0 in qword_B34B58, growing after No).
+#[derive(Clone, Copy)]
+struct DlgOut {
+    c: Confirm,
+    yes: bool,
+    hold: f32,
+    t: f32,
+}
+
 /// Mode banner (sub_3B430 / sub_3B4B0, popup_ja): 0 Skip, 1 Quick Save, 2 Auto Save, 3 Auto. `t` rises
 /// 0.04 / frame to 3 (the first third pops it in), then falls from 1 to 0 replaying the pop backwards.
 /// The "complete" banner on the title (sub_90440 / sub_91350): state 1 rises in, 2 holds, 3 fades out.
@@ -236,11 +252,15 @@ pub struct Ui {
     /// frames since a successful save write (sub_50FC0 states 8 / 9): sound 1 as the popup closes at 30, the
     /// list is rebuilt 41 frames after that; input waits meanwhile
     save_wait: Option<f32>,
-    /// the slot being saved until the list is rebuilt: sub_50FC0 empties its record first, so it shows as a
-    /// used slot without data (save_scene_plus only; the unknown route info panel when selected)
+    /// the slot being saved until the list is rebuilt (sub_50FC0 state 9): its record already shows the new
+    /// save (state 7 copies it into the list records), its old thumbnail stays until then
     save_pending: Option<usize>,
+    /// the save list's order while a save is pending: sub_50790 only rebuilds it in state 9
+    save_order: Option<Vec<usize>>,
     /// confirm dialog open animation, 0..1
     dlg_t: f32,
+    /// the confirm dialog after A / B (sub_49F00)
+    dlg_out: Option<DlgOut>,
     title_movie: bool,
     /// the title was up last frame: entering it (sub_8D2E0) and leaving it (sub_90180) step the title stage
     on_title: bool,
@@ -817,7 +837,9 @@ impl Ui {
             popup: None,
             save_wait: None,
             save_pending: None,
+            save_order: None,
             dlg_t: 0.0,
+            dlg_out: None,
             title_movie: false,
             on_title: false,
             complete: None,
@@ -971,7 +993,6 @@ impl Ui {
         self.file.update_continue();
         game.store_system(&mut self.file);
         self.file.store()?;
-        game.clear_previews(None);
         Ok(())
     }
 
@@ -1500,6 +1521,12 @@ impl Ui {
     }
 
     fn refresh_slots(&mut self, game: &mut Game) {
+        self.reload_slots(game);
+        game.clear_previews(None);
+    }
+
+    /// The slots' records again, keeping their thumbnails.
+    fn reload_slots(&mut self, game: &mut Game) {
         self.slots = (0..save::SLOTS)
             .map(|n| {
                 let rec = self.file.record(n)?;
@@ -1510,7 +1537,6 @@ impl Ui {
                 d
             })
             .collect();
-        game.clear_previews(None);
     }
 
     /// sub_4ABE0(message, frames): dialog_win with a SYSMES line, without buttons.
@@ -1751,9 +1777,9 @@ impl Ui {
     /// music panel) set +101785, and sub_C406C then draws them with font variant 3 (sub_CBC68: the font set
     /// sub_CAA50 builds from the shared fonts sub_C9F3C fetches). Switch (save list "SCENE プロローグ", flags
     /// 0x183040): the 0x80000 / 0x200000 font index (+55436) does not change it. Falls back to TsukuGo when
-    /// `--sysfont` is missing.
+    /// the assets dir has no `nintendo_udsg-r_std_003.bfttf`.
     fn sys_font(game: &Game, r: &Renderer) -> Option<FontAtlas> {
-        let path = &game.assets.sysfont;
+        let path = &game.assets.romfs.join("nintendo_udsg-r_std_003.bfttf");
         match std::fs::read(path) {
             Ok(data) => {
                 let data = knife_core::format::bfttf::decode(&data).unwrap_or(data);
@@ -2327,7 +2353,11 @@ impl Ui {
                 v
             }
             // sub_4AE90: buttons 0 (Yes) at 330 and 1 (No) at 252, y 249.01 (640x448 units), 216x56
-            Screen::Confirm(_) => vec![([990.0, 600.0, 216.0, 56.0], Action::Yes), ([756.0, 600.0, 216.0, 56.0], Action::No)],
+            Screen::Confirm(c) => {
+                // sub_4AE90: buttons at y 249.01 of 448, 261.46 under a thumbnail
+                let y = if c.thumbnail() { 261.46 * H / 448.0 } else { 600.0 };
+                vec![([990.0, y, 216.0, 56.0], Action::Yes), ([756.0, y, 216.0, 56.0], Action::No)]
+            }
             // sub_28A90: a tap left of x 543 (640x448 units, clear of the scroll bar) asks for the quick jump;
             // the button guide (sub_4A410: x >= 546, y > 393) closes
             Screen::Backlog { .. } => vec![([0.0, 0.0, 543.0 * 3.0, H], Action::BacklogJump), ([546.0 * 3.0, 393.0 * H / 448.0, W - 546.0 * 3.0, H - 393.0 * H / 448.0], Action::Back)],
@@ -3276,7 +3306,7 @@ impl Ui {
             self.touch_move();
         }
         if self.screen == Screen::Game {
-            game.mouse_move(x, y);
+            game.mouse_move(x, y, self.touch.panel == touch::Panel::Closed);
             return;
         }
         // the system menu: the pointer moves the tab cursor like the other menus' (the Switch's tap moves it and
@@ -3430,7 +3460,7 @@ impl Ui {
 
     /// Right click / escape.
     pub fn cancel(&mut self, game: &mut Game, r: &Renderer) {
-        if self.popup_input() {
+        if self.popup_input() || self.dlg_holding() {
             return;
         }
         match self.screen {
@@ -3994,6 +4024,7 @@ impl Ui {
     /// after state 2's fade).
     fn busy(&self) -> bool {
         self.closing
+            || self.dlg_holding()
             || (self.screen == Screen::Title && self.black_speed < 0.0)
             || (self.screen == Screen::Gallery && self.cg_in < CG_FX_SECS)
             || self.cg_fx != CgFx::None
@@ -4007,9 +4038,17 @@ impl Ui {
             || (self.screen == Screen::Config && (self.conf_next.is_some() || self.conf_ca < 1.0))
     }
 
+    /// An answered confirm dialog still up: input waits for dword_B34B54 (sub_496F0).
+    fn dlg_holding(&self) -> bool {
+        self.dlg_out.is_some_and(|o| o.hold > 0.0)
+    }
+
     /// The save list (sub_50790): every used slot, newest first; when saving, the first free slot comes
     /// first as an empty frame (the quick / auto save slot is never offered).
     fn save_list(&self, save: bool) -> Vec<usize> {
+        if let Some(order) = self.save_order.as_ref().filter(|_| save) {
+            return order.clone();
+        }
         let mut used: Vec<(u64, usize)> =
             self.slots.iter().enumerate().take(save::LIST_SLOTS).filter_map(|(i, s)| s.as_ref().map(|s| (s.timestamp, i))).collect();
         used.sort_by(|a, b| b.cmp(a));
@@ -4366,6 +4405,12 @@ impl Ui {
                 }
             }
             Action::Back if matches!(self.screen, Screen::CgView { .. }) => self.cg_close(game),
+            Action::Back if matches!(self.screen, Screen::Confirm(_)) => {
+                let Screen::Confirm(c) = self.screen else { return };
+                // sub_49F00: B plays sound 2 and answers No a frame later
+                self.snd(game, 2);
+                self.dlg_out = Some(DlgOut { c, yes: false, hold: 1.0, t: 1.0 });
+            }
             Action::Back => {
                 // B / the back button: sound 2 (sub_4CEA0, sub_50FC0, sub_2B5C0, sub_49A40, sub_28A90, sub_6E28, ...)
                 if self.screen != Screen::MoviePlay {
@@ -4412,69 +4457,11 @@ impl Ui {
                 self.conf_change(game, i, d);
                 self.store_global(game);
             }
-            Action::Yes => {
+            Action::Yes | Action::No => {
                 let Screen::Confirm(c) = self.screen else { return };
-                // sub_49A40 / sub_49F00: A on either button plays sound 1
+                // sub_49F00: A on either button plays sound 1; the caller acts 15 frames later
                 self.snd(game, 1);
-                self.pop();
-                match c {
-                    Confirm::Movie(i) => self.play_gallery_movie(game, i),
-                    // cGalleryEnding: the "Teach me, Ciel-sensei" scene replays (sub_5040(scene, -1, -1))
-                    Confirm::Ending(i) => self.gal_replay(crate::gallery::ENDINGS[i].1, -1, -1),
-                    Confirm::Title => {
-                        // sub_4CCA0 with byte_B359DC = 0: F024 off, so the story ends to the title; a flowchart
-                        // replay's mode goes back to the one before it (sub_50C8)
-                        game.set_var_pub("F024", 0);
-                        if self.gal_ret[0] == 2 {
-                            self.gal_ret[0] = self.gal_ret[2];
-                            self.gal_ret[2] = -1;
-                        }
-                        self.leave_to_title(game, r);
-                    }
-                    // byte_B359DC = 1: F024 stays, so the story ends back in the gallery
-                    Confirm::EndReplay => self.leave_to_title(game, r),
-                    Confirm::Overwrite(i) => self.save(game, r, i),
-                    // state 18, Yes: popup 184 held open (sub_4ABE0(0xB8) + sub_4ABD0(1)), state 19 loads once it shows
-                    Confirm::Load(i) => {
-                        self.popup(game, 184, f32::INFINITY);
-                        self.load_popup = Some(i);
-                    }
-                    Confirm::BacklogJump => {
-                        // sub_28A90 state 6 -> 7: back in the backlog, which fades out and jumps
-                        self.backlog_jump = true;
-                        self.closing = true;
-                    }
-                    // sub_40ED0 off_AE0680 5 -> 6 / 2 -> 3 (and off_AE06B0 2 -> 3 after an RDAS hit): 20 frames first
-                    // (only when sub_53980(-1) / sub_53980(1) allow it: 0x41308 / 0x41428)
-                    Confirm::PrevScene if game.prev_scene_allowed() => self.start_scene_countdown(false, 20),
-                    Confirm::NextScene if game.next_scene_allowed() => self.start_scene_countdown(true, 20),
-                    Confirm::PrevScene | Confirm::NextScene => {}
-                    Confirm::QuickLoad => self.quick_load(game, r),
-                    Confirm::Defaults => {
-                        self.conf_change(game, Ctl::Default.code(), 0);
-                        self.store_global(game);
-                    }
-                    Confirm::Jump(row, n, scene) => {
-                        self.store_global(game);
-                        if !game.jump_record(row, n, scene) {
-                            // a filler record (scene -1): no scene to start, the chart closes back into the
-                            // system menu (sub_4D8C0 state 16)
-                            if matches!(self.screen, Screen::Flowchart { .. }) {
-                                self.pop();
-                            }
-                        } else {
-                            self.screen = Screen::Game;
-                            self.stack.clear();
-                            self.title_movie = false;
-                            // as after a load: the system menu backdrop does not stay over the new scene
-                            self.menu_bg = MenuBg::new();
-                        }
-                    }
-                }
-            }
-            Action::No => {
-                self.snd(game, 1);
-                self.pop();
+                self.dlg_out = Some(DlgOut { c, yes: a == Action::Yes, hold: 15.0, t: 1.0 });
             }
         }
     }
@@ -4690,17 +4677,83 @@ impl Ui {
         }
     }
 
+    /// A confirm dialog's Yes, once its hold is over (the callers wait for sub_496F0() == 0).
+    fn confirm_yes(&mut self, game: &mut Game, r: &Renderer, c: Confirm) {
+        match c {
+            Confirm::Movie(i) => self.play_gallery_movie(game, i),
+            // cGalleryEnding: the "Teach me, Ciel-sensei" scene replays (sub_5040(scene, -1, -1))
+            Confirm::Ending(i) => self.gal_replay(crate::gallery::ENDINGS[i].1, -1, -1),
+            Confirm::Title => {
+                // sub_4CCA0 with byte_B359DC = 0: F024 off, so the story ends to the title; a flowchart
+                // replay's mode goes back to the one before it (sub_50C8)
+                game.set_var_pub("F024", 0);
+                if self.gal_ret[0] == 2 {
+                    self.gal_ret[0] = self.gal_ret[2];
+                    self.gal_ret[2] = -1;
+                }
+                self.leave_to_title(game, r);
+            }
+            // byte_B359DC = 1: F024 stays, so the story ends back in the gallery
+            Confirm::EndReplay => self.leave_to_title(game, r),
+            Confirm::Overwrite(i) => self.save(game, r, i),
+            // state 18, Yes: popup 184 held open (sub_4ABE0(0xB8) + sub_4ABD0(1)), state 19 loads once it shows
+            Confirm::Load(i) => {
+                self.popup(game, 184, f32::INFINITY);
+                self.load_popup = Some(i);
+            }
+            Confirm::BacklogJump => {
+                // sub_28A90 state 6 -> 7: back in the backlog, which fades out and jumps
+                self.backlog_jump = true;
+                self.closing = true;
+            }
+            // sub_40ED0 off_AE0680 5 -> 6 / 2 -> 3 (and off_AE06B0 2 -> 3 after an RDAS hit): 20 frames first
+            // (only when sub_53980(-1) / sub_53980(1) allow it: 0x41308 / 0x41428)
+            Confirm::PrevScene if game.prev_scene_allowed() => self.start_scene_countdown(false, 20),
+            Confirm::NextScene if game.next_scene_allowed() => self.start_scene_countdown(true, 20),
+            Confirm::PrevScene | Confirm::NextScene => {}
+            Confirm::QuickLoad => {
+                self.quick_load(game, r);
+                self.close_panel_after_quick_load();
+            }
+            Confirm::Defaults => {
+                self.conf_change(game, Ctl::Default.code(), 0);
+                self.store_global(game);
+            }
+            Confirm::Jump(row, n, scene) => {
+                self.store_global(game);
+                if !game.jump_record(row, n, scene) {
+                    // a filler record (scene -1): no scene to start, the chart closes back into the
+                    // system menu (sub_4D8C0 state 16)
+                    if matches!(self.screen, Screen::Flowchart { .. }) {
+                        self.pop();
+                    }
+                } else {
+                    self.screen = Screen::Game;
+                    self.stack.clear();
+                    self.title_movie = false;
+                    // as after a load: the system menu backdrop does not stay over the new scene
+                    self.menu_bg = MenuBg::new();
+                }
+            }
+        }
+    }
+
     fn save(&mut self, game: &mut Game, _r: &Renderer, slot: usize) {
         let Some(data) = game.save_data() else { return };
         // sub_50FC0: "セーブ中です" (183) is shown with a 1200-frame limit but held (sub_4ABD0(1)) and closed
         // (sub_4ACD0) once the write is done and 30 frames have passed since it opened; "セーブに失敗しました"
         // (189) on failure
+        let order = self.save_list(true);
         match self.write_record(game, slot, &data) {
             Ok(()) => {
                 // the write is done at once here, so state 8 closes the popup (with sound 1) at its 30 frames
                 self.popup_held(game, 183, 30.0);
                 self.save_wait = Some(0.0);
                 self.save_pending = Some(slot);
+                // state 7 (LABEL_72) copies the new record into the list records at once: the entry shows its
+                // date and titles in place while the list keeps its order and the old thumbnail
+                self.save_order = Some(order);
+                self.reload_slots(game);
             }
             Err(e) => {
                 tracing::warn!("save to slot {slot}: {e:#}");
@@ -4714,8 +4767,13 @@ impl Ui {
     /// the new save: entry 1 when the list (count, the blank slot included) is 2..4 long, else scroll 1 and
     /// row 0 while a blank slot leads, else entry 0.
     fn save_refresh(&mut self, game: &mut Game) {
-        self.save_pending = None;
-        self.refresh_slots(game);
+        // sub_8C2E0 frees the saved slot's thumbnail (word_F1F438[40] flag cleared): sub_4F240 draws none
+        // there until sub_89AD0 has made it again; the others are kept
+        if let Some(slot) = self.save_pending.take() {
+            game.clear_previews(Some(slot));
+        }
+        self.save_order = None;
+        self.reload_slots(game);
         let Screen::SaveLoad { save, .. } = self.screen else { return };
         let list = self.save_list(save);
         let count = list.len();
@@ -5009,8 +5067,25 @@ impl Ui {
                 p.closing = p.frames < 1.0;
             }
         }
-        // sub_4AE90 opening: +1/10 per frame (60 fps)
-        self.dlg_t = (self.dlg_t + secs * 6.0).min(1.0);
+        // sub_49F00 state 1: +0.07 per frame
+        self.dlg_t = (self.dlg_t + secs * 60.0 * 0.07).min(1.0);
+        if let Some(o) = self.dlg_out {
+            let f = secs * 60.0;
+            if o.hold > 0.0 {
+                let hold = o.hold - f;
+                self.dlg_out = Some(DlgOut { hold: hold.max(0.0), ..o });
+                if hold <= 0.0 {
+                    // dword_B34B54 clears (state 3 -> 4): the screen below takes over and the caller acts
+                    self.pop();
+                    if o.yes {
+                        self.confirm_yes(game, r, o.c);
+                    }
+                }
+            } else {
+                let t = o.t - 0.07 * f;
+                self.dlg_out = (t > 0.0).then_some(DlgOut { t, ..o });
+            }
+        }
         // sub_4CBA0 -> sub_49630(1, ..) -> sub_2E000: the system menu blurs the scene (+1/12 per frame from
         // 0.001) and the message text is hidden; it ends once the backdrop has faded out (sub_2E030(0, 1))
         let f60 = secs * 60.0;
@@ -5624,8 +5699,20 @@ impl Ui {
     }
 
     /// dialog_win (824x416) centred on the screen, scaled by the opening animation.
-    fn draw_dialog_win(&self, out: &mut Vec<Quad>, t: f32) {
-        let k = (1.0 - (1.0 - t) * 0.2).powi(2);
+    /// sub_4AE90's thumbnail (the quick save, record 139, loaded by sub_89590 and made by sub_89AD0): 100 *
+    /// 0.82667 * 0.825 x 53 * 1.0859 * 0.825 units hanging from (320, 202) over a black frame 2 units wider each
+    /// side, once it is made.
+    fn draw_dialog_thumb(&self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
+        let Some(d) = self.slots.get(save::QUICK_SLOT).cloned().flatten() else { return };
+        let Some(t) = game.preview(save::QUICK_SLOT, &d.layers) else { return };
+        let (w, h) = (100.0 * 0.82667 * 0.825, 53.0 * 1.0859 * 0.825);
+        let (ux, uy) = (W / 640.0, H / 448.0);
+        out.push(Quad::rect(r.white.clone(), [(318.0 - w / 2.0) * ux, 200.0 * uy, (w + 4.0) * ux, (h + 4.0) * uy], [0.0, 0.0, 0.0, 1.0]));
+        out.push(Quad::rect(t, [(320.0 - w / 2.0) * ux, 202.0 * uy, w * ux, h * uy], [1.0; 4]));
+    }
+
+    /// dialog_win at alpha `t`, scaled by `k` about the centre.
+    fn draw_dialog_win(&self, out: &mut Vec<Quad>, t: f32, k: f32) {
         let (w, h) = (824.0 * k, 416.0 * k);
         self.sprite_c(out, "dialog_win", [(W - w) / 2.0, (H - h) / 2.0, w, h], None, t, Blend::Alpha);
     }
@@ -5730,26 +5817,20 @@ impl Ui {
                     self.sysmes = game.assets.sysmes();
                 }
                 let mut selected = None;
-                let mut pending_sel = false;
                 for (i, (_, a)) in items.iter().enumerate() {
                     let Action::Slot(slot) = *a else { continue };
                     let [fx, fy] = Self::save_frame(i);
                     let src = if hovered(i) { [31.0, 336.0, 960.0, 272.0] } else { [32.0, 32.0, 960.0, 272.0] };
                     self.sprite(out, "save_win", [fx, fy, 960.0, 272.0], Some(src));
-                    if self.save_pending == Some(slot) {
-                        self.sprite(out, "save_scene_plus", [fx, fy, 960.0, 272.0], Some([32.0, 32.0, 960.0, 272.0]));
-                        pending_sel |= hovered(i);
-                        continue;
-                    }
                     let Some(d) = self.slots.get(slot).cloned().flatten() else { continue };
                     if hovered(i) {
                         selected = Some(d.clone());
                     }
                     // sub_4F240: 100 * 0.827 x 53 * 1.092 units at (151, y + 23.23), quad scale 1.15 about its top left
                     let thumb = [fx + 52.0, fy + 56.0, 300.0 * 0.827 * 1.15, 53.0 * 1.092 * 1.15 * H / 448.0];
-                    match game.preview(slot, &d.layers) {
-                        Some(t) => out.push(Quad::rect(t, thumb, [1.0; 4])),
-                        None => out.push(Quad::rect(white.clone(), thumb, [0.0, 0.0, 0.0, 1.0])),
+                    // drawn only once made (word_F1F438[40]); nothing in its place until then
+                    if let Some(t) = game.preview(slot, &d.layers) {
+                        out.push(Quad::rect(t, thumb, [1.0; 4]));
                     }
                     self.sprite(out, "save_scene_plus", [fx, fy, 960.0, 272.0], Some([32.0, 32.0, 960.0, 272.0]));
                     // "YYYY/MM/DD HH:MM": glyph x from unk_350650 (640 units, relative to the frame)
@@ -5786,9 +5867,6 @@ impl Ui {
                 }
                 // info panel for the selected slot: saveinfobg_{arc,ciel,unknown} by route (phase
                 // 11..36 via dword_3506B0) at 453.33,39.41 and the slot's text at 463.33,259.26
-                if pending_sel {
-                    self.sprite(out, "saveinfobg_unknown", [1360.0, 95.0, 472.0, 712.0], None);
-                }
                 if let Some(d) = selected {
                     let var = |k: &str| d.vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map_or(0, |v| v.1);
                     let bg = match usize::try_from(var("F023") - 11).ok().and_then(|k| INFO_ROUTE.get(k)) {
@@ -6252,15 +6330,19 @@ impl Ui {
                 self.fade_quads(out, n0, self.scr_a);
             }
             Screen::Confirm(c) => {
-                // sub_4AE90: the screen below, dialog_BG at 75% and dialog_win popping in (scale
-                // (1 - (1 - t) * 0.2)^2, alpha t), then the message (y 184 of 448) and the buttons
+                // sub_4AE90: the screen below, dialog_BG at 75% and dialog_win settling in (scale
+                // (1 + (1 - t) * 0.2)^2, alpha t), then the message (y 184 of 448) and the buttons
                 self.draw_under(game, r, out);
                 let t = self.dlg_t;
                 self.sprite_c(out, "dialog_BG", [0.0, 0.0, W, H], None, t * 0.75, Blend::Alpha);
-                self.draw_dialog_win(out, t);
+                self.draw_dialog_win(out, t, (1.0 + (1.0 - t) * 0.2).powi(2));
                 if t >= 1.0 {
                     let msg = self.sysmes.get(c.message().0).cloned().unwrap_or_default();
-                    self.draw_dialog_text(game, r, out, &msg, 443.6, 0.0);
+                    // the thumbnail variant (sub_4B4A0(1), byte_B34AF0 + 192) moves the message up to y 160
+                    self.draw_dialog_text(game, r, out, &msg, if c.thumbnail() { 160.0 * H / 448.0 } else { 443.6 }, 0.0);
+                    if c.thumbnail() {
+                        self.draw_dialog_thumb(game, r, out);
+                    }
                     for (i, (rc, a)) in items.iter().enumerate() {
                         // dialog_btn_ja frames: Yes (224,0) / glow (0,135), No (224,67) / glow (0,202)
                         let y = if *a == Action::Yes { 0.0 } else { 67.0 };
@@ -6307,9 +6389,18 @@ impl Ui {
             self.draw_banner(out);
             self.draw_help(game, r, out);
         }
+        // sub_4AE90: an answered dialog fading out over the screen below (no text below t 1), shrinking after
+        // Yes and growing after No
+        if !self.under
+            && let Some(o) = self.dlg_out.filter(|o| o.hold <= 0.0)
+        {
+            let d = (1.0 - o.t) * 0.2;
+            self.sprite_c(out, "dialog_BG", [0.0, 0.0, W, H], None, o.t * 0.75, Blend::Alpha);
+            self.draw_dialog_win(out, o.t, (if o.yes { 1.0 - d } else { 1.0 + d }).powi(2));
+        }
         // sub_48540: message popup, dialog_win with the text at y 214 of 448
         if let Some(p) = self.popup {
-            self.draw_dialog_win(out, p.a);
+            self.draw_dialog_win(out, p.a, (1.0 - (1.0 - p.a) * 0.2).powi(2));
             // the text appears once the window is fully open
             if p.a >= 1.0 {
                 let msg = self.sysmes.get(p.id).cloned().unwrap_or_default();

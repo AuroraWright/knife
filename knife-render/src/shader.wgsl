@@ -237,11 +237,21 @@ fn fs_blur(i: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(acc / wsum, 1.0);
 }
 
-// Plain copy (canvas -> surface).
+// The final blit (sub_D7BD0): shader noalpha_srgb raises the frame to 2.2 and the sRGB swapchain encodes it.
+fn srgb_encode(l: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, l * 12.92, l <= vec3<f32>(0.0031308));
+}
+
 @fragment
-fn fs_copy(i: VsOut) -> @location(0) vec4<f32> {
+fn fs_present(i: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(tex0, samp, i.uv);
-    return vec4<f32>(t.rgb * i.color.rgb, 1.0);
+    return vec4<f32>(srgb_encode(pow(t.rgb, vec3<f32>(2.2))), 1.0);
+}
+
+@fragment
+fn fs_present_srgb(i: VsOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex0, samp, i.uv);
+    return vec4<f32>(pow(t.rgb, vec3<f32>(2.2)), 1.0);
 }
 
 // Backdrop-reading layer blends (the exe's nexl_nxshader_ps_* family, blend state 7): tex0 = sprite,

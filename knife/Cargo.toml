@@ -23,6 +23,7 @@ parking_lot = "0.12.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 mp4 = "0.14.0"
 symphonia = { version = "0.6.1", features = ["aac"], default-features = false }
+tungstenite = "0.30"
 
 # Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows and GStreamer
 # elsewhere. An ffmpeg executable is the fallback.
@@ -50,5 +51,6 @@ gst-video = { package = "gstreamer-video", version = "0.25.4" }
 gilrs = "0.11.2"
 
 [features]
-# Always decode movies with an ffmpeg executable instead of the platform decoder.
-ffmpeg = []
+# Debug command-line options (screenshots, scripted input, scene / slot / screen at startup); not
+# part of the normal build.
+debug = []

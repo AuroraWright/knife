@@ -105,11 +105,10 @@ pub struct Touch {
     press: Option<[f32; 2]>,
     dragged: bool,
     swallow: bool,
-    /// the touch moved this frame / frames left of touch visibility (off_AE02C8 + 0xC: 256 while a finger
-    /// is down, then counting down), the button / finger is down (+8), and where it last was (units,
-    /// +0x2C / +0x30: it stays there after the release). Only a held button moves the touch: a mouse that
-    /// merely hovers is no finger on the screen.
-    moved: bool,
+    /// frames left of touch visibility (off_AE02C8 + 0xC: 256 while a finger is down, then counting down),
+    /// the button / finger is down (+8), and where it last was (units, +0x2C / +0x30: it stays there after
+    /// the release). Only a held button moves the touch: a mouse that merely hovers is no finger on the
+    /// screen.
     visible: f32,
     pub(super) down: bool,
     at: [f32; 2],
@@ -139,7 +138,10 @@ pub struct Touch {
     /// and how long (dword_AFFCCC), and the per-button press flash (sub_AE040(.., 10))
     pub panel: Panel,
     panel_t: f32,
-    panel_hover: Option<usize>,
+    pub panel_hover: Option<usize>,
+    /// the pointer moved since the last frame, pressed or not (the panel's buttons follow a hovering mouse
+    /// as the other menus' items do)
+    hovered: bool,
     held_frames: f32,
     flash: [f32; 8],
     /// The panel's selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad,
@@ -162,7 +164,6 @@ impl Touch {
             press: None,
             dragged: false,
             swallow: false,
-            moved: false,
             visible: 0.0,
             down: false,
             // sub_AD1F0: the screen centre
@@ -182,6 +183,7 @@ impl Touch {
             panel: Panel::Closed,
             panel_t: 0.0,
             panel_hover: None,
+            hovered: false,
             held_frames: 0.0,
             flash: [0.0; 8],
             panel_key: None,
@@ -245,11 +247,21 @@ impl Ui {
     }
 
     /// Mouse moved (canvas px): a drag moves the touch, a hover does not.
+    /// sub_4E170 case 6, after the quick load (sub_527A0(139)): the mode panel slides shut from where it is
+    /// (state 4) with no button focused (sub_AE0E0(-1)), and sub_AD440(320, 224, 256) puts the last touch back at
+    /// the screen centre, so the tap on Q.LOAD in the top 25 units does not open the panel again.
+    pub(super) fn close_panel_after_quick_load(&mut self) {
+        self.touch.panel = Panel::Closing;
+        self.touch.panel_hover = None;
+        self.touch.panel_key = None;
+        self.touch.at = [320.0, 224.0];
+    }
+
     pub(super) fn touch_move(&mut self) {
+        self.touch.hovered = true;
         if !self.touch.down {
             return;
         }
-        self.touch.moved = true;
         self.touch.visible = 256.0;
         // CG viewer (sub_C56C): a held touch moves the picture twice as far as the finger
         if matches!(self.screen, Screen::CgView { .. }) && !self.busy() {
@@ -276,7 +288,7 @@ impl Ui {
         if !matches!(self.intro, Some(super::Intro::Logo { .. } | super::Intro::Notice { .. })) {
             self.touch.spawn(x, y);
         }
-        self.touch.moved = true;
+        self.touch.hovered = true;
         self.touch.visible = 256.0;
         self.touch.down = true;
         self.touch.at = self.units();
@@ -330,6 +342,12 @@ impl Ui {
         match self.touch.panel {
             // a tap in the bottom 40 units only hides the window (sub_40ED0); a hidden window takes no tap
             Panel::Closed if self.touch.hidden || y > 408.0 => {}
+            // sub_4E170 runs before the story and the choice (sub_83E50) read the tap: one in the top 25 units
+            // opens the panel (state 1) and goes no further
+            Panel::Closed if y < 25.0 && self.panel_allowed(game) => {
+                self.touch.panel = Panel::Opening;
+                self.touch.panel_key = Some(self.touch.panel_last);
+            }
             Panel::Closed => self.click(game, r),
             Panel::Open => {
                 if y <= 43.0 {
@@ -405,7 +423,7 @@ impl Ui {
     /// Help balloon of the focused panel button once the panel is open (state 3 focuses object 207 + button,
     /// sub_AE0E0): object table unk_5918C8, SYSMES 169 171 173 172 170 174 175 176, rect (4, -10) 70x36, flags 0x320.
     pub(super) fn panel_help(&self) -> Option<(usize, [f32; 2], [f32; 4], u32)> {
-        if self.touch.panel != Panel::Open {
+        if self.touch.panel != Panel::Open || matches!(self.screen, Screen::Confirm(_)) || self.dlg_holding() {
             return None;
         }
         let i = self.touch.panel_hover.or(self.touch.panel_key)?;
@@ -413,7 +431,13 @@ impl Ui {
         Some((id, [PANEL_X0 + PANEL_DX * i as f32, self.panel_y() + PANEL_BTN_Y], [4.0, -10.0, 70.0, 36.0], 0x320))
     }
 
-    fn panel_y(&self) -> f32 {
+    /// sub_40ED0 enables the mode panel (sub_4E080(1)) in the story, also over a choice list; only the SELS / SELA
+    /// question dialogs (byte_14715B0 / byte_14715B1), a scene countdown and the engine tasks turn it off.
+    fn panel_allowed(&self, game: &Game) -> bool {
+        self.screen == Screen::Game && !game.choice_question() && self.touch.scene_cd.is_none() && !game.mode_task()
+    }
+
+        fn panel_y(&self) -> f32 {
         // sub_4DE10: quad-out from -43.14 to 0 units over the slide
         let t = self.touch.panel_t;
         -43.14 - 43.14 * t * (t - 2.0)
@@ -484,10 +508,10 @@ impl Ui {
         // no story touches during a scene countdown (sub_40ED0 returns first)
         // nor during the staff roll task (off_AE0650 = 1; only taps and ZR act)
         let in_game = self.screen == Screen::Game && !game.in_choice() && self.touch.scene_cd.is_none() && !game.mode_task();
+        let panel_game = self.panel_allowed(game);
         let held = self.touch.press.is_some();
         let [x, y] = self.touch.at;
-        let pointer_moved = self.touch.moved;
-        self.touch.moved = false;
+        let hovered = std::mem::take(&mut self.touch.hovered);
         // the pointer is sampled once per 60 Hz frame, like the touch panel
         self.touch.trail_t += f;
         if self.touch.trail_t >= 1.0 {
@@ -527,7 +551,7 @@ impl Ui {
 
         // mode panel buttons held: rewind (case 1, speed ramping over 8..107 frames up to 64) and
         // skip (case 3, speed 64)
-        let mut panel_rewind = 0;
+        let mut panel_rewind = None;
         let mut panel_skip = false;
         let held_button = if held && y <= 43.0 {
             self.panel_button()
@@ -540,7 +564,7 @@ impl Ui {
             match held_button {
                 Some(1) => {
                     let t = self.touch.held_frames;
-                    panel_rewind = if t > 107.0 { 64 } else if t >= 8.0 { ((t as i32) * 64 - 512) / 100 } else { 0 };
+                    panel_rewind = Some(if t > 107.0 { 64 } else if t >= 8.0 { ((t as i32) * 64 - 512) / 100 } else { 0 });
                     self.touch.held_frames += f;
                 }
                 Some(3) => panel_skip = true,
@@ -591,21 +615,24 @@ impl Ui {
             game.set_skip(false);
             game.speed = 1;
         }
+        // (the held panel button rewinds from its first frame, at speed 0 for the first 8: sub_814C0 ignores
+        // the speed)
         let back = if let Some(v) = zl {
-            v
-        } else if panel_rewind > 0 {
-            panel_rewind as u32
+            Some(v)
+        } else if let Some(v) = panel_rewind {
+            Some(v as u32)
         } else if speed < 0 && !self.touch.hidden {
-            (-speed) as u32
+            Some((-speed) as u32)
         } else {
-            0
+            None
         };
         // (off_AE05B8 stays set while held, also once the ring has run out)
-        if back > 0 && (game.can_rewind() || game.rewinding) {
-            self.touch.rewind = back;
-            game.speed = back;
+        if let Some(back) = back.filter(|_| game.can_rewind() || game.rewinding) {
+            self.touch.rewind = back.max(1);
+            game.speed = back.max(1);
             // sub_40ED0 runs sub_814C0 instead of the script: no message is shown while rewinding, and each
             // 60 Hz frame restores the stage of the previous ring entry (whatever the display rate)
+            game.rewind_frame();
             game.rewinding = true;
             self.touch.rewind_t = (self.touch.rewind_t + f).min(1.0);
             if self.touch.rewind_t >= 1.0 && game.settled() {
@@ -662,7 +689,7 @@ impl Ui {
             Panel::Closed => {
                 // state 1 sets the button request (HIDWORD(qword_B35A14) = 1) however it opens, so a panel
                 // opened by touch also starts on its last button and takes the pad
-                if in_game && !self.touch.hidden && self.touch.visible > 0.0 && y < 25.0 {
+                if panel_game && !self.touch.hidden && self.touch.visible > 0.0 && y < 25.0 {
                     self.touch.panel = Panel::Opening;
                     self.touch.panel_key = Some(self.touch.panel_last);
                 }
@@ -674,23 +701,28 @@ impl Ui {
                     self.touch.panel = Panel::Open;
                     self.show_window();
                     // state 3 reads the pointed object every frame: a pointer resting on a button takes it
-                    self.touch.moved = true;
+                    if let Some(h) = self.panel_button() {
+                        self.touch.panel_hover = Some(h);
+                        self.touch.panel_last = h;
+                    }
                 }
             }
             Panel::Open => {
-                if pointer_moved {
+                // state 3, as the other menus' cursors: the pointed button takes the focus (sound 0 when it
+                // changes) and is the one the pad goes on from (qword_B35A1C); a pointer moved off the buttons
+                // leaves none lit, the pad's focus (HIDWORD(qword_B35A14)) only stays until the pointer moves
+                if hovered {
                     let before = self.touch.panel_hover.or(self.touch.panel_key);
-                    self.touch.panel_hover = if y <= 43.0 { self.panel_button() } else { None };
+                    self.touch.panel_hover = self.panel_button();
+                    self.touch.panel_key = None;
                     if let Some(h) = self.touch.panel_hover {
-                        // sub_4E170: sound 0 when the touch moves onto another button
                         if before != Some(h) {
                             game.play_sys_sound(0);
                         }
                         self.touch.panel_last = h;
-                        self.touch.panel_key = Some(h);
                     }
                 }
-                if self.screen == Screen::Game && game.in_choice() {
+                if self.screen == Screen::Game && game.choice_question() {
                     self.touch.panel = Panel::Closing;
                 }
             }
@@ -787,7 +819,10 @@ impl Ui {
             let y = self.panel_y();
             self.spr(out, "modepanel_window", 0.0, y * UY, None);
             let top = (y + PANEL_BTN_Y) * UY;
-            let hover = self.touch.panel_hover.or(self.touch.panel_key);
+            // a dialog over the panel (quick load, previous / next scene) takes the object focus (sub_AE0E0), so
+            // no panel button shows as pointed until sub_4E170 is back in state 3
+            let dialog = self.under || self.dlg_holding();
+            let hover = self.touch.panel_hover.or(self.touch.panel_key).filter(|_| !dialog);
             let pressing = (self.touch.press.is_some() && self.touch.panel_hover.is_some()) || (self.enter_held && self.touch.panel_key.is_some());
             for i in 0..8 {
                 // states (sub_ADE80 flag 2): previous scene unavailable -> dark; auto on -> lit

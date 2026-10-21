@@ -60,8 +60,6 @@ impl Decoded {
 
 pub struct Assets {
     pub romfs: PathBuf,
-    /// The shared system font file (`--sysfont`)
-    pub sysfont: PathBuf,
     pub allpac: Arc<Archive>,
     pub allpachd: Option<Arc<Archive>>,
     pub allpaccg: Option<Arc<Archive>>,
@@ -76,15 +74,14 @@ pub struct Assets {
     sounds: HashMap<String, Option<Arc<Pcm>>>,
 }
 
-fn find_main_nso(exefs: &Path) -> Result<Vec<u8>> {
-    let path = exefs.join("uncompressed_main");
-    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+/// The executable's tables, compiled in (`kdu exe-tables` writes them; knife_core::exe).
+pub fn exe_tables() -> Result<Nso> {
+    Nso::from_bundle(include_bytes!("../data/exe_tables.bin"))
 }
 
 impl Assets {
-    pub fn open(romfs: &Path, exefs: &Path) -> Result<Self> {
-        let nso = Nso::parse(find_main_nso(exefs)?)?;
-        let tables = ExeTables::load(&nso)?;
+    pub fn open(romfs: &Path, nso: &Nso) -> Result<Self> {
+        let tables = ExeTables::load(nso)?;
         let image_index = tables
             .images
             .iter()
@@ -96,7 +93,6 @@ impl Assets {
         let sar = SoundArchive::parse(std::fs::read(romfs.join("knife1.bfsar")).context("reading knife1.bfsar")?)?;
         Ok(Self {
             romfs: romfs.to_path_buf(),
-            sysfont: PathBuf::new(),
             allpac: Arc::new(Archive::open(romfs, "allpac")?),
             allpachd: Archive::open(romfs, "allpachd").ok().map(Arc::new),
             allpaccg: Archive::open(romfs, "allpaccg").ok().map(Arc::new),
@@ -389,6 +385,26 @@ impl Assets {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 tracing::warn!("sound {name}: {e:#}");
+                None
+            }
+        };
+        if self.sounds.len() > 256 {
+            self.sounds.clear();
+        }
+        self.sounds.insert(key, pcm.clone());
+        pcm
+    }
+
+    /// A wave sound by BFSAR item id (sub_710's dword_3341A0 ids), cached with the named sounds.
+    pub fn sound_effect_id(&mut self, item: u32) -> Option<Arc<Pcm>> {
+        let key = format!("#{item:x}");
+        if let Some(s) = self.sounds.get(&key) {
+            return s.clone();
+        }
+        let pcm = match self.sar.load_wave_sound_id(item) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                tracing::warn!("sound {item:#x}: {e:#}");
                 None
             }
         };

@@ -127,6 +127,7 @@ impl Game {
         if kind == ChoiceKind::Page {
             // SELD writes every option to the message history as a type 12 entry (the backlog lists them)
             self.page.choice_texts.extend(opts.iter().map(|o| o.text.clone()));
+            crate::text_stream::choices(opts.iter().map(|o| o.text.as_str()));
         } else {
             // sub_83B20: the message text goes (sub_53AB0(1)), F823 = 0, F1103 = 1
             self.page.visible = false;
@@ -174,6 +175,11 @@ impl Game {
 
     pub fn in_choice(&self) -> bool {
         self.choice.is_some()
+    }
+
+    /// A SELS / SELA question dialog is up (sub_85680 / sub_85C10), which turns the mode panel off.
+    pub fn choice_question(&self) -> bool {
+        self.choice.as_ref().is_some_and(|c| c.kind != ChoiceKind::Page)
     }
 
     /// The choice takes input (state 3).

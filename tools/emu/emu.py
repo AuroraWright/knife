@@ -8,11 +8,13 @@ window open. Captures are the game area of the window, scaled to 1920x1080.
     emu.py shot OUT.png
     emu.py run NAME KEYS [--every MS] [--until MS]
         KEYS: comma-separated MS:KEY like knife's --keys (a b x y l r zl zr plus minus up down left right,
-        lup/ldown/lleft/lright = left stick tilt for 100 ms, NAME+ / NAME- hold / release, wait); the Switch
+        lup/ldown/lleft/lright = left stick tilt for 100 ms, NAME+ / NAME- hold / release, tap/X/Y[/MS] a touch
+        at game coordinates, wait); the Switch
         is captured every --every ms (or as fast as a capture allows, 0.25-0.5 s) into build/emu/NAME/emu_NNNN.png,
         with each capture's real time in emu_times.txt
     emu.py knife NAME KEYS [--every MS] [--until MS] [knife args...]
-        the same keys through knife (--keys / --shots) on a copy of switch_emu_save, into knife_NNNN.png;
+        the same keys through knife (--keys / --shots) on a copy of switch_emu_save, into knife_NNNN.png
+        (target/release/knife built with `--features debug`);
         with --title it boots like a normal start (--boot --skip-intro), so the title has its entry state
     emu.py rec NAME KEYS [--fps N] [--until MS]
         the same as run, but records the window (tools/emu/winrec.swift, up to 60 fps, works while covered) and
@@ -242,6 +244,10 @@ def send_key(key):
         ctrl(f"hold {key[:-1]}")
     elif key.endswith("-"):
         ctrl(f"release {key[:-1]}")
+    elif key.startswith("tap/"):
+        # tap/X/Y[/MS]: a touch at game coordinates (see tap)
+        v = [float(n) for n in key[4:].split("/")]
+        touch([(v[0], v[1])], v[2] if len(v) > 2 else 80)
     elif key in STICK:
         s, x, y = STICK[key]
         ctrl(f"stick {s} {x} {y}")
@@ -317,9 +323,9 @@ def knife(name, keys, every, until, extra):
         extra = extra + [x for x in ("--boot", "--skip-intro") if x not in extra]
     kk = ",".join(f"{int(ms)}:{k}" for ms, k in ev if k != "wait")
     cmd = [os.path.join(ROOT, "target", "release", "knife"), "--shots", shots, "--shot-every", str(int(every)),
-           "--exit-after", str(int(until + every))] + (["--keys", kk] if kk else []) + extra
-    env = dict(os.environ, KNIFE_SAVE_DIR=sv)
-    subprocess.run(cmd, cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+           "--exit-after", str(int(until + every)), "--assets-dir", os.path.join(ROOT, "switch_romfs"), "--save-file", os.path.join(sv, "savedata.bin")] \
+        + (["--keys", kk] if kk else []) + extra
+    subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         focus()  # back to Astris for the next emulator command
     except SystemExit:

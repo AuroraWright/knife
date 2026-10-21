@@ -1,7 +1,10 @@
-//! Data tables compiled into the game executable (`exefs/main`).
+//! Data tables compiled into the game executable (`exefs/main`), for build ID `f4b3318d561e0345`.
 //!
-//! These cannot be shipped, so they are read from the user's own copy of the
-//! (uncompressed) NSO at startup. Addresses are for build ID `f4b3318d561e0345`.
+//! knife does not read the executable: `kdu exe-tables` copies the address ranges in `BUNDLED` out of the
+//! uncompressed NSO into a zlib-compressed bundle (`knife/data/exe_tables.bin`) that is compiled into knife, and
+//! `Nso::from_bundle` serves them by virtual address as the NSO would.
+
+use std::io::{Read, Write};
 
 use anyhow::{Context, Result, bail};
 
@@ -16,10 +19,35 @@ const IMAGE_COUNT: usize = 14713;
 const SCENE_IDS: u64 = 0x350D58; // u16
 const SCENE_ID_COUNT: usize = 549;
 
-/// Read-only view of an uncompressed NSO's segments by virtual address.
+/// STMA motion keys (64-byte records), motion key ends and lengths (u32 per motion id) and field masks
+/// (u64 per motion id, `qword_36AB38`, sub_99960).
+pub const MOTION_KEYS: u64 = 0x65CE18;
+pub const MOTION_KEY_COUNT: usize = 0x118E1;
+pub const MOTION_ENDS: u64 = 0x3B1940;
+pub const MOTION_LENS: u64 = 0x399F40;
+pub const MOTION_COUNT: usize = 0xBD * 128;
+pub const MOTION_MASKS: u64 = 0x36AB38;
+pub const MOTION_MASK_COUNT: usize = 0x5E81;
+
+/// Every executable range knife reads: (virtual address, length).
+pub const BUNDLED: &[(u64, usize)] = &[
+    (IMAGE_NAMES, 32 * IMAGE_COUNT),
+    (IMAGE_INFO, 72 * IMAGE_COUNT),
+    (SCENE_IDS, 2 * SCENE_ID_COUNT),
+    (HAZE, 40 * (HAZE_COUNT + 1)),
+    (MOTION_KEYS, 64 * MOTION_KEY_COUNT),
+    (MOTION_ENDS, 4 * MOTION_COUNT),
+    (MOTION_LENS, 4 * MOTION_COUNT),
+    (MOTION_MASKS, 8 * MOTION_MASK_COUNT),
+];
+
+const BUNDLE_MAGIC: &[u8; 4] = b"KXT0";
+
+/// Read-only view of an uncompressed NSO's segments (or of a bundle of its ranges) by virtual address.
 pub struct Nso {
     data: Vec<u8>,
-    segs: [(u64, u64, u64); 3], // (file_off, vaddr, size)
+    segs: Vec<(u64, u64, u64)>, // (data offset, vaddr, size)
+    build_id: [u8; 32],
 }
 
 impl Nso {
@@ -31,17 +59,61 @@ impl Nso {
         if flags & 7 != 0 {
             bail!("NSO is compressed; use the uncompressed main (e.g. from hactool --uncompressed)");
         }
-        let mut segs = [(0, 0, 0); 3];
-        for (i, s) in segs.iter_mut().enumerate() {
-            let o = 0x10 + i * 0x10;
-            let r = |k: usize| u32::from_le_bytes(data[o + k..o + k + 4].try_into().unwrap()) as u64;
-            *s = (r(0), r(4), r(8));
+        let segs = (0..3)
+            .map(|i| {
+                let o = 0x10 + i * 0x10;
+                let r = |k: usize| u32::from_le_bytes(data[o + k..o + k + 4].try_into().unwrap()) as u64;
+                (r(0), r(4), r(8))
+            })
+            .collect();
+        let build_id = data[0x40..0x60].try_into()?;
+        Ok(Self { data, segs, build_id })
+    }
+
+    /// The `BUNDLED` ranges of this executable, zlib-compressed: magic, build ID, range count (u32), then per
+    /// range its address (u64), length (u32) and bytes.
+    pub fn bundle(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(BUNDLE_MAGIC);
+        out.extend_from_slice(&self.build_id);
+        out.extend_from_slice(&(BUNDLED.len() as u32).to_le_bytes());
+        for &(va, len) in BUNDLED {
+            let b = self.bytes(va, len).with_context(|| format!("range {va:#x}+{len:#x} out of the executable"))?;
+            out.extend_from_slice(&va.to_le_bytes());
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+            out.extend_from_slice(b);
         }
-        Ok(Self { data, segs })
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&out)?;
+        Ok(z.finish()?)
+    }
+
+    /// The ranges written by `bundle`.
+    pub fn from_bundle(z: &[u8]) -> Result<Self> {
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(z).read_to_end(&mut raw).context("inflating the executable tables")?;
+        if raw.get(..4) != Some(BUNDLE_MAGIC.as_slice()) || raw.len() < 40 {
+            bail!("not an executable table bundle");
+        }
+        let build_id = raw[4..36].try_into()?;
+        let n = u32::from_le_bytes(raw[36..40].try_into()?) as usize;
+        let mut segs = Vec::with_capacity(n);
+        let mut data = Vec::new();
+        let mut o = 40;
+        for _ in 0..n {
+            let head = raw.get(o..o + 12).context("truncated bundle")?;
+            let va = u64::from_le_bytes(head[..8].try_into()?);
+            let len = u32::from_le_bytes(head[8..].try_into()?) as usize;
+            let body = raw.get(o + 12..o + 12 + len).context("truncated bundle")?;
+            segs.push((data.len() as u64, va, len as u64));
+            data.extend_from_slice(body);
+            o += 12 + len;
+        }
+        Ok(Self { data, segs, build_id })
     }
 
     pub fn build_id(&self) -> &[u8] {
-        &self.data[0x40..0x60]
+        &self.build_id
     }
 
     pub fn bytes(&self, va: u64, len: usize) -> Option<&[u8]> {
@@ -160,5 +232,24 @@ impl ExeTables {
 
     pub fn scene_index(&self, id: u16) -> Option<usize> {
         self.scene_ids.iter().position(|&s| s == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled ranges read back as the executable's own bytes (needs `switch_exefs/uncompressed_main`).
+    #[test]
+    fn bundle_matches_executable() {
+        let Ok(data) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../switch_exefs/uncompressed_main")) else {
+            return;
+        };
+        let nso = Nso::parse(data).unwrap();
+        let bundled = Nso::from_bundle(include_bytes!("../../knife/data/exe_tables.bin")).unwrap();
+        assert_eq!(bundled.build_id(), nso.build_id());
+        for &(va, len) in BUNDLED {
+            assert_eq!(bundled.bytes(va, len), nso.bytes(va, len), "{va:#x}");
+        }
     }
 }

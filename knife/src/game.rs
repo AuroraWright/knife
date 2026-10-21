@@ -70,8 +70,9 @@ pub struct Page {
     dim_vel: f32,
     /// the page waits for a click before more text (shown as an icon)
     waiting: bool,
-    /// per message: first index into `chars`, whether its text ends in @k, frames since it was superseded
-    msgs: Vec<(usize, bool, f32)>,
+    /// per message: first index into `chars`, whether its text ends in @k, how far its read fade has gone
+    /// (0..1) and that fade's length in frames (stage word 870 + i: the text speed * 1.2 while it was current)
+    msgs: Vec<(usize, bool, f32, f32)>,
     /// SELD options listed after the page's messages (history entries of type 12, shown in the backlog)
     choice_texts: Vec<String>,
 }
@@ -160,17 +161,9 @@ const TEST_SES: [&str; 14] = [
     "moon_se09005",
 ];
 
-const SYS_SOUNDS: [&str; 9] = [
-    "WSD_MOON_SE00001",
-    "WSD_MOON_SE00002",
-    "WSD_MOON_SE00003",
-    "WSD_MOON_SE00004",
-    "WSD_MOON_SE00007",
-    "WSD_MOON_SE00010",
-    "WSD_MOON_SE00011",
-    "WSD_MOON_SE00013",
-    "WSD_MOON_SE00014",
-];
+/// sub_710's sound ids (dword_3341A0): BFSAR items 0x10040d4.. in order. 0x10040d5 (1) and 0x10040db (7) have no
+/// name; the others are WSD_MOON_SE00001, 03, 04, 07, 10, 11 and 14.
+const SYS_SOUNDS: [u32; 9] = [0x10040d4, 0x10040d5, 0x10040d6, 0x10040d7, 0x10040d8, 0x10040d9, 0x10040da, 0x10040db, 0x10040dc];
 /// sub_CA0's volume curve (flt_3355F0, 100 points over 0..1, linear in between; 1.0 from 0.99).
 const VOLUME_CURVE: [f32; 100] = [
     0.0, 0.001442, 0.002885, 0.004327, 0.005769, 0.007212, 0.008654, 0.010096, 0.011538, 0.016667, 0.021795,
@@ -227,8 +220,9 @@ fn voice_row(name: &str) -> usize {
 pub const VOICE_ROW_WORDS: [usize; 19] = [11, 12, 13, 14, 15, 16, 27, 17, 29, 18, 23, 26, 19, 24, 25, 20, 21, 22, 30];
 const BOTTOM_LIMIT: f32 = 1000.0;
 const PARAGRAPH_GAP: f32 = 0.0;
-/// sub_391A0: earlier messages on the page fade to 100/255 over (config word 7) * 1.2 = 42 frames; a run of
-/// messages ending in @k shares the fade of the message that ends it.
+/// sub_391A0: earlier messages on the page fade to 100/255 over (config word 7 / 8, the unread / read text
+/// speed the message had while current) * 1.2 frames; a run of messages ending in @k shares the fade of the
+/// message that ends it.
 const READ_ALPHA: f32 = 100.0 / 255.0;
 /// A rewind-ring entry: the snapshot, the RDST count it belongs to (for the mode panel's previous scene), its
 /// (scene, message pc, page line) key and a serial the backlog pages refer to.
@@ -288,7 +282,6 @@ struct BacklogPage {
 const HISTORY: usize = 800;
 /// frames a message stays up under a skip (measured on the Switch: about 20 messages a second within a page)
 const SKIP_FRAMES: f32 = 3.0;
-const READ_FADE_FRAMES: f32 = 42.0;
 /// ms per 60 fps frame
 const FRAME_MS: f32 = 1000.0 / 60.0;
 
@@ -894,9 +887,13 @@ impl Game {
         }
     }
 
-    pub fn mouse_move(&mut self, x: f32, y: f32) {
+    /// `choice`: the choice reads the pointer (not while the mode panel is up: sub_83E50 returns while
+    /// sub_4E170 reports it busy, AE06C0).
+    pub fn mouse_move(&mut self, x: f32, y: f32, choice: bool) {
         self.mouse = (x, y);
-        self.choice_hover_at(x, y);
+        if choice {
+            self.choice_hover_at(x, y);
+        }
     }
 
     // ---- per-frame update ---------------------------------------------------------
@@ -964,8 +961,15 @@ impl Game {
         if self.var("F1103") != 0 || self.page.dim != 0.0 {
             i = 0;
         }
+        // the current message's fade length follows the text speed of its read state (dword_572B64, set by
+        // sub_6E0D0 / a rewind's layout); config byte 98 (fade out off) ends every fade at once
+        let fade_frames = self.settings.text_ms[usize::from(self.line_read)] * 1.2;
+        if let Some(m) = self.page.msgs.last_mut() {
+            m.3 = fade_frames;
+        }
+        let instant = !self.settings.text_fade_out;
         for m in &mut self.page.msgs[..i] {
-            m.2 = (m.2 + dt * 0.06).min(READ_FADE_FRAMES);
+            m.2 = if instant || m.3 <= 0.0 { 1.0 } else { (m.2 + dt * 0.06 / m.3).min(1.0) };
         }
         // window fade / text reveal
         let target = if self.page.visible { 1.0 } else { 0.0 };
@@ -1304,8 +1308,8 @@ impl Game {
         (self.wait == Wait::Click || self.rewinding) && self.trans.is_none()
     }
 
-    /// The held rewind stopped: the script replays the restored message (which shows the window), or a restored
-    /// choice shows the page under it at once.
+    /// The held rewind stopped: the text shows again (sub_391A0 draws none while off_AE05B8 is set), and a
+    /// restored choice shows the page under it at once.
     pub fn end_rewind(&mut self) {
         self.rewinding = false;
         if self.wait == Wait::Choice && !self.page.texts.is_empty() {
@@ -1429,10 +1433,16 @@ impl Game {
         self.node_seq = tag;
         self.seek_node = false;
         self.restore_with(r, &d, how != Back::Point);
+        // the quick jump's window comes back with the replayed message
+        if how == Back::Jump {
+            self.page.visible = false;
+            self.page.alpha = 0.0;
+        }
         self.restore_save_point(&d, locked, kind);
-        // sub_5BAF0 case 0 with a2 != 0 (the ZL rewind) sets byte_146E648
+        // sub_5BAF0 case 0 with a2 != 0 (the ZL rewind) sets byte_146E648 and lays the message out
         if how == Back::Rewind && kind == 0 {
             self.ring_restored = true;
+            self.lay_out_rewound(&d);
         }
         // the backlog shares the ring: pages from this entry on are gone, and the page around it is current again
         self.backlog_pages.retain(|p| p.last.is_some_and(|l| l < serial));
@@ -1440,6 +1450,39 @@ impl Game {
         let kept = self.backlog_pages.last().and_then(|p| p.last);
         let start = self.history.iter().take(i + 1).rev().find(|h| h.key.2 == 1).map(|h| h.serial);
         self.page_ring = (start.filter(|&s| kept.is_none_or(|l| s > l)), Some(serial));
+    }
+
+    /// sub_5BAF0 case 0 with a2 != 0: the entry's message is laid out in full at once (sub_53CF0 on its script
+    /// text) with no voice (AE04C8 / AE08B0 = -1; the replay voice AE0790 stays the entry's), and the script
+    /// resumes past it (+16). Without `@n` it waits for a click (AE04B8 0x500, 0x140 for `@e` or a full
+    /// page), which the next held frame's sub_814C0 clears again, so a rewind held past its step goes on into
+    /// the next message once released; an `@n` message goes on at once and holds the next ring push
+    /// (byte_146E644).
+    fn lay_out_rewound(&mut self, d: &crate::save::SaveData) {
+        let Some(c) = self.script.commands.get(self.pc).filter(|c| matches!(c.op, Op::Message)).cloned() else {
+            return;
+        };
+        let raw = c.args.first().map(String::as_str).unwrap_or("");
+        let (_, code) = raw_message(raw, "");
+        let (text, _) = message_end(&self.resolve_text(raw));
+        // (sub_3B2B0(0, 1): the laid-out message counts as read, dword_572B64)
+        self.line_read = true;
+        self.pc += 1;
+        self.show_message(&text, code != Some(b'n'));
+        crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
+        self.page.revealed = self.page.order as f32;
+        self.ring_hold = code == Some(b'n');
+        self.pending_voice = None;
+        self.voice_to_play = None;
+        self.last_voice = d.voice.clone();
+    }
+
+    /// sub_814C0 starts every held frame by clearing the click wait (AE04B8 0x500) a step left.
+    pub fn rewind_frame(&mut self) {
+        if self.wait == Wait::Click {
+            self.wait = Wait::None;
+            self.page.waiting = false;
+        }
     }
 
     /// sub_5BAF0 LABEL_137: a restored entry recorded outside an engine task, not a choice (11 / 12), at a
@@ -1583,6 +1626,7 @@ impl Game {
                 }
                 let (text, wait) = message_end(&text);
                 self.show_message(&text, wait);
+                crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
                 let (raw_text, code) = raw_message(raw, "");
                 self.msg_text = raw_text;
                 self.record_message();
@@ -1767,6 +1811,8 @@ impl Game {
                     self.msg_text = raw_text;
                     let (text, wait) = message_end(&self.resolve_text(a));
                     self.append_message(&text, wait);
+                    // the text hooker gets the addition (the message itself went out already)
+                    crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.pc as u64);
                     if !wait {
                         self.wait = Wait::None;
                     }
@@ -2540,7 +2586,7 @@ impl Game {
     pub fn play_sys_sound(&mut self, n: usize) {
         tracing::debug!("system sound {n}");
         let vol = if self.settings.mute & 4 != 0 { 0.0 } else { self.settings.sys_se };
-        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|name| self.assets.sound_effect(name)) {
+        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|&id| self.assets.sound_effect_id(id)) {
             self.sound.play_sys(0, pcm, vol);
         }
     }
@@ -2548,7 +2594,7 @@ impl Game {
     /// sub_ACFA0(n): system sound n on the SE volume through the sub_CA0 curve.
     fn play_se_sound(&mut self, n: usize) {
         let vol = volume_curve(self.sound.se_volume());
-        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|name| self.assets.sound_effect(name)) {
+        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|&id| self.assets.sound_effect_id(id)) {
             self.sound.play_sys(1, pcm, vol);
         }
     }
@@ -2959,9 +3005,10 @@ impl Game {
     }
 
     /// sub_6E0D0: a voice plays unless voices are off or its speaker's row is muted, at that row's volume.
+    /// Neither a message start nor VPL2 (0x7a450) plays one during the next-scene seek (off_AE0568).
     /// `replay`: it becomes the voice the replay button plays (AE06A8), as at a message start.
     fn play_voice(&mut self, n: &str, replay: bool) {
-        if self.skip || !self.settings.voice_on {
+        if self.skip || self.seek_node || !self.settings.voice_on {
             return;
         }
         tracing::debug!("voice {n}");
@@ -3186,7 +3233,8 @@ impl Game {
             self.page.order = order;
         }
         self.page.last_start = from;
-        self.page.msgs.push((self.page.chars.len(), text.trim_end().ends_with("@k"), 0.0));
+        let fade_frames = self.settings.text_ms[usize::from(self.line_read)] * 1.2;
+        self.page.msgs.push((self.page.chars.len(), text.trim_end().ends_with("@k"), 0.0, fade_frames));
         self.page.chars.extend(placed);
         self.page.texts.push(text.to_string());
         if wait {
@@ -3199,7 +3247,7 @@ impl Game {
     /// MSAD (sub_6E950): append to the current message's text (its trailing `@k` dropped) and lay the whole
     /// message out again in its slot, so the addition continues where the message ended.
     fn append_message(&mut self, add: &str, wait: bool) {
-        let (Some(last), Some(&(first, _, _))) = (self.page.texts.last(), self.page.msgs.last()) else {
+        let (Some(last), Some(&(first, _, _, _))) = (self.page.texts.last(), self.page.msgs.last()) else {
             self.show_message(add, wait);
             return;
         };
@@ -3330,7 +3378,7 @@ impl Game {
             let fades: Vec<f32> = (0..msgs.len())
                 .map(|i| {
                     let j = (i..msgs.len()).find(|&j| !msgs[j].1).unwrap_or(msgs.len() - 1);
-                    1.0 - (1.0 - read_alpha) * msgs[j].2 / READ_FADE_FRAMES
+                    1.0 - (1.0 - read_alpha) * msgs[j].2
                 })
                 .collect();
             let mut m = 0;
@@ -3345,13 +3393,15 @@ impl Game {
                 if !self.settings.text_fade_in && vis > 0.0 {
                     vis = 1.0;
                 }
-                if vis <= 0.0 {
+                // (sub_391A0 draws no text while a rewind runs, off_AE05B8)
+                if vis <= 0.0 || self.rewinding {
                     continue;
                 }
                 let alpha = vis * text_a * fade;
                 Self::rimmed_glyph(font, r, &mut out, pc, alpha);
             }
-            if self.wait == Wait::Click && revealed as usize >= self.page.order {
+            // (sub_38EC0 draws nothing while a rewind runs)
+            if self.wait == Wait::Click && revealed as usize >= self.page.order && !self.rewinding {
                 // sub_38EC0 at the pen + (2, 3.5) units for the F799 line icon (slot 54, lineBreak_a), (2, 5.5)
                 // for the page icon (slot 55, pageBreak_a, at half alpha); F822 != 1 always the page icon at
                 // (2, 6.5). Window types 3..32 draw slot 56 (pageBreak_ciel_a, 59 frames of 43x46) at (4, 4).
@@ -4111,8 +4161,11 @@ impl Game {
         }
         self.ended = false;
         self.clear_page(false);
-        self.page.visible = false;
-        self.page.alpha = 0.0;
+        // (a rewind keeps the window: sub_391A0 only leaves the text out while it runs)
+        if !rewind {
+            self.page.visible = false;
+            self.page.alpha = 0.0;
+        }
         self.page.quick = false;
         self.page.dim = 0.0;
         self.page.dim_vel = 0.0;
@@ -4124,19 +4177,17 @@ impl Game {
             let (t, _) = message_end(&self.resolve_text(&d.text));
             self.show_message(&t, false);
         }
-        // a rewind (sub_814C0) shows no window until the script replays the message once it stops
-        if rewind {
-            self.page.visible = false;
-        }
         self.page.revealed = self.page.order as f32;
         for m in &mut self.page.msgs {
-            m.2 = READ_FADE_FRAMES;
+            m.2 = 1.0;
         }
         self.pc = d.pc;
         self.wait = Wait::None;
         self.click_ms = 0.0;
-        // the entry's voice plays again (load: sub_5D950 0x5ee6c; rewind: sub_5BAF0 makes it pending for the
-        // replayed message)
+        // sub_5BAF0 makes the entry's voice pending (AE04C8, AE08B0) for both a load and a rewind: the script
+        // replays the message (a load resumes at the entry's offset; sub_5BAF0's own layout of the message runs
+        // for a rewind only), whose start (sub_6E0D0) plays it and makes it the message's voice. A load only
+        // sets the speaker's voice level from it (sub_5D950 0x5ee6c).
         self.pending_voice = None;
         self.stage_dirty = false;
         self.voice_to_play = None;
@@ -4145,13 +4196,8 @@ impl Game {
         // the entry's read key is current again (sub_5BAF0), so the next `_Z` command marks it read
         self.read_key = d.read_key;
         self.last_voice = None;
-        if rewind {
-            // the replayed message (d.pc) takes it as VPLY's voice once the script runs again
-            self.pending_voice = d.voice.clone();
-            self.voice_to_play = d.voice.clone();
-        } else if let Some(n) = d.voice.clone() {
-            self.play_voice(&n, true);
-        }
+        self.pending_voice = d.voice.clone();
+        self.voice_to_play = d.voice.clone();
         if let Some((var, opts)) = &d.choice {
             let opts = opts.iter().map(|(v, t)| ChoiceOpt { value: *v, text: t.clone(), disabled: false }).collect();
             self.start_choice(Choice::new(var.clone(), ChoiceKind::Page, opts));
@@ -4355,9 +4401,16 @@ impl Game {
         s
     }
 
-    /// RGBA8 copy of the last presented canvas.
+    /// RGBA8 copy of the last presented canvas as the screen shows it (through the output curve).
     pub fn screenshot(&self, r: &Renderer) -> Vec<u8> {
-        r.read_target(&self.canvas)
+        let lut: Vec<u8> = (0..=255).map(knife_render::output_level).collect();
+        let mut px = r.read_target(&self.canvas);
+        for c in px.chunks_mut(4) {
+            for v in &mut c[..3] {
+                *v = lut[usize::from(*v)];
+            }
+        }
+        px
     }
 }
 
