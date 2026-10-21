@@ -125,3 +125,34 @@ right, a, b, x, y, l, r, zl, zr, rup, rdown, minus and plus (tapped, or held fro
 menu, click, press, release, move/X/Y in canvas pixels and wheel/N (mouse wheel notches, + up). `--skip-movies` lets every story movie be skipped
 (the Switch plays an unwatched opening, prologue or ending through), `--jump-node N` starts at a flowchart node, `--var F822=0,...` sets script variables after the start (F822 = 0 shows the
 one-message-per-window layout of records made without START_SCRIPT).
+
+## Comparing with the Switch original (Astris)
+
+`tools/emu/` drives the original in the Astris emulator and captures it, for side-by-side checks against
+knife. Setup: start `python3 tools/emu/dsu_server.py` (a DSU / cemuhook controller server on 127.0.0.1:26760,
+control socket 26761), set Astris Input to DSU Controller at 127.0.0.1:26760 and pick slot 0, and run the
+game on the save in `switch_emu_save` (knife only ever uses a copy of it). Astris reads the controller only
+while focused; the commands bring it to the front.
+
+- `tools/emu/emu press a` (also hold / release / stick L X Y / reset): one input to the Switch.
+- `tools/emu/emu shot out.png`: the game area at 1920x1080.
+- `tools/emu/emu tap X Y [MS]` / `drag X0 Y0 X1 Y1 [MS]`: a touch at game coordinates (1920x1080). Astris
+  turns the mouse into the touch screen, but only for events posted at the HID level, and the first touch after
+  it gains focus only switches touch on. Between touches the resting pointer still counts as the Switch's
+  mouse (a pointer left at the top reopens the story's mode panel), so both park it at the picture's centre
+  afterwards. A drag holds still for 100 ms after the press, since Astris registers a touch a few frames late.
+- `tools/emu/emu run NAME "500:down,1000:a"`: the inputs (knife `--keys` syntax) with captures every
+  `--every` ms until `--until` ms into `build/emu/NAME/` (real capture times in `emu_times.txt`).
+- `tools/emu/emu knife NAME "KEYS" --title`: the same keys through knife on a copy of the emulator save;
+  `--title` boots to the title like a normal start, and other trailing arguments (e.g. `--load-slot 7`) pass
+  through to knife. `tools/emu/emu compare NAME` puts both side by side.
+
+Window captures come in the display's colour space (their ICC profile, Display P3 here); `emu.py` converts
+them to sRGB so they compare with knife pixel for pixel. QuickTime recordings of the emulator window are not
+colour-faithful. The emulator's live save is `savedata000` in both
+`~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/bis/user/save/0000000000000004/{0,1}/`
+(`switch_emu_save` is a separate copy). Replace it only while the game is stopped (the running game writes it
+back), then restart: Astris's stop button, then double-click the game in the list. The load list shows the
+registered slots sorted by save date.
+
+Research notes live in `re/NOTES.md`.

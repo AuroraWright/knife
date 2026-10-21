@@ -5,3 +5,4 @@
 /build
 .DS_Store
 /switch_sysfont
+__pycache__/
