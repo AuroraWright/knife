@@ -9,6 +9,9 @@ pub const BUILD_ID_PREFIX: [u8; 8] = [0xf4, 0xb3, 0x31, 0x8d, 0x56, 0x03, 0x1e, 
 
 const IMAGE_NAMES: u64 = 0x5e02a4; // [u8; 32] records
 const IMAGE_INFO: u64 = 0x46f830; // 72-byte records
+/// STRA haze parameters (sub_91520): 10 floats per id, ids 1..=557.
+const HAZE: u64 = 0x352bd4;
+pub const HAZE_COUNT: usize = 557;
 const IMAGE_COUNT: usize = 14713;
 const SCENE_IDS: u64 = 0x350D58; // u16
 const SCENE_ID_COUNT: usize = 549;
@@ -84,11 +87,31 @@ pub struct ImageInfo {
     pub center_x: f32,
     pub center_y: f32,
     pub kind: u8,
+    /// +67 bit 0: the name ends in a `_aa_bb` variant suffix
+    pub variant: bool,
+    /// +70 (sub_2DFD0): size level; pivots and SBAS children of the image scale by 1 / 2^level (1..3)
+    pub level: i16,
+    /// +65 bit 1: the screen shake does not move the image (sub_34440 / sub_32050; the colour fills 0..6)
+    pub no_shake: bool,
+}
+
+impl ImageInfo {
+    /// sub_2DFD0's scale: level 1 / 2 / 3 -> 0.5 / 0.25 / 0.125, else 1.
+    pub fn level_scale(&self) -> f32 {
+        match self.level {
+            1 => 0.5,
+            2 => 0.25,
+            3 => 0.125,
+            _ => 1.0,
+        }
+    }
 }
 
 pub struct ExeTables {
     pub images: Vec<ImageInfo>,
     pub scene_ids: Vec<u16>,
+    /// Indexed by STRA id; entry 0 is unused.
+    pub haze: Vec<[f32; 10]>,
 }
 
 impl ExeTables {
@@ -116,12 +139,23 @@ impl ExeTables {
                 center_x: f(52),
                 center_y: f(56),
                 kind: nso.bytes(rec + 68, 1).map(|b| b[0]).unwrap_or(0),
+                variant: nso.bytes(rec + 67, 1).is_some_and(|b| b[0] & 1 != 0),
+                level: nso.u16(rec + 70).map_or(0, |v| v as i16),
+                no_shake: nso.bytes(rec + 65, 1).is_some_and(|b| b[0] & 2 != 0),
             });
         }
         let scene_ids = (0..SCENE_ID_COUNT)
             .map(|i| nso.u16(SCENE_IDS + 2 * i as u64).unwrap_or(0xFFFF))
             .collect();
-        Ok(Self { images, scene_ids })
+        let haze = (0..=HAZE_COUNT)
+            .map(|id| std::array::from_fn(|k| nso.f32(HAZE + 40 * id as u64 + 4 * k as u64).unwrap_or(0.0)))
+            .collect();
+        Ok(Self { images, scene_ids, haze })
+    }
+
+    /// Haze entry for a STRA id (sub_91520: ids outside 1..=557 have none).
+    pub fn haze(&self, id: i32) -> Option<&[f32; 10]> {
+        if (1..=HAZE_COUNT as i32).contains(&id) { self.haze.get(id as usize) } else { None }
     }
 
     pub fn scene_index(&self, id: u16) -> Option<usize> {

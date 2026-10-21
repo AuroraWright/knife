@@ -1,6 +1,8 @@
 //! Readers for the game's data formats.
 
 pub mod archive;
+pub mod bffnt;
+pub mod bfttf;
 pub mod bntx;
 pub mod bntx_decode;
 pub mod mzp;

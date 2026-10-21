@@ -40,7 +40,7 @@ impl Archive {
         let mrg = unsafe { Mmap::map(&file)? };
 
         let mut entries = Vec::new();
-        for (i, e) in hed.chunks_exact(8).enumerate() {
+        for (i, e) in hed.as_chunks::<8>().0.iter().enumerate() {
             let offset = u32::from_le_bytes(e[0..4].try_into().unwrap());
             if offset == 0xFFFF_FFFF {
                 break;

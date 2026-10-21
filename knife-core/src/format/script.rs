@@ -16,8 +16,10 @@ impl ScriptText {
         let offsets = mzp.get(slot * 2).context("missing offset table")?;
         let text = mzp.get(slot * 2 + 1).context("missing text block")?;
         let offs: Vec<usize> = offsets
-            .chunks_exact(4)
-            .map(|c| u32::from_be_bytes(c.try_into().unwrap()) as usize)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_be_bytes(c) as usize)
             .collect();
         let mut lines = Vec::with_capacity(offs.len());
         for (i, &start) in offs.iter().enumerate() {

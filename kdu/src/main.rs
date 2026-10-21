@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use knife_core::format::{archive::Archive, bntx, mzx, nx, script};
+use knife_core::format::{archive::Archive, bffnt, bntx, mzx, nx, script};
 
 #[derive(Parser)]
 struct Cli {
@@ -44,6 +44,8 @@ enum Cmd {
     Sound { name: String, out: PathBuf },
     /// Extract an archive entry, converting BNTX textures to PNG (BC7 decoded)
     Extract { archive: String, name: String, out: PathBuf },
+    /// List the glyphs of a BFFNT font (romfs-relative path) and write its sheet to OUT as PNG
+    Bffnt { font: PathBuf, out: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -118,10 +120,7 @@ fn main() -> Result<()> {
         Cmd::Streams => {
             let sar = knife_audio::bfsar::SoundArchive::parse(std::fs::read(cli.romfs.join("knife1.bfsar"))?)?;
             for i in 0..sar.sound_count() {
-                match sar.stream_sound(i) {
-                    Ok(s) => println!("{i:5} {:?}", s),
-                    Err(_) => {}
-                }
+                if let Ok(s) = sar.stream_sound(i) { println!("{i:5} {:?}", s) }
             }
         }
         Cmd::Sound { name, out } => {
@@ -185,6 +184,19 @@ fn main() -> Result<()> {
                 let _ = (mzx::is_mzx(&data), nx::kind(&data));
                 std::fs::write(&out, &data)?;
             }
+        }
+        Cmd::Bffnt { font, out } => {
+            let f = bffnt::Font::parse(&std::fs::read(cli.romfs.join(font))?)?;
+            println!(
+                "height {} ascent {} width {} cell {}x{} baseline {}",
+                f.height, f.ascent, f.width, f.cell_w, f.cell_h, f.baseline
+            );
+            for (c, g) in &f.glyphs {
+                let ch = char::from_u32(*c).unwrap_or('?');
+                println!("U+{c:04X} {ch} at ({}, {}) left {} width {} advance {}", g.x, g.y, g.left, g.width, g.advance);
+            }
+            let rgba = knife_core::format::bntx_decode::to_rgba8(&f.sheet)?;
+            image::save_buffer(&out, &rgba, f.sheet.width, f.sheet.height, image::ExtendedColorType::Rgba8)?;
         }
     }
     Ok(())
