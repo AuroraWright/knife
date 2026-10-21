@@ -4,5 +4,5 @@
 /switch_romfs
 /build
 .DS_Store
-/switch_sysfont
 __pycache__/
+/AGENTS.md

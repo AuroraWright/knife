@@ -134,7 +134,7 @@ impl Ui {
                         None
                     }
                     Pad::Down | Pad::B | Pad::Y => {
-                        self.touch.panel = Panel::Closing;
+                        self.close_panel_by_button();
                         None
                     }
                     _ => None,

@@ -247,6 +247,14 @@ impl Ui {
     }
 
     /// Mouse moved (canvas px): a drag moves the touch, a hover does not.
+    /// sub_4E170 state 3 closed by a button (0x4e460): the last touch's y (+0x30, and the pointer's +0x18) goes to
+    /// 120 so a touch that opened the panel from the top 25 units does not open it again in state 1, and the
+    /// press is used up for the frame (off_AE0490 = 1).
+    pub(super) fn close_panel_by_button(&mut self) {
+        self.touch.panel = Panel::Closing;
+        self.touch.at[1] = 120.0;
+    }
+
     /// sub_4E170 case 6, after the quick load (sub_527A0(139)): the mode panel slides shut from where it is
     /// (state 4) with no button focused (sub_AE0E0(-1)), and sub_AD440(320, 224, 256) puts the last touch back at
     /// the screen centre, so the tap on Q.LOAD in the top 25 units does not open the panel again.
