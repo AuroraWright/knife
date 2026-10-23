@@ -13,6 +13,9 @@ Chinese besides Japanese).
 knife is inspired by [shin](https://github.com/DCNick3/shin), DCNick3's reimplementation of the engine of
 the Switch visual novels by Entergram, and shares some of its code.
 
+[engine-writeup.md](engine-writeup.md) describes how the original engine works: the game data, the script
+machine and its frame loop, text, the stage, sound, saves and the full instruction set.
+
 ## Game data
 
 knife needs the game data from your own copy of the game:
