@@ -136,10 +136,11 @@ pub struct Layer {
     /// SOXY args 3 / 4 (stage words 1222 / 1262 -> render +284 / +286): sub_37F50 adds (a * 0.33333, b *
     /// 0.41481) to the drawn position in the 640x448 draw space, i.e. (a, b) 1920x1080 pixels
     pub soxy: (i16, i16),
-    /// Pivot (render floats 25 / 26, 640x362 units; None = the image centre): STPV and motion fields 6 / 7.
+    /// Pivot (render floats 25 / 26, 640x362 units; None = `Image::anchor`, the centre cut to whole units):
+    /// STPV and motion fields 6 / 7.
     /// Zoom and rotation turn about it, and SBAS children anchor to it.
     pub pivot: Option<[f32; 2]>,
-    /// Quad offset (render floats 18 / 19; None = minus the image centre). The image is drawn shifted by
+    /// Quad offset (render floats 18 / 19; None = minus `Image::anchor`). The image is drawn shifted by
     /// pivot + shift: STPV moves only the pivot, motion fields 6 / 7 set shift = -pivot as well.
     pub shift: Option<[f32; 2]>,
     /// quake slots 0 (SQK2) and 1 (SHK2 / SSW2)
@@ -586,6 +587,30 @@ impl Layer {
     }
 }
 
+/// One step of the stage pass (`Stage::draws`). The layer group path draws some layers into the exe's
+/// "temp buffer surface" pair instead of the stage: `Pixel` (pixel, off_AE0CC8) and `Mask` (alpha,
+/// off_AE0CD0). Both persist across frames and are cleared only by a group's first draw.
+pub enum Draw {
+    Stage(Quad),
+    Pixel { quad: Quad, clear: bool },
+    Mask { quad: Quad, clear: bool },
+    /// sub_37EA0: the pixel surface, its alpha multiplied by the mask's, drawn over the whole stage with the
+    /// saved blend at the saved alpha
+    Composite { blend: Blend, alpha: f32 },
+}
+
+/// The layer group state of the draw pass: mode / first / flag (off_AE0D18 / D20 / D28) and what the first
+/// draw saved (blend off_AE0D30, alpha off_AE0D40). The saved pair is never reset.
+#[derive(Default)]
+struct Group {
+    mode: u8,
+    first: bool,
+    blend: Blend,
+    alpha: u8,
+    /// the last frame's summary, so the debug log shows changes only
+    log: String,
+}
+
 #[derive(Default)]
 pub struct Stage {
     pub layers: Vec<Option<Layer>>,
@@ -602,6 +627,7 @@ pub struct Stage {
     /// the quake slots' random source and unspent time for their 60 Hz steps
     quake_rng: crate::fx::Rng,
     frame_acc: f32,
+    group: Group,
 }
 
 impl Stage {
@@ -615,6 +641,7 @@ impl Stage {
             kept: vec![None; LAYERS],
             quake_rng: crate::fx::Rng::default(),
             frame_acc: 0.0,
+            group: Group::default(),
         }
     }
 
@@ -786,7 +813,7 @@ impl Stage {
             // (sub_89190 / sub_892B0)
             let (ax, ay, k) = match &bl.source {
                 Source::Image(img) => {
-                    let [px, py] = bl.pivot.unwrap_or([img.center_x, img.center_y]);
+                    let [px, py] = bl.pivot.unwrap_or(img.anchor());
                     (px * SCRIPT_W / UNIT_W, py * SCRIPT_H / UNIT_H, img.level)
                 }
                 Source::Color(_) => (SCRIPT_W / 2.0, SCRIPT_H / 2.0, 1.0),
@@ -849,37 +876,255 @@ impl Stage {
         r
     }
 
-    pub fn quads(&self, white: &TexRef) -> Vec<Quad> {
-        // sub_3BBA0 draws a layer (sub_37F50) only while its priority (render dword 5883 + layer) is >= 1, so
-        // STCP(l, 0) hides it; the rest go back to front by priority, ties by layer number
+    /// sub_3BBA0 draws a layer (sub_37F50) only while its priority (render dword 5883 + layer) is >= 1, so
+    /// STCP(l, 0) hides it; the rest go back to front by priority, ties by layer number
+    fn order(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.layers.len())
             .filter(|&i| self.layers[i].as_ref().is_some_and(|l| !l.pending && l.prio >= 1))
             .collect();
         order.sort_by_key(|&i| (self.layers[i].as_ref().unwrap().prio, i));
+        order
+    }
+
+    /// Every shown layer drawn straight onto the stage (save previews, which never take the group path).
+    pub fn quads(&self, white: &TexRef) -> Vec<Quad> {
+        self.order().into_iter().filter_map(|i| self.layer_quad(i, white)).collect()
+    }
+
+    /// The stage pass with the group path (sub_3BBA0). Layers sharing a clip parent (STCH arg 11, render +272;
+    /// a parent with children maps to itself; not the SBAS base, +276) that follow each other in draw order form a
+    /// group: sub_A2BA0 gets mode 1 while the next drawn layer has the same parent, 2 for the last, 0 outside a
+    /// group, and 0 -> 1 sets
+    /// "first" (sub_9F020 resets mode 0 / first 1 every frame). sub_36520 raises the group flag (sub_A2BF0,
+    /// mode >= 1 only) around the draws below; sub_37EA0 then composites at a group's last layer once
+    /// something drew (first clear) and resets the mode.
+    /// - Sprite draws (sub_9FE00: unclipped layers with the default shader) go onto the stage as usual and
+    ///   add their alpha to the mask (blend state 0, alpha One / One; the group's first draw clears it).
+    /// - Surface draws (sub_A4BC0: unclipped layers with any other shader, haze) go into the pixel surface
+    ///   instead. The first is opaque (blend 0 / default shader, or noalpha with a clip inset), clears both
+    ///   surfaces, saves its blend and alpha and puts its alpha into the mask; later ones keep their blend
+    ///   and colour, reading the pixel surface as their backdrop.
+    /// - A child of a shown parent (sub_36520 case 2, clipped to the parent's clip, sub_A6570) goes into the pixel
+    ///   surface through the normal shader (blend state 7, shader 45: mix(backdrop premultiplied by its alpha, s, a), opaque) or
+    ///   its own backdrop blend, in white at 255 alpha / the saved alpha (capped); the first instead draws
+    ///   opaque white, clears both, saves and puts its alpha into the mask.
+    /// - A clipped layer that is not a child (the group branch of sub_36520's clip path) is drawn through
+    ///   noalpha (shader id 8) into the pixel surface likewise, then sub_A74B0 copies its rect (target 1,
+    ///   also noalpha, inside the scissor) into the mask, clearing it, and saves its alpha.
+    ///
+    /// Only children and clipped layers end a group (LABEL_190), and a layer at alpha 0 (sub_37F50). A
+    /// clipped layer whose clip lies off screen draws nothing and does not end one. sub_37EA0 first paints the
+    /// parent's clip inset band (sub_34A70(layer, -3), clip modes 1..6) into the pixel surface; it lies outside
+    /// the inset scissor the mask was drawn in, so the composite never shows it.
+    pub fn draws(&mut self, white: &TexRef) -> Vec<Draw> {
+        let order = self.order();
+        // v69: each shown layer's parent; a parent with children maps to itself
+        let mut key = [-1i32; LAYERS];
+        for (i, l) in self.layers.iter().enumerate() {
+            if let Some(l) = l
+                && !l.pending
+                && l.prio != 0
+            {
+                key[i] = l.parent.filter(|&b| b < LAYERS).map_or(-1, |b| b as i32);
+            }
+        }
+        for i in 0..LAYERS {
+            let b = key[i];
+            if b >= 0 && key[b as usize] == -1 {
+                key[b as usize] = b;
+            }
+        }
+        self.group.mode = 0;
+        self.group.first = true;
         let mut out = Vec::new();
-        for i in order {
+        // debug log of the group draws (knife::group), printed when it changes
+        let trace = tracing::enabled!(target: "knife::group", tracing::Level::DEBUG);
+        let mut log = Vec::new();
+        for (n, &i) in order.iter().enumerate() {
+            let before = out.len();
+            let g = key[i];
+            let mode = match order.get(n + 1) {
+                _ if g < 0 => 0,
+                Some(&next) if key[next] == g => 1,
+                _ => 2,
+            };
+            if mode == 1 && self.group.mode == 0 {
+                self.group.first = true;
+            }
+            self.group.mode = mode;
+            let Some(quad) = self.layer_quad(i, white) else {
+                self.end_group(&mut out);
+                if trace && mode != 0 {
+                    log.push(format!("{i} (mode {mode}): alpha 0{}", if out.len() > before { ", composite" } else { "" }));
+                }
+                continue;
+            };
             let l = self.layers[i].as_ref().unwrap();
+            let alpha = self.resolved(i, 0).alpha.clamp(0.0, 1.0);
+            let abyte = (alpha * 255.0) as u8;
+            // sub_37F50 passes 2 (a child) when the parent is shown
+            let parent = l.parent.filter(|&b| b != i && b < LAYERS && self.layers[b].as_ref().is_some_and(|b| !b.pending));
+            // case 2 clips to the parent's clip, the default path to the layer's own
+            let clip = match parent {
+                Some(b) => self.resolved(b, 0).clip,
+                None => self.resolved(i, 0).clip,
+            }
+            .filter(|c| c.w != 0.0 && c.h != 0.0);
+            let on_screen = clip.is_none_or(|c| c.x < CANVAS_W as f32 && c.y < CANVAS_H as f32 && c.x + c.w > 0.0 && c.y + c.h > 0.0);
+            if !on_screen {
+                if trace && mode != 0 {
+                    log.push(format!("{i} (mode {mode}): off screen"));
+                }
+                continue;
+            }
+            let flag = mode >= 1;
+            let haze = quad.haze[0][3] > 0.5;
+            // STNS grain (+420): sub_35FC0 draws it without the flag; a child's skips sub_37EA0 too
+            if l.noise.is_some() && (parent.is_some() || clip.is_none()) {
+                out.push(Draw::Stage(quad));
+                continue;
+            }
+            match (parent.is_some(), clip.is_some()) {
+                (_, true) if flag => self.clip_draw(&mut out, quad, l.blend, abyte, parent.is_none(), haze),
+                (true, false) | (false, false) if !flag => out.push(Draw::Stage(quad)),
+                // the per-layer rule fade (sub_A6E90) bypasses the group
+                (false, false) if l.rule.is_some() && alpha < 1.0 && quad.blend == Blend::Alpha => out.push(Draw::Stage(quad)),
+                (_, false) if quad.blend != Blend::Alpha || haze => {
+                    let inset = if haze { l.clip_inset } else { 0 };
+                    self.surface_draw(&mut out, quad, l.blend, abyte, inset);
+                }
+                (_, false) => {
+                    let first = std::mem::take(&mut self.group.first);
+                    out.push(Draw::Mask { quad: footprint(&quad, quad.color[3]), clear: first });
+                    out.push(Draw::Stage(quad));
+                }
+                (_, true) => out.push(Draw::Stage(quad)),
+            }
+            if parent.is_some() || clip.is_some() {
+                self.end_group(&mut out);
+            }
+            for d in out[before..].iter().filter(|_| trace) {
+                match d {
+                    Draw::Pixel { clear, .. } => log.push(format!("{i} (mode {mode}): pixel{}", if *clear { " (clear)" } else { "" })),
+                    Draw::Composite { blend, alpha } => log.push(format!("{i}: composite {blend:?} {alpha:.3}")),
+                    _ => {}
+                }
+            }
+        }
+        if trace {
+            let sum = log.join(", ");
+            if sum != self.group.log {
+                tracing::debug!(target: "knife::group", "{}", sum);
+                self.group.log = sum;
+            }
+        }
+        out
+    }
+
+    /// sub_A4BC0 under the group flag.
+    fn surface_draw(&mut self, out: &mut Vec<Draw>, mut quad: Quad, blend: Blend, abyte: u8, inset: i16) {
+        if std::mem::take(&mut self.group.first) {
+            quad.color[3] = 1.0;
+            (quad.blend, quad.shade) = if inset < 1 { (Blend::Alpha, Shade::Sprite) } else { (Blend::Opaque, Shade::NoAlpha) };
+            self.group.blend = blend;
+            self.group.alpha = abyte;
+            out.push(Draw::Mask { quad: footprint(&quad, 1.0), clear: true });
+            out.push(Draw::Pixel { quad, clear: true });
+        } else {
+            out.push(Draw::Pixel { quad, clear: false });
+        }
+    }
+
+    /// sub_A6570 under the group flag (and sub_A74B0 after a clipped layer that is not a child).
+    fn clip_draw(&mut self, out: &mut Vec<Draw>, mut quad: Quad, blend: Blend, abyte: u8, own: bool, haze: bool) {
+        let first = std::mem::take(&mut self.group.first);
+        // a layer's own clipped draw passes alpha 1 (sub_36520: v101 = 1 in the group branch; sub_A74B0 saves its
+        // alpha afterwards), a child its alpha
+        let drawn = if own { 255 } else { u32::from(abyte) };
+        let a = if first {
+            1.0
+        } else if self.group.alpha == 0 {
+            0.0
+        } else {
+            (255 * drawn / u32::from(self.group.alpha)).min(255) as f32 / 255.0
+        };
+        if quad.shade != Shade::Fill {
+            quad.color = [1.0, 1.0, 1.0, a];
+        } else {
+            quad.color[3] = a;
+        }
+        if quad.blend == Blend::Alpha {
+            quad.blend = Blend::Ps(knife_render::PsOp::Normal);
+        }
+        // a rule fade only shapes target 1 (sub_A7190), i.e. the mask; the group branch has no soft clip mask
+        // (sub_32E30), only the scissor
+        let rule = quad.rule.take();
+        quad.soft = None;
+        // the layer's own image goes into target 2 through noalpha (id 8; 38 on the haze path)
+        if own && !haze {
+            quad.shade = Shade::NoAlpha;
+        }
+        if first {
+            self.group.blend = blend;
+            self.group.alpha = abyte;
+            out.push(Draw::Mask { quad: footprint(&quad, 1.0), clear: true });
+        }
+        if own {
+            let mut rect = footprint(&quad, 1.0);
+            rect.tex = quad.tex.clone();
+            rect.shade = Shade::NoAlpha;
+            rect.blend = Blend::Opaque;
+            rect.rule = rule;
+            out.push(Draw::Mask { quad: rect, clear: true });
+            self.group.alpha = abyte;
+        }
+        out.push(Draw::Pixel { quad, clear: first });
+    }
+
+    /// sub_37EA0
+    fn end_group(&mut self, out: &mut Vec<Draw>) {
+        if self.group.mode == 2 && !self.group.first {
+            out.push(Draw::Composite { blend: self.group.blend, alpha: f32::from(self.group.alpha) / 255.0 });
+            self.group.mode = 0;
+        }
+    }
+
+    /// Layer `i` as drawn onto the stage, or None while its alpha is 0.
+    fn layer_quad(&self, i: usize, white: &TexRef) -> Option<Quad> {
+        {
+            let l = self.layers[i].as_ref()?;
             let Resolved { x, y, alpha, clip, zoom: (zx, zy), rot, spin } = self.resolved(i, 0);
             if alpha <= 0.0 {
-                continue;
+                return None;
             }
             let (mut cx, mut cy) = script_to_px(x, y);
             // sub_34440 adds the screen shake twice (640x448 units) unless the image is exempt (+65 bit 1, the
-            // colour fills) or the layer clips with a base and is not absolute; sub_32050 shifts the clip
-            // scissor the same way unless the image is exempt
-            let exempt = match &l.source {
+            // colour fills) or the layer clips with a parent (+272) and is not absolute; sub_32050 shifts the
+            // clip scissor the same way unless the image is exempt. Such a child is placed from its parent's
+            // clip origin by sub_37F50, which is sub_32050 of the parent and so carries the parent's shake.
+            let exempt = |l: &Layer| match &l.source {
                 Source::Image(img) => img.no_shake,
                 Source::Color(_) => true,
             };
-            let shake = if exempt { (0.0, 0.0) } else { (2.0 * self.shake.0 * CANVAS_W as f32 / 640.0, 2.0 * self.shake.1 * CANVAS_H as f32 / 448.0) };
+            let full = (2.0 * self.shake.0 * CANVAS_W as f32 / 640.0, 2.0 * self.shake.1 * CANVAS_H as f32 / 448.0);
+            let shake = if exempt(l) { (0.0, 0.0) } else { full };
             let clip = clip.map(|mut c| {
                 c.x += shake.0;
                 c.y += shake.1;
                 c
             });
-            if !(clip.is_some() && l.base.is_some() && !l.absolute) {
-                cx += shake.0;
-                cy += shake.1;
+            let parent = l.parent.filter(|&p| p != i && p < LAYERS).and_then(|p| self.layers[p].as_ref());
+            match parent {
+                Some(pl) if clip.is_some() && !l.absolute => {
+                    if pl.clip.is_some() && !exempt(pl) {
+                        cx += full.0;
+                        cy += full.1;
+                    }
+                }
+                _ => {
+                    cx += shake.0;
+                    cy += shake.1;
+                }
             }
             // sub_37F50: SOXY in 1920x1080 pixels, scaled into the 640x448 draw space
             cx += f32::from(l.soxy.0) * 0.33333 * CANVAS_W as f32 / 640.0;
@@ -893,7 +1138,7 @@ impl Stage {
             let (mut tex, w, h, ox, oy, uvm) = match &l.source {
                 Source::Image(img) => {
                     // sub_34440: the quad turns about the pivot and is offset by pivot + shift
-                    let centre = [img.center_x, img.center_y];
+                    let centre = img.anchor();
                     let piv = l.pivot.unwrap_or(centre);
                     let sh = l.shift.unwrap_or([-centre[0], -centre[1]]);
                     cx += (piv[0] + sh[0]) * CANVAS_W as f32 / UNIT_W;
@@ -961,7 +1206,7 @@ impl Stage {
             }
             .unwrap_or_default();
             let [u0, v0, u1, v1] = uv;
-            out.push(Quad {
+            Some(Quad {
                 tex,
                 pos: [corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)],
                 uv: [[u0, v0], [u1, v0], [u1, v1], [u0, v1]],
@@ -973,10 +1218,22 @@ impl Stage {
                 rule,
                 haze,
                 soft: clip.and_then(|c| c.soft()),
-            });
+            })
         }
-        out
     }
+}
+
+/// A quad's alpha as the group mask takes it: the default shader (texture alpha times `alpha`), no rule.
+fn footprint(q: &Quad, alpha: f32) -> Quad {
+    let mut f = q.clone();
+    f.color = [1.0, 1.0, 1.0, alpha];
+    f.blend = Blend::Footprint;
+    if f.shade != Shade::NoAlpha {
+        f.shade = Shade::Sprite;
+    }
+    f.rule = None;
+    f.haze = Default::default();
+    f
 }
 
 #[cfg(test)]
@@ -1007,7 +1264,7 @@ mod tests {
             let b = crate::motion::ease(kind, 1.0);
             assert!(a.abs() < 2e-3 && (b - 1.0).abs() < 2e-3, "kind {kind}: {a} {b}");
             // the layer form (d = -1) starts at `from` for the in and out kinds; in-out and out-in halves swap
-            if kind < 2 || kind > 41 || (kind - 2) % 4 < 2 {
+            if !(2..=41).contains(&kind) || (kind - 2) % 4 < 2 {
                 let t = Tween::new(3.0, 1.0, 10, kind);
                 assert!((t.value() - 3.0).abs() < 1e-2, "kind {kind}: {}", t.value());
             }

@@ -67,6 +67,41 @@ pub const MOVIES: &[&str] = &[
     "credit06",
 ];
 
+/// The movie file of a table entry: entries 0..46 above, then the overseas build's language copies (its table
+/// at 0x357868): 46 / 47 prologue_en / _zc, 48..75 / 75..102 phasetitle_*_en / _zc (8..35 + 40 / + 67), 102..106
+/// op1_arc / op2_ciel _en and _zc, 106 prologue_zt, 107..134 phasetitle_*_zt (8..35 + 99).
+pub fn movie_name(id: usize) -> Option<String> {
+    let lang = |base: usize, suffix: &str| Some(format!("{}_{suffix}", MOVIES[base]));
+    match id {
+        0..46 => Some(MOVIES[id].to_string()),
+        46 => lang(4, "en"),
+        47 => lang(4, "zc"),
+        48..75 => lang(id - 40, "en"),
+        75..102 => lang(id - 67, "zc"),
+        102 | 103 => lang(id - 97, "en"),
+        104 | 105 => lang(id - 99, "zc"),
+        106 => lang(4, "zt"),
+        107..134 => lang(id - 99, "zt"),
+        _ => None,
+    }
+}
+
+/// sub_41260 (overseas; the identity in Japanese): the table entry a movie plays in a language: the prologue
+/// dword_232510 = {4, 46, 47, 106}, the phase titles 8..34 + 40 / 67 / 99, the openings 5 / 6 the English copy
+/// (+ 97) or for both Chinese languages the Simplified Chinese one (+ 99).
+pub fn localized(id: usize, language: usize) -> usize {
+    match (id, language) {
+        (_, 0) => id,
+        (4, l) => [4, 46, 47, 106].get(l).copied().unwrap_or(46),
+        (8..=34, 2) => id + 67,
+        (8..=34, 3) => id + 99,
+        (8..=34, _) => id + 40,
+        (5 | 6, 2 | 3) => id + 99,
+        (5 | 6, _) => id + 97,
+        _ => id,
+    }
+}
+
 pub(crate) const W: u32 = 1920;
 pub(crate) const H: u32 = 1080;
 

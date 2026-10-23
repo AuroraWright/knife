@@ -4,7 +4,7 @@
 //! flow_sam_bg band and phase titles at x 208. Connector pieces come from flow_line_merge: grey where
 //! the edge into a node was ever taken, lit (cyan) where it was taken in the current playthrough.
 
-use crate::flow_table::{LINES, ROWS, TITLES};
+use crate::flow_table::{LINES, ROWS, TITLES, TITLES_EN};
 
 /// Node bit range of RDST/RDED/RTST (0..0x240).
 pub const NODE_BITS: usize = 0x240;
@@ -446,19 +446,21 @@ pub fn build(flags: Flags, gallery: bool) -> Chart {
         if titles.len() <= slot {
             titles.resize_with(slot + 1, Vec::new);
         }
-        let title_at = |y: f32, cell: [f32; 4]| Sprite { tex: "flow_phasetitle", dst: [208.0, y, cell[2], cell[3]], src: cell, prio: 430 };
+        // English (overseas sub_FFFC): its own cells, at x 2 instead of 208
+        let (titles_tab, title_x) = if crate::text::english() { (&TITLES_EN, 2.0) } else { (&TITLES, 208.0) };
+        let title_at = |y: f32, cell: [f32; 4]| Sprite { tex: "flow_phasetitle", dst: [title_x, y, cell[2], cell[3]], src: cell, prio: 430 };
         for (j, cell_node) in row_nodes.iter_mut().enumerate() {
             let f = b.rows[k].recs[j].f;
             let title = f[4];
             if title >= 0 && count <= 2 && title > last_title && fl.edge(f[2]) {
-                let cell = Builder::cell(TITLES.get(title as usize).copied().unwrap_or([0, 0, 0, 0]));
+                let cell = Builder::cell(titles_tab.get(title as usize).copied().unwrap_or([0, 0, 0, 0]));
                 titles[slot].push(title_at(title_y + 8.0, cell));
                 title_y += 32.0;
                 last_title = title;
                 if title != 0 {
                     count += 1;
                 } else {
-                    titles[slot].push(title_at(title_y + 8.0, Builder::cell(TITLES[TITLES.len() - 1])));
+                    titles[slot].push(title_at(title_y + 8.0, Builder::cell(titles_tab[titles_tab.len() - 1])));
                     title_y += 32.0;
                     count += 2;
                 }

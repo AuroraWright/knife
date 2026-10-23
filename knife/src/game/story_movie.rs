@@ -1,7 +1,8 @@
 //! The TOMP movie task (vtable 0x573798: init sub_402A0, update sub_40480, draw sub_40940, end sub_40A00).
 //!
 //! The movie is drawn opaque with a full screen cover over it at alpha 1 - `vis`, in black, or in white
-//! for movies 5 and 37 (dword_AFFCA0). `frame` is the playback position * 60 while the movie plays and then
+//! for movies 5 and 37 (dword_AFFCA0; the overseas build tests the language's table entry, so its English and
+//! Chinese op1_arc copies start under black). `frame` is the playback position * 60 while the movie plays and then
 //! keeps counting frames, so a movie shorter than its fade-out start holds its last frame until then.
 
 use knife_render::{CANVAS_H, CANVAS_W, Quad, Renderer};
@@ -28,10 +29,13 @@ pub(super) struct StoryMovie {
     pressed: bool,
     /// cover colour (dword_AFFCA0)
     cover: f32,
+    /// the game language (the overseas prologue times its skip check and fade-out for English)
+    language: usize,
 }
 
 impl StoryMovie {
-    pub(super) fn new(n: i32, flag: Option<u16>, skippable: bool) -> Self {
+    /// `entry` is the movie table entry played (`movie::localized`).
+    pub(super) fn new(n: i32, entry: i32, language: usize, flag: Option<u16>, skippable: bool) -> Self {
         Self {
             n,
             flag,
@@ -41,7 +45,8 @@ impl StoryMovie {
             vis: 0.0,
             skip_req: false,
             pressed: false,
-            cover: if n | 0x20 == 0x25 { 1.0 } else { 0.0 },
+            cover: if entry | 0x20 == 0x25 { 1.0 } else { 0.0 },
+            language,
         }
     }
 
@@ -49,6 +54,8 @@ impl StoryMovie {
     fn rates(&self) -> (f32, f32, f32) {
         const SLOW: f32 = 0.020833;
         match self.n {
+            // overseas: 23340 in English
+            4 if self.language == 1 => (1.0, 23340.0, 1.0),
             4 => (1.0, 23040.0, 1.0),
             5 => (1.0, 6420.0, 1.0),
             6 => (1.0, 6300.0, 1.0),
@@ -141,8 +148,8 @@ impl Game {
                             }
                             self.play_sys_sound_7();
                         }
-                        // the prologue: B / Plus is only noted until 6 minutes in
-                        4 if t.frame <= 21599.0 => {
+                        // the prologue: B / Plus is only noted until 6 minutes in (overseas English: 6 m 5 s)
+                        4 if t.frame < if t.language == 1 { 21900.0 } else { 21600.0 } => {
                             if !(t.skippable && pressed) {
                                 return false;
                             }

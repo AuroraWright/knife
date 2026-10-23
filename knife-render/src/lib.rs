@@ -40,6 +40,12 @@ pub enum Blend {
     /// A blend computed in the shader from a copy of the target taken just before the quad is drawn (the
     /// exe's blend state 7, which captures the framebuffer per draw).
     Ps(PsOp),
+    /// Colour kept, source alpha added to the target's (the exe's blend state 0 alpha One / One, for the layer
+    /// group mask sub_9FE00 / sub_A4BC0 accumulate).
+    Footprint,
+    /// Colour kept, the target's alpha multiplied by the source alpha (the group mask applied to the group
+    /// pixels: sub_37EA0's exalpha draw).
+    MaskAlpha,
 }
 
 /// Backdrop-reading blends of the exe's layer shaders (shader/nexl_nxshader_*.bnsh). With s = texture rgb *
@@ -82,6 +88,8 @@ pub enum PsOp {
     SubNoAlpha,
     /// noalpha: s, opaque
     NoAlpha,
+    /// normal: mix(d * backdrop alpha, s, a), opaque (where a = 0 the backdrop, alpha included, stays)
+    Normal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -95,6 +103,8 @@ pub enum Shade {
     RimText,
     Mono,
     Nega,
+    /// The texture's rgb with alpha 1 (shader noalpha: the exe draws a clipped layer of a layer group this way)
+    NoAlpha,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -605,6 +615,7 @@ impl Renderer {
                         Shade::RimText => "fs_rim_text",
                         Shade::Mono => "fs_mono",
                         Shade::Nega => "fs_nega",
+                        Shade::NoAlpha => "fs_noalpha",
                     },
                     blend_state(blend),
                     &self.sprite_pl,
@@ -701,8 +712,9 @@ impl Renderer {
                         None => (&self.white.view, -1.0, 0.0),
                     };
                     let fill = if q.shade == Shade::Fill { 1.0 } else { 0.0 };
+                    let noalpha = if q.shade == Shade::NoAlpha { 1.0 } else { 0.0 };
                     let bd = backdrop.as_ref().unwrap();
-                    Some(self.effect_bind_group(&q.tex.view, &bd.view, rule, [op as u32 as f32, fill, tw, th, progress, flags, 0.0, 0.0]))
+                    Some(self.effect_bind_group(&q.tex.view, &bd.view, rule, [op as u32 as f32, fill, tw, th, progress, flags, noalpha, 0.0]))
                 }
                 (_, Some(m)) => Some(self.trans_bind_group(&q.tex.view, &self.white.view, &m.tex.view, [m.progress, m.flags(), tw, th])),
                 (_, None) => None,
@@ -895,10 +907,12 @@ impl Renderer {
         })
     }
 
-    /// One separable gaussian blur pass of `src` into `dst` along `dir` (pixels per tap).
+    /// One separable gaussian blur pass of `src` into `dst` along `dir` (pixels of `src` per tap): the
+    /// Switch's 2 ceil(3 sigma) + 1 taps.
     pub fn blur(&mut self, encoder: &mut wgpu::CommandEncoder, src: &GpuTexture, dst: &RenderTarget, dir: [f32; 2], sigma: f32) {
         self.pipeline(PipeKey::Blur, TARGET_FORMAT);
-        let bg = self.trans_bind_group(&src.view, &self.white.view, &self.white.view, [dir[0], dir[1], sigma, 0.0]);
+        let half = (sigma * 3.0).ceil();
+        let bg = self.trans_bind_group(&src.view, &self.white.view, &self.white.view, [dir[0], dir[1], sigma, half]);
         let verts = fullscreen_verts([1.0; 4]);
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fullscreen"),
@@ -1105,6 +1119,22 @@ fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
     };
     let color = match b {
         Blend::Opaque | Blend::Ps(_) => return None,
+        Blend::Footprint | Blend::MaskAlpha => {
+            let keep = C {
+                src_factor: F::Zero,
+                dst_factor: F::One,
+                operation: O::Add,
+            };
+            let (src_factor, dst_factor) = if b == Blend::Footprint { (F::One, F::One) } else { (F::Zero, F::SrcAlpha) };
+            return Some(wgpu::BlendState {
+                color: keep,
+                alpha: C {
+                    src_factor,
+                    dst_factor,
+                    operation: O::Add,
+                },
+            });
+        }
         Blend::Alpha => alpha,
         Blend::Add => C {
             src_factor: F::One,

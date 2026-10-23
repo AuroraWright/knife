@@ -10,12 +10,13 @@ use std::{
 use anyhow::{Context, Result};
 use knife_audio::{Pcm, bfsar::SoundArchive, codec};
 use knife_core::{
-    exe::{ExeTables, ImageInfo, Nso},
+    exe::{Build, ExeTables, ImageInfo, Nso},
     format::{
         archive::Archive,
         bntx::{self, TexFormat},
         bntx_decode,
         script::{SceneArchive, ScriptText},
+        sfnt,
     },
     vm::parse::Scene,
 };
@@ -38,6 +39,15 @@ pub struct Image {
     pub no_shake: bool,
 }
 
+impl Image {
+    /// The stage anchor cmd_STCH_impl gives a layer showing this image: its centre cut to whole units (stage
+    /// float 221 + layer = (int)centre, shift word 2923 + 9 * layer = (int)-centre), what the draw zooms and
+    /// turns about.
+    pub fn anchor(&self) -> [f32; 2] {
+        [self.center_x.trunc(), self.center_y.trunc()]
+    }
+}
+
 /// Decoded pixels of an image, ready to upload.
 pub enum Pixels {
     Bntx(bntx::Texture),
@@ -48,6 +58,7 @@ pub enum Pixels {
 pub struct Decoded {
     key: String,
     name: String,
+    strip: Option<(usize, usize)>,
     pixels: Result<Pixels>,
 }
 
@@ -60,7 +71,18 @@ impl Decoded {
 
 pub struct Assets {
     pub romfs: PathBuf,
+    /// Japanese or overseas data (`detect_build`)
+    pub build: Build,
+    /// The game language (sub_2DE70: config word +0x12 when it is below `languages`, else the system language):
+    /// 0 Japanese, 1 English, 2 Simplified Chinese, 3 Traditional Chinese
+    language: usize,
+    /// sub_9A700: the language count of the SYSMES file (1 Japanese, 4 overseas)
+    languages: usize,
+    script_text: Vec<u8>,
     pub allpac: Arc<Archive>,
+    /// The second image archive (archive id 10): empty in the Japanese data; the overseas one holds the save
+    /// list pictures IMG6000..6026 and 140 other images allpac lacks, with their thumbnails
+    pub allpacml: Option<Arc<Archive>>,
     pub allpachd: Option<Arc<Archive>>,
     pub allpaccg: Option<Arc<Archive>>,
     pub allui: Arc<Archive>,
@@ -74,14 +96,68 @@ pub struct Assets {
     sounds: HashMap<String, Option<Arc<Pcm>>>,
 }
 
-/// The executable's tables, compiled in (`kdu exe-tables` writes them; knife_core::exe).
-pub fn exe_tables() -> Result<Nso> {
-    Nso::from_bundle(include_bytes!("../data/exe_tables.bin"))
+/// The build a romfs belongs to: the overseas data names its archives `w_allpac` / `w_allui` / ... (sub_AE050).
+pub fn detect_build(romfs: &Path) -> Build {
+    if romfs.join("w_allpac.nam").exists() { Build::Overseas } else { Build::Japanese }
+}
+
+/// The executable's tables for a build, compiled in (`kdu exe-tables` writes them; knife_core::exe).
+pub fn exe_tables(build: Build) -> Result<Nso> {
+    Nso::from_bundle(match build {
+        Build::Japanese => include_bytes!("../data/exe_tables.bin"),
+        Build::Overseas => include_bytes!("../data/exe_tables_overseas.bin"),
+    })
+}
+
+/// sub_2DE00: the game language of the console's desired language (nn::oe::GetDesiredLanguage, limited to the
+/// languages the title declares; the Japanese build declares only Japanese): Japanese 0, Simplified Chinese 2,
+/// Traditional Chinese 3, any other language 1 (English). knife takes the host locale for the console's.
+pub fn system_language(build: Build) -> i16 {
+    if build == Build::Japanese {
+        return 0;
+    }
+    let locale = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase().replace('_', "-");
+    let mut parts = locale.split('-');
+    match parts.next().unwrap_or("") {
+        "ja" => 0,
+        "zh" => {
+            let rest: Vec<&str> = parts.collect();
+            // zh-Hant / zh-TW / zh-HK / zh-MO are Traditional, other Chinese locales Simplified
+            if rest.iter().any(|p| matches!(*p, "hant" | "tw" | "hk" | "mo")) { 3 } else { 2 }
+        }
+        _ => 1,
+    }
+}
+
+/// The Japanese release's application title.
+pub const TITLE: &str = "月姫 -A piece of blue glass moon-";
+/// The overseas release's titles by game language (its control.nacp: Japanese, American English, Simplified and
+/// Traditional Chinese entries; the Chinese ones write 月姬, U+59EC).
+const OVERSEAS_TITLES: [&str; 4] =
+    [TITLE, "TSUKIHIME A piece of blue glass moon", "月姬 -A piece of blue glass moon-", "月姬 -A piece of blue glass moon-"];
+
+/// The SYSMES message the overseas build inserts at 217 (the "deleted" popup, `jp_50FC0` state 25). knife keeps
+/// the Japanese numbering and moves it here, past the Japanese build's 1498 messages.
+pub const SYSMES_DELETED: usize = 1498;
+const SYSMES_OVERSEAS_INSERT: usize = 217;
+
+/// The loaded executable is the overseas build (for tables that differ between the builds).
+static OVERSEAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn overseas() -> bool {
+    OVERSEAS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Assets {
-    pub fn open(romfs: &Path, nso: &Nso) -> Result<Self> {
+    /// `language` is the config word (`cfg::LANGUAGE`); `language()` resolves it like sub_2DE70.
+    pub fn open(romfs: &Path, nso: &Nso, language: i16) -> Result<Self> {
         let tables = ExeTables::load(nso)?;
+        let build = tables.build;
+        // sub_AE050: the overseas archives allpac / allpacml / allui / allpaccg carry a `w_` prefix
+        let w = |base: &str| match build {
+            Build::Overseas => format!("w_{base}"),
+            Build::Japanese => base.to_string(),
+        };
         let image_index = tables
             .images
             .iter()
@@ -89,23 +165,81 @@ impl Assets {
             .map(|(i, im)| (im.name.to_ascii_uppercase(), i))
             .collect();
         let scenes = SceneArchive::parse(&std::fs::read(romfs.join("allscr.mrg")).context("reading allscr.mrg")?)?;
-        let text = ScriptText::parse(&std::fs::read(romfs.join("script_text.mrg")).context("reading script_text.mrg")?, 0)?;
+        let script_text = std::fs::read(romfs.join("script_text.mrg")).context("reading script_text.mrg")?;
         let sar = SoundArchive::parse(std::fs::read(romfs.join("knife1.bfsar")).context("reading knife1.bfsar")?)?;
-        Ok(Self {
+        let allui = Arc::new(Archive::open(romfs, &w("allui"))?);
+        let languages = Self::sysmes_file(&allui, build).map_or(1, |d| sysmes_u32(&d, 0).unwrap_or(1).max(1) as usize);
+        let mut a = Self {
             romfs: romfs.to_path_buf(),
-            allpac: Arc::new(Archive::open(romfs, "allpac")?),
+            build,
+            language: 0,
+            languages,
+            text: ScriptText::parse(&script_text, 0)?,
+            script_text,
+            allpac: Arc::new(Archive::open(romfs, &w("allpac"))?),
+            allpacml: Archive::open(romfs, &w("allpacml")).ok().map(Arc::new),
             allpachd: Archive::open(romfs, "allpachd").ok().map(Arc::new),
-            allpaccg: Archive::open(romfs, "allpaccg").ok().map(Arc::new),
-            allui: Arc::new(Archive::open(romfs, "allui")?),
+            allpaccg: Archive::open(romfs, &w("allpaccg")).ok().map(Arc::new),
+            allui,
             tables,
             image_index,
             scenes,
-            text,
             sar,
             parsed: HashMap::new(),
             images: HashMap::new(),
             sounds: HashMap::new(),
-        })
+        };
+        crate::text::set_line_break(a.tables.line_break.clone());
+        OVERSEAS.store(a.build == Build::Overseas, std::sync::atomic::Ordering::Relaxed);
+        a.set_language(language)?;
+        Ok(a)
+    }
+
+    /// sub_2DE70: the game language for a config word (negative or past the data's languages: the system's).
+    pub fn resolve_language(&self, word: i16) -> usize {
+        if word >= 0 && (word as usize) < self.languages {
+            word as usize
+        } else {
+            system_language(self.build) as usize
+        }
+    }
+
+    pub fn language(&self) -> usize {
+        self.language
+    }
+
+    /// The application title in the game language, as the console shows it (`OVERSEAS_TITLES`; the Japanese
+    /// release has its one title).
+    pub fn title(&self) -> &'static str {
+        match self.build {
+            Build::Overseas => OVERSEAS_TITLES.get(self.language).copied().unwrap_or(TITLE),
+            Build::Japanese => TITLE,
+        }
+    }
+
+    /// Switch to the language of a config word: the script text pair (sub_53CF0 reads script_text.mrg entries
+    /// 2 * language / 2 * language + 1) and the language-strip images (sub_3F130 / sub_3F1A0 rebuild them).
+    /// Returns whether the language changed.
+    pub fn set_language(&mut self, word: i16) -> Result<bool> {
+        let language = self.resolve_language(word);
+        if language == self.language && !self.text.is_empty() {
+            return Ok(false);
+        }
+        self.text = ScriptText::parse(&self.script_text, language)?;
+        self.language = language;
+        crate::text::set_language(language);
+        let (msg, bubble) = self.font_metrics();
+        crate::text::set_font_metrics(msg.line_feed, msg.ascent, msg.baseline, bubble.ascent);
+        let strips: Vec<String> = self
+            .images
+            .keys()
+            .filter(|k| self.image_info(k.split('#').next().unwrap_or(k)).is_some_and(|i| i.language_strips))
+            .cloned()
+            .collect();
+        for k in strips {
+            self.images.remove(&k);
+        }
+        Ok(true)
     }
 
     pub fn scene(&mut self, index: usize) -> Option<Arc<Scene>> {
@@ -141,9 +275,10 @@ impl Assets {
     /// The exe moves the anchor by the centre difference, so the base lands centred where the variant was.
     pub fn thumb_name(&self, name: &str) -> String {
         let upper = name.to_ascii_uppercase();
-        let base = match self.image_index_of(&upper).and_then(|i| self.tables.images.get(i)) {
+        let upper = upper.strip_prefix(THUMB).unwrap_or(&upper);
+        let base = match self.image_index_of(upper).and_then(|i| self.tables.images.get(i)) {
             Some(im) if im.variant && upper.len() > 6 => &upper[..upper.len() - 6],
-            _ => upper.as_str(),
+            _ => upper,
         };
         format!("{THUMB}{base}")
     }
@@ -168,9 +303,11 @@ impl Assets {
         None
     }
 
-    /// The image archives in lookup order.
+    /// The image archives in lookup order: jp_32360 resolves a name with jp_A90C0(name, -1), which searches
+    /// allpac (archive 9), then allpacml (10), then the others; allpac and allpacml come first here for
+    /// `image_bytes`' thumbnails.
     fn image_archives(&self) -> Vec<Arc<Archive>> {
-        [Some(&self.allpac), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
+        [Some(&self.allpac), self.allpacml.as_ref(), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
             .into_iter()
             .flatten()
             .cloned()
@@ -180,9 +317,13 @@ impl Assets {
     fn image_bytes(archives: &[Arc<Archive>], name: &str) -> Option<Vec<u8>> {
         if let Some(stem) = name.strip_prefix(THUMB) {
             // sub_895A0: the layer's allpac entry - (bg_top.mzp + 1) + (thumstand_top.mzp + 1), a copy of the
-            // art at 1/6 size (a 4x4 transparent DUMMY.NXZ for the `_aa_bb` variants and IMG7000 / IMG7001)
-            let a = archives.first()?;
-            let i = a.find_stem(stem)?.checked_sub(a.find_stem("BG_TOP")? + 1)? + a.find_stem("THUMSTAND_TOP")? + 1;
+            // art at 1/6 size (a 4x4 transparent DUMMY.NXZ for the `_aa_bb` variants and IMG7000 / IMG7001);
+            // an allpacml image (archive 10 / 12) its entry - (bgml_top + 1) + (thumstandml_top + 1) there
+            let ml = archives.iter().find(|a| a.name.ends_with("allpacml"));
+            let (a, base, thumbs) = [(archives.first(), "BG_TOP", "THUMSTAND_TOP"), (ml, "BGML_TOP", "THUMSTANDML_TOP")]
+                .into_iter()
+                .find_map(|(a, base, thumbs)| a.filter(|a| a.find_stem(stem).is_some()).map(|a| (a, base, thumbs)))?;
+            let i = a.find_stem(stem)?.checked_sub(a.find_stem(base)? + 1)? + a.find_stem(thumbs)? + 1;
             return a.read(i).inspect_err(|e| tracing::warn!("reading thumbnail {stem}: {e}")).ok();
         }
         for a in archives {
@@ -208,7 +349,7 @@ impl Assets {
         if let Some(i) = self.images.get(&key) {
             return i.clone();
         }
-        let pixels = Self::decode_pixels(&self.image_archives(), &name, grade);
+        let pixels = Self::decode_pixels(&self.image_archives(), &name, grade, self.strip(&name));
         self.finish_image(r, key, &name, pixels)
     }
 
@@ -230,9 +371,10 @@ impl Assets {
     pub fn decode_async(&self, name: &str, bake: Bake, done: std::sync::mpsc::Sender<Decoded>) {
         let (name, grade, k) = Self::image_key(name, bake);
         let archives = self.image_archives();
+        let strip = self.strip(&name);
         let spawned = std::thread::Builder::new().name("image decode".into()).spawn(move || {
-            let pixels = Self::decode_pixels(&archives, &name, grade);
-            let _ = done.send(Decoded { key: k, name, pixels });
+            let pixels = Self::decode_pixels(&archives, &name, grade, strip);
+            let _ = done.send(Decoded { key: k, name, strip, pixels });
         });
         if let Err(e) = spawned {
             tracing::warn!("image decode thread: {e}");
@@ -241,7 +383,8 @@ impl Assets {
 
     /// Upload and cache an image `decode_async` read.
     pub fn finish_decoded(&mut self, r: &Renderer, d: Decoded) {
-        if !self.images.contains_key(&d.key) {
+        // a language change while it decoded makes a language-strip image stale
+        if !self.images.contains_key(&d.key) && d.strip == self.strip(&d.name) {
             self.finish_image(r, d.key, &d.name, d.pixels);
         }
     }
@@ -266,13 +409,29 @@ impl Assets {
         self.images.retain(|_, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1));
     }
 
-    /// The CPU side of an image load (no renderer needed): archive read, BNTX parse or image decode, grade.
-    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: Bake) -> Result<Pixels> {
+    /// The (strip, strip count) an image draws: a language-strip image (overseas ImageInfo +67 bit 1) stacks
+    /// one copy per language, and a layer draws the game language's (sub_374F0 / sub_375D0 source rectangle
+    /// `[0, language * h / n, w, h / n]`, n = sub_9A700).
+    fn strip(&self, name: &str) -> Option<(usize, usize)> {
+        let base = name.strip_prefix(THUMB).unwrap_or(name);
+        let i = self.image_index_of(base)?;
+        self.tables.images.get(i).filter(|im| im.language_strips).map(|_| (self.language, self.languages))
+    }
+
+    /// The CPU side of an image load (no renderer needed): archive read, BNTX parse or image decode, grade, and
+    /// the language strip.
+    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: Bake, strip: Option<(usize, usize)>) -> Result<Pixels> {
         let data = Self::image_bytes(archives, name).context("not found")?;
-        if grade.is_none() && bntx::is_bntx(&data) {
+        if grade.is_none() && strip.is_none() && bntx::is_bntx(&data) {
             return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?));
         }
-        let (w, h, mut px) = decode_image(&data)?;
+        let (w, mut h, mut px) = decode_image(&data)?;
+        if let Some((k, n)) = strip {
+            let rows = h / n as u32;
+            let top = (h as usize * k / n) * w as usize * 4;
+            px = px[top..top + (rows * w) as usize * 4].to_vec();
+            h = rows;
+        }
         grade.apply(&mut px);
         Ok(Pixels::Rgba(w, h, px))
     }
@@ -320,6 +479,37 @@ impl Assets {
             let tex = upload_bntx(r, &t)?;
             out.push((t.name.clone(), tex));
         }
+        // the game picks atlas images by index (the object table, sub_9A940); the other languages' atlases
+        // (`NAME_<FOLDER>`) hold the same images in the same order under their own names (`title_titlelog_en`,
+        // `caution_en`, `flow_info_en`, ...), so the UI also finds them under the Japanese atlas's names
+        let ja_names: Vec<String> = stem
+            .rsplit_once('_')
+            .filter(|(_, l)| !l.eq_ignore_ascii_case("ja"))
+            .and_then(|(base, _)| self.allui.find_stem(&format!("{base}_JA")))
+            .and_then(|j| self.allui.read(j).ok())
+            .and_then(|d| bntx::parse(&d).ok())
+            .map(|ts| ts.into_iter().map(|t| t.name).collect())
+            .unwrap_or_default();
+        if !ja_names.is_empty() && ja_names.len() != out.len() {
+            tracing::warn!("{stem}: {} images, the Japanese atlas {}", out.len(), ja_names.len());
+        }
+        let aliases: Vec<(String, TexRef)> = ja_names
+            .into_iter()
+            .zip(&out)
+            .filter(|(ja, (n, _))| ja != n)
+            .map(|(ja, (_, t))| (ja, t.clone()))
+            .collect();
+        out.extend(aliases);
+        // the overseas Japanese atlas also renames some images the Japanese release has without a suffix
+        // (`system_bg` -> `system_bg_ja`); the UI uses the Japanese release's names
+        let aliases: Vec<(String, TexRef)> = out
+            .iter()
+            .filter_map(|(n, t)| {
+                let base = n.strip_suffix("_ja")?;
+                (!out.iter().any(|(m, _)| m == base)).then(|| (base.to_string(), t.clone()))
+            })
+            .collect();
+        out.extend(aliases);
         Ok(out)
     }
 
@@ -350,24 +540,115 @@ impl Assets {
         load().map_err(|e| tracing::warn!("parts #{index}: {e:#}")).ok()
     }
 
-    /// SYSMES_TEXT.DAT: system strings indexed by id (u32 lang count, u32 count, u64 0, u64 table offset,
-    /// then u64 offsets of NUL-terminated UTF-8 strings; entry 0 is the language code).
+    /// The SYSMES file: SYSMES_TEXT in the Japanese allui, SYSMES_TEXT_ML in the overseas w_allui (jp_9A420).
+    fn sysmes_file(allui: &Archive, build: Build) -> Option<Vec<u8>> {
+        let stem = match build {
+            Build::Japanese => "SYSMES_TEXT",
+            Build::Overseas => "SYSMES_TEXT_ML",
+        };
+        allui.read(allui.find_stem(stem)?).ok()
+    }
+
+    /// The game language's system strings, indexed by the Japanese build's ids (u32 language count, u32 count,
+    /// u64 0, then per language a u64 offset of a table of u64 offsets of NUL-terminated UTF-8 strings; entry 0
+    /// is the language's folder name). The overseas file's message 217 moves to `SYSMES_DELETED`.
     pub fn sysmes(&self) -> Vec<String> {
         let parse = || -> Option<Vec<String>> {
-            let d = self.allui.read(self.allui.find_stem("SYSMES_TEXT")?).ok()?;
-            let u32_at = |o: usize| Some(u32::from_le_bytes(d.get(o..o + 4)?.try_into().ok()?));
-            let u64_at = |o: usize| Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?) as usize);
-            let n = u32_at(4)? as usize;
-            let table = u64_at(0x10)?;
-            (0..n)
+            let d = Self::sysmes_file(&self.allui, self.build)?;
+            let n = sysmes_u32(&d, 4)? as usize;
+            let table = sysmes_u64(&d, 0x10 + 8 * self.language)?;
+            let mut v = (0..n)
                 .map(|i| {
-                    let o = u64_at(table + 8 * i)?;
+                    let o = sysmes_u64(&d, table + 8 * i)?;
                     let end = d.get(o..)?.iter().position(|&b| b == 0)?;
                     Some(String::from_utf8_lossy(&d[o..o + end]).into_owned())
+                })
+                .collect::<Option<Vec<String>>>()?;
+            if self.build == Build::Overseas && v.len() > SYSMES_OVERSEAS_INSERT {
+                let deleted = v.remove(SYSMES_OVERSEAS_INSERT);
+                v.resize(SYSMES_DELETED, String::new());
+                v.push(deleted);
+            }
+            Some(v)
+        };
+        parse().unwrap_or_default()
+    }
+
+    /// The button guide's help_txt word cells of the game language (CONTHELP_TXT_UV.BIN, jp_9A420 / jp_9A710:
+    /// i16 count, then from byte 8 per language `count` cells of i16 x0 y0 x1 y1).
+    pub fn guide_words(&self) -> Vec<[u16; 4]> {
+        let parse = || -> Option<Vec<[u16; 4]>> {
+            let d = self.allui.read(self.allui.find_stem("CONTHELP_TXT_UV")?).ok()?;
+            let n = i16::from_le_bytes(d.get(0..2)?.try_into().ok()?).max(0) as usize;
+            let base = 8 + 8 * n * self.language;
+            (0..n)
+                .map(|i| {
+                    let c = d.get(base + 8 * i..base + 8 * i + 8)?;
+                    Some([0, 2, 4, 6].map(|k| u16::from_le_bytes([c[k], c[k + 1]])))
                 })
                 .collect()
         };
         parse().unwrap_or_default()
+    }
+
+    /// A system atlas of the game language (jp_9A940: the object table's `name.nxgz` becomes
+    /// `name_<language folder>.nxgz`, found case-insensitively; SELECT_PARTS_JA alone is named in full).
+    pub fn ui_atlas(&self, stem: &str) -> String {
+        format!("{stem}_{}", self.language_folder().to_ascii_uppercase())
+    }
+
+    /// sub_AB0F0: the first file of the language's font folder `<folder><suffix>` (suffix "" the story text,
+    /// "2" the UI text, "3" the bubble text).
+    pub fn font_path(&self, suffix: &str) -> Option<PathBuf> {
+        let dir = self.romfs.join(format!("{}{suffix}", self.language_folder()));
+        let mut files: Vec<PathBuf> =
+            std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file()).collect();
+        files.sort();
+        files.into_iter().next()
+    }
+
+    /// The pair font metrics at the 40 px base size (sub_CAE88, `sfnt::pair_metrics`) of the message font set
+    /// (the language's three fonts sub_AB0F0 loads) and of the bubble font (`<folder>3`), each paired with the
+    /// exfont: line feed / ascent / baseline position Japanese 50 / 41 / 41, English 53 / 43 / 40 (bubble ascent
+    /// 41), Simplified Chinese 49 / 39 / 39, Traditional Chinese 47 / 39 / 37 (the exfont's); the Japanese ones
+    /// without font files.
+    fn font_metrics(&self) -> (sfnt::SetMetrics, sfnt::SetMetrics) {
+        use knife_core::format::{bffnt, bfttf};
+        let read = |p: PathBuf| std::fs::read(p).ok().map(|d| bfttf::decode(&d).unwrap_or(d));
+        let set = |suffixes: &[&str]| {
+            let m: Vec<sfnt::Metrics> =
+                suffixes.iter().filter_map(|s| self.font_path(s)).filter_map(read).filter_map(|d| sfnt::metrics(&d)).collect();
+            sfnt::set_metrics(&m, crate::text::BASE_SIZE)
+        };
+        let ex = std::fs::read(self.romfs.join("exfont_nx01.bffnt"))
+            .ok()
+            .and_then(|d| bffnt::Font::parse(&d).ok())
+            .map(|f| sfnt::SetMetrics {
+                height: i32::from(f.height),
+                ascent: i32::from(f.ascent),
+                line_feed: i32::from(f.line_feed),
+                baseline: i32::from(f.baseline),
+            });
+        let ja = sfnt::SetMetrics { height: 50, ascent: 41, line_feed: 50, baseline: 41 };
+        let msg = set(&["", "2", "3"]).map_or(ja, |m| sfnt::pair_metrics(m, ex));
+        let bubble = set(&["3"]).map_or(msg, |m| sfnt::pair_metrics(m, ex));
+        (msg, bubble)
+    }
+
+    /// The console shared font sub_AB0F0 asks for (sub_C9F3C: nn::pl::GetSharedFont with the language code of
+    /// dword_3C97F0[language]: ja / en-US share the standard font, zh-Hans / zh-Hant get the Chinese ones).
+    pub fn shared_font_names(&self) -> &'static [&'static str] {
+        match self.language {
+            2 => &["nintendo_udsg-r_org_zh-cn_003.bfttf", "nintendo_udsg-r_std_003.bfttf"],
+            3 => &["nintendo_udjxh-db_zh-tw_003.bfttf", "nintendo_udsg-r_std_003.bfttf"],
+            _ => &["nintendo_udsg-r_std_003.bfttf"],
+        }
+    }
+
+    /// A per-language romfs file (sub_AB0F0 fonts, the save icon, movies): `<stem>` in Japanese, else
+    /// `<stem>_en` / `_zc` / `_zt` (the language folder names, SYSMES entry 0).
+    pub fn language_folder(&self) -> &'static str {
+        ["ja", "en", "zc", "zt"].get(self.language).copied().unwrap_or("ja")
     }
 
     /// Decode a sound effect from the BFSAR (`MOON_SE03001` -> `WSD_moon_se03001`).
@@ -449,3 +730,10 @@ fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((img.width(), img.height(), img.into_raw()))
 }
 
+fn sysmes_u32(d: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(o..o + 4)?.try_into().ok()?))
+}
+
+fn sysmes_u64(d: &[u8], o: usize) -> Option<usize> {
+    Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?) as usize)
+}

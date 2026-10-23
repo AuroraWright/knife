@@ -104,6 +104,8 @@ pub struct Touch {
     /// left button: where it went down (units), whether it became a drag, whether its release is swallowed
     press: Option<[f32; 2]>,
     dragged: bool,
+    /// frames the button has been down (sub_AD4E0: release frame - qword_17FC720)
+    down_t: f32,
     swallow: bool,
     /// frames left of touch visibility (off_AE02C8 + 0xC: 256 while a finger is down, then counting down),
     /// the button / finger is down (+8), and where it last was (units, +0x2C / +0x30: it stays there after
@@ -111,7 +113,7 @@ pub struct Touch {
     /// screen.
     visible: f32,
     pub(super) down: bool,
-    at: [f32; 2],
+    pub(super) at: [f32; 2],
     /// drag arrow: alpha (off_AE0600), effect fade (dword_AFECA4), start (units) and stretch
     arrow_a: f32,
     arrow_fx: f32,
@@ -144,6 +146,9 @@ pub struct Touch {
     hovered: bool,
     held_frames: f32,
     flash: [f32; 8],
+    /// The buttons' object flag 2 (objects 207..214, sub_ADE80): previous scene / next scene / Q.SAVE /
+    /// Q.LOAD unavailable, auto lit. The objects start without it (unk_5918C8: flags 0x320).
+    pflags: [bool; 8],
     /// The panel's selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad,
     /// which the next opening starts on (LODWORD)
     pub panel_key: Option<usize>,
@@ -163,6 +168,7 @@ impl Touch {
             ripples: [None; RIPPLES],
             press: None,
             dragged: false,
+            down_t: 0.0,
             swallow: false,
             visible: 0.0,
             down: false,
@@ -186,6 +192,7 @@ impl Touch {
             hovered: false,
             held_frames: 0.0,
             flash: [0.0; 8],
+            pflags: [false; 8],
             panel_key: None,
             // sub_4DCC0: the panel's cursor starts on fast forward
             panel_last: 3,
@@ -299,6 +306,7 @@ impl Ui {
         self.touch.hovered = true;
         self.touch.visible = 256.0;
         self.touch.down = true;
+        self.touch.down_t = 0.0;
         self.touch.at = self.units();
         // a touch inside the screen's drag rect (sub_6A0 before sub_40C) is tracked; the config only takes
         // one that is on none of its objects (sub_40C a2 = sub_AE0B0 < 0)
@@ -315,13 +323,24 @@ impl Ui {
         {
             self.drag.press(y);
         }
-        if !self.busy() && self.popup.is_none() && self.bar_grab(y) {
+        if self.popup.is_some() {
+            // sub_49750 takes no touch-down: only the release closes the popup
+            self.touch.press = Some(self.units());
+            self.touch.dragged = false;
+            return;
+        }
+        if !self.busy() && self.bar_grab(y) {
             return;
         }
         if matches!(self.screen, Screen::Game | Screen::CgView { .. }) {
             self.touch.press = Some(self.units());
             self.touch.dragged = false;
             return;
+        }
+        // the system menu acts on the touch at once but also reads its release swipe (sub_4CEA0)
+        if self.screen == Screen::Menu {
+            self.touch.press = Some(self.units());
+            self.touch.dragged = false;
         }
         self.click(game, r);
     }
@@ -332,8 +351,27 @@ impl Ui {
         self.bar = None;
         let Some(start) = self.touch.press.take() else { return };
         let swallow = std::mem::take(&mut self.touch.swallow);
+        if self.popup.is_some() {
+            // sub_49750 closes on +0x34 bit 0x2000: a release after 7..199 frames held without a drag
+            // (sub_AD4E0); a quicker tap leaves it up
+            if !self.touch.dragged && (7.0..200.0).contains(&self.touch.down_t) {
+                self.popup_input();
+            }
+            return;
+        }
         if matches!(self.screen, Screen::CgView { .. }) {
             self.cg_flick(game);
+            return;
+        }
+        // sub_4CEA0: a left or up swipe (+0x54 bits 1 / 4) closes the system menu like B
+        if self.screen == Screen::Menu && self.touch.dragged && !self.busy() {
+            let [x, y] = self.units();
+            let [px, py] = self.touch.trail[1];
+            let (dx, dy) = (x - px, y - py);
+            let horiz = dx.abs() > dy.abs();
+            if (horiz && dx <= -7.0) || (!horiz && dy <= -7.0) {
+                self.cancel(game, r);
+            }
             return;
         }
         if self.screen != Screen::Game {
@@ -470,13 +508,30 @@ impl Ui {
         }
     }
 
+    /// sub_4E0C0: objects 211..213 take flag 2 for the unavailable next scene / Q.SAVE / Q.LOAD. It runs when
+    /// the panel has slid open (sub_4E170 state 2), as the story starts (sub_48AC0 case 2) and, in the
+    /// overseas build, as the panel opens (state 1).
+    fn panel_flags_save(&mut self, game: &Game) {
+        for b in 4..=6 {
+            self.touch.pflags[b] = !self.panel_ok(game, b);
+        }
+    }
+
+    /// sub_4E170 state 3, every frame but the one that closes it (the overseas build's sub_4F100, also called
+    /// as the panel opens): object 209 lit in auto mode, 207 unavailable without a previous scene.
+    fn panel_flags_scene(&mut self, game: &Game) {
+        self.touch.pflags[2] = game.auto;
+        self.touch.pflags[0] = !game.can_prev_scene();
+    }
+
     /// A tapped mode panel button (sub_4E170 state 3 cases 0..7; 1 and 3 act while held, see `touch_update`).
     pub(super) fn panel_press(&mut self, game: &mut Game, r: &Renderer, b: usize) {
         self.touch.flash[b] = 10.0;
         // sub_4E170: a button that acts plays system sound 1 (before its dialog), an unavailable one sound 2
         match b {
             // previous / next scene and quick load ask first (dialogs 11, 10, 9)
-            0 if game.can_prev_scene() => {
+            // cases 0 / 4 test the objects' flag 2 (sub_ADE60(207 / 211, 2)), 5 / 6 sub_47B10 itself
+            0 if !self.touch.pflags[0] => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::PrevScene);
             }
@@ -484,11 +539,12 @@ impl Ui {
                 self.snd(game, 1);
                 self.toggle_auto(game);
             }
-            4 if self.panel_ok(game, 4) => {
+            4 if !self.touch.pflags[4] => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::NextScene);
             }
-            5 if game.can_save() && self.panel_ok(game, 5) => {
+            // case 5 also wants dword_AFFCC4 run out (sub_40E90)
+            5 if game.can_save() && self.panel_ok(game, 5) && self.save_cool == 0 => {
                 self.snd(game, 1);
                 self.quick_save(game, r);
             }
@@ -505,6 +561,10 @@ impl Ui {
 
     /// Per frame (60 Hz frames `f`), after the game update.
     pub(super) fn touch_update(&mut self, game: &mut Game, r: &Renderer, secs: f32, f: f32) {
+        // sub_48AC0 case 2 runs sub_4E0C0 as the story starts: outside the story the flags follow it
+        if self.screen != Screen::Game && !self.stack.contains(&Screen::Game) {
+            self.panel_flags_save(game);
+        }
         for s in &mut self.touch.ripples {
             if let Some((_, t)) = s {
                 *t += secs;
@@ -530,6 +590,9 @@ impl Ui {
             *h += f;
         }
         self.touch.visible = if self.touch.down { 256.0 } else { (self.touch.visible - f).max(0.0) };
+        if self.touch.down {
+            self.touch.down_t += f;
+        }
         for v in &mut self.touch.flash {
             *v = (*v - f).max(0.0);
         }
@@ -703,10 +766,16 @@ impl Ui {
                 }
             }
             Panel::Opening => {
+                if self.touch.panel_t == 0.0 && game.assets.build == knife_core::exe::Build::Overseas {
+                    // overseas sub_4E170 state 1: sub_4E0C0 and sub_4F100 before the slide
+                    self.panel_flags_save(game);
+                    self.panel_flags_scene(game);
+                }
                 self.touch.panel_t += 0.05 * f;
                 if self.touch.panel_t >= 1.0 {
                     self.touch.panel_t = 1.0;
                     self.touch.panel = Panel::Open;
+                    self.panel_flags_save(game);
                     self.show_window();
                     // state 3 reads the pointed object every frame: a pointer resting on a button takes it
                     if let Some(h) = self.panel_button() {
@@ -732,6 +801,8 @@ impl Ui {
                 }
                 if self.screen == Screen::Game && game.choice_question() {
                     self.touch.panel = Panel::Closing;
+                } else {
+                    self.panel_flags_scene(game);
                 }
             }
             Panel::Closing => {
@@ -792,7 +863,7 @@ impl Ui {
         game.hold = self.touch.scene_cd.is_some();
     }
 
-    pub(super) fn draw_touch_game(&self, game: &Game, r: &Renderer, out: &mut Vec<Quad>) {
+    pub(super) fn draw_touch_game(&self, r: &Renderer, out: &mut Vec<Quad>) {
         // sub_3EF20, first in sub_3C510: the countdown's black over the screen
         if self.touch.cd_black > 0.0 {
             out.push(Quad::rect(r.white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, self.touch.cd_black.min(1.0)]));
@@ -833,10 +904,10 @@ impl Ui {
             let hover = self.touch.panel_hover.or(self.touch.panel_key).filter(|_| !dialog);
             let pressing = (self.touch.press.is_some() && self.touch.panel_hover.is_some()) || (self.enter_held && self.touch.panel_key.is_some());
             for i in 0..8 {
-                // states (sub_ADE80 flag 2): previous scene unavailable -> dark; auto on -> lit
-                let row = if (i == 0 && !game.can_prev_scene()) || !self.panel_ok(game, i) {
+                // states (sub_ADE80 flag 2): an unavailable button dark, auto lit
+                let row = if i != 2 && self.touch.pflags[i] {
                     0.0
-                } else if self.touch.flash[i] > 0.0 || (i == 2 && game.auto) || (pressing && hover == Some(i)) {
+                } else if self.touch.flash[i] > 0.0 || (i == 2 && self.touch.pflags[2]) || (pressing && hover == Some(i)) {
                     3.0
                 } else if hover == Some(i) {
                     2.0

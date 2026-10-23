@@ -11,6 +11,9 @@ struct Cli {
     /// Path to the extracted romfs directory
     #[arg(long, default_value = "switch_romfs")]
     romfs: PathBuf,
+    /// Script text language for line / lines (0 Japanese, 1 English, 2 / 3 Chinese; overseas data only)
+    #[arg(long, default_value_t = 0)]
+    language: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -33,7 +36,8 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Write the executable ranges knife uses (knife_core::exe::BUNDLED) as knife's bundled tables
+    /// Write the executable ranges knife uses (knife_core::exe::Layout::bundled) as knife's bundled tables
+    /// (knife/data/exe_tables_overseas.bin for switch_exefs_eng/uncompressed_main)
     ExeTables {
         #[arg(long, default_value = "switch_exefs/uncompressed_main")]
         exe: PathBuf,
@@ -166,12 +170,12 @@ fn main() -> Result<()> {
         }
         Cmd::Line { index } => {
             let data = std::fs::read(cli.romfs.join("script_text.mrg"))?;
-            let t = script::ScriptText::parse(&data, 0)?;
+            let t = script::ScriptText::parse(&data, cli.language)?;
             println!("{}", t.get(index).context("no such line")?);
         }
         Cmd::Lines => {
             let data = std::fs::read(cli.romfs.join("script_text.mrg"))?;
-            let t = script::ScriptText::parse(&data, 0)?;
+            let t = script::ScriptText::parse(&data, cli.language)?;
             for i in 0..t.len() {
                 println!("{i}\t{}", t.get(i).unwrap_or(""));
             }
@@ -190,7 +194,7 @@ fn main() -> Result<()> {
                         out.file_stem().unwrap().to_string_lossy(),
                         t.name
                     ));
-                    println!("{} {:?} {}x{}", t.name, t.format, t.width, t.height);
+                    println!("{} {:?} {}x{} mips {}", t.name, t.format, t.width, t.height, t.mips);
                     let rgba = knife_core::format::bntx_decode::to_rgba8(&t)?;
                     image::save_buffer(&path, &rgba, t.width, t.height, image::ExtendedColorType::Rgba8)?;
                 }

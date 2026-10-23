@@ -3,10 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use knife_core::exe::{
-    MOTION_COUNT, MOTION_ENDS as ENDS_VA, MOTION_KEY_COUNT as KEY_COUNT, MOTION_KEYS as KEYS_VA,
-    MOTION_LENS as LENS_VA, MOTION_MASK_COUNT as MASK_COUNT, MOTION_MASKS as MASKS_VA, Nso,
-};
+use knife_core::exe::{MOTION_COUNT, MOTION_KEY_COUNT as KEY_COUNT, MOTION_MASK_COUNT as MASK_COUNT, Nso};
 
 use crate::motion_loops::MOTION_LOOPS;
 
@@ -85,7 +82,8 @@ fn rd_u32(nso: &Nso, va: u64) -> Option<u32> {
 
 impl MotionTable {
     pub fn load(nso: &Nso) -> Result<Self> {
-        let raw = nso.bytes(KEYS_VA, KEY_COUNT * 64).context("motion keys out of range")?;
+        let l = nso.layout()?;
+        let raw = nso.bytes(l.motion_keys, KEY_COUNT * 64).context("motion keys out of range")?;
         let keys = raw
             .as_chunks::<64>().0.iter()
             .map(|k| {
@@ -103,14 +101,14 @@ impl MotionTable {
             })
             .collect();
         let ends = (0..MOTION_COUNT)
-            .map(|i| rd_u32(nso, ENDS_VA + i as u64 * 4).unwrap_or(0))
+            .map(|i| rd_u32(nso, l.motion_ends + i as u64 * 4).unwrap_or(0))
             .collect();
         let lens = (0..MOTION_COUNT)
-            .map(|i| rd_u32(nso, LENS_VA + i as u64 * 4).unwrap_or(0))
+            .map(|i| rd_u32(nso, l.motion_lens + i as u64 * 4).unwrap_or(0))
             .collect();
         let masks = (0..MASK_COUNT)
             .map(|i| {
-                nso.bytes(MASKS_VA + i as u64 * 8, 8)
+                nso.bytes(l.motion_masks + i as u64 * 8, 8)
                     .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
             })
             .collect();

@@ -6,3 +6,6 @@
 .DS_Store
 __pycache__/
 /AGENTS.md
+/switch_romfs_en
+/switch_exefs_eng
+/tools/envydis

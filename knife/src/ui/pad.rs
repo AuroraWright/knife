@@ -72,6 +72,7 @@ impl Ui {
             Pad::Y | Pad::ZL if self.screen == Screen::Menu => self.cancel(game, r),
             Pad::X | Pad::ZL if matches!(self.screen, Screen::Backlog { .. }) => self.cancel(game, r),
             Pad::ZR if matches!(self.screen, Screen::Backlog { .. }) => self.shoulder(game, r, -1),
+            Pad::X if matches!(self.screen, Screen::SaveLoad { .. }) => self.save_delete_key(game),
             // CG viewer (sub_C56C): Minus zooms to fill the screen, R3 back to the fit scale, centred; sound 0
             // the gallery movie player takes B / Plus (mask 0x4008) only
             Pad::Plus if self.screen == Screen::MoviePlay => self.gal_movie_skip(game),

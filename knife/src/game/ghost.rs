@@ -29,7 +29,7 @@ pub struct Ghost {
     phase: i32,
     curve: f32,
     /// word_AFEB94: the phase wrapped once (the wobble stops), angle direction (+3 / -3)
-    wrapped: bool,
+    pub(crate) wrapped: bool,
     up: bool,
     /// AFEBF8: current shift amplitude (960-wide pixels)
     amp: f32,

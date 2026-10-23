@@ -151,12 +151,20 @@ pub fn set_file(path: PathBuf) {
     let _ = SAVE_FILE.set(path);
 }
 
-/// The save file: `--save-file`, else `knife/savedata000` in the OS application data directory (the working
-/// directory when the OS has none), as shin does.
+/// The default save file of a build: `knife/savedata000` (the overseas data: `knife/overseas/savedata000`, a
+/// separate title on the Switch) in the OS application data directory (the working directory when the OS has
+/// none), as shin does.
+pub fn default_file(build: knife_core::exe::Build) -> PathBuf {
+    let dir = dirs::data_dir().unwrap_or_default().join("knife");
+    match build {
+        knife_core::exe::Build::Japanese => dir.join("savedata000"),
+        knife_core::exe::Build::Overseas => dir.join("overseas").join("savedata000"),
+    }
+}
+
+/// The save file: `--save-file`, else `default_file`.
 pub fn file() -> PathBuf {
-    SAVE_FILE
-        .get_or_init(|| dirs::data_dir().unwrap_or_default().join("knife").join("savedata000"))
-        .clone()
+    SAVE_FILE.get_or_init(|| default_file(knife_core::exe::Build::Japanese)).clone()
 }
 
 /// The local wall-clock time as seconds since 1970-01-01 00:00 of the same clock: save records store the date

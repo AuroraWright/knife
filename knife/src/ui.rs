@@ -23,8 +23,14 @@ const H: f32 = CANVAS_H as f32;
 const SLOTS_PER_PAGE: usize = 4;
 /// Baseline of a text slot in the shared system font, as a ratio of the glyph height below the slot's y:
 /// Switch (music panel title, credits, time and volume at 29.87 / 24.89 px glyphs, the help balloon at
-/// 22.2 px) 0.1 em below the message font's ascent ratio.
-const SYS_ASCENT: f32 = crate::game::LAYOUT.ascent / crate::game::LAYOUT.size + 0.1;
+/// 22.2 px; Chinese config labels within 0.1 px) 1.156: the system pair font's ascent at 40 px, the standard
+/// font's 45 (1158 of 1024), + 1.24.
+const SYS_ASCENT: f32 = 1.156;
+
+/// sub_A7790's glyph scale of the language (English 0.9): text slot baselines and pitches follow the glyphs.
+fn gs() -> f32 {
+    crate::text::glyph_scale()
+}
 /// Canvas distance between save list frames (`save_frame`).
 pub const SAVE_PITCH: f32 = 93.748 * H / 448.0;
 /// Trackpad travel (canvas px on screen) that scrolls the save list a row.
@@ -37,7 +43,6 @@ pub enum Confirm {
     Load(usize),
     /// flowchart rewind to the record (table row, id, scene id) under the cursor (dialog 26)
     Jump(usize, i32, i32),
-    Movie(usize),
     /// mode panel: previous scene, next scene, quick load (dialogs 11, 10, 9)
     PrevScene,
     NextScene,
@@ -49,6 +54,8 @@ pub enum Confirm {
     BacklogJump,
     /// system menu FlowChart during a gallery flowchart replay: end the replay (dialog 12)
     EndReplay,
+    /// overseas save list X: delete the save (dialog 21)
+    Delete(usize),
 }
 
 impl Confirm {
@@ -68,13 +75,14 @@ impl Confirm {
             // sub_50FC0 load mode: sub_49710(0, 0), Yes first (Switch: title LOAD GAME)
             Confirm::Load(_) => (179, false),
             Confirm::Jump(..) => (1497, false),
-            Confirm::Movie(_) => (1443, true),
             Confirm::PrevScene => (233, true),
             Confirm::NextScene => (232, true),
             Confirm::QuickLoad => (230, true),
             Confirm::Ending(i) => (crate::gallery::ENDINGS[i].2, true),
             Confirm::Defaults => (160, true),
             Confirm::BacklogJump => (231, true),
+            // sub_50FC0 (overseas): sub_49710(21, 1)
+            Confirm::Delete(_) => (182, true),
         }
     }
 }
@@ -252,6 +260,24 @@ pub struct Ui {
     /// frames since a successful save write (sub_50FC0 states 8 / 9): sound 1 as the popup closes at 30, the
     /// list is rebuilt 41 frames after that; input waits meanwhile
     save_wait: Option<f32>,
+    /// overseas save deletion (sub_50FC0 states 23..25): frames since the record went
+    delete_wait: Option<f32>,
+    /// dword_AFFCC4: frames left before the next save write (sub_40E70: 0 at boot, 180 after a quick save, the
+    /// system menu's auto save and, overseas, a deletion). sub_48AC0 counts it down each frame outside the
+    /// title (off_AE04E8 2 / 3: the story, its menus and the title's load list). While it runs (sub_40E90)
+    /// the panel's quick save plays sound 2, the save list ignores A on an entry and the auto save
+    /// (sub_52AA0) only reaches the in-memory records, without a file write or banner.
+    save_cool: u32,
+    /// dword_F1F460: the save list's cursor flash, set to 1 when a touch, the pad or the scroller moves the
+    /// cursor (sub_50FC0 state 2, not the list rebuilds); sub_4F240 draws the selected frame again over the
+    /// cursor entry with blend 30 at that times the page alpha and lowers it by 0.2 per draw
+    save_flash: f32,
+    /// the save list's (page, cursor, scroll) last frame, to see the cursor moves that light the flash
+    save_seen: Option<(bool, Option<usize>, usize)>,
+    /// text slot 38, the info panel's notes: sub_50B10 lays out the cursor entry's text on opening, cursor
+    /// moves and list rebuilds only, so while a save is written into the free entry (state 7) the panel
+    /// shows the new record with the notes of the entry the cursor had (none for the free entry)
+    save_notes: Option<String>,
     /// the slot being saved until the list is rebuilt (sub_50FC0 state 9): its record already shows the new
     /// save (state 7 copies it into the list records), its old thumbnail stays until then
     save_pending: Option<usize>,
@@ -262,6 +288,10 @@ pub struct Ui {
     /// the confirm dialog after A / B (sub_49F00)
     dlg_out: Option<DlgOut>,
     title_movie: bool,
+    /// the touch back button (sub_4A7A0, object 81 sliding in from x 1920 to 1640 at y 952): shown 0..1
+    /// (jd_B34B38, 0.04 a frame while a screen has it on with sub_4A790(1)); docked it is drawn at alpha 0
+    /// (sub_FBED4 == 1), but its tap zone still works
+    back_btn: f32,
     /// the title was up last frame: entering it (sub_8D2E0) and leaving it (sub_90180) step the title stage
     on_title: bool,
     complete: Option<Complete>,
@@ -297,6 +327,8 @@ pub struct Ui {
     last_track: Option<usize>,
     /// SYSMES_TEXT strings (music titles), loaded on first use
     sysmes: Vec<String>,
+    /// help_txt word cells of the language (CONTHELP_TXT_UV, jp_9A710), and that language
+    guide_words: (usize, Vec<[u16; 4]>),
     /// seconds since the title screen appeared (logo / menu fade-in)
     title_clock: f32,
     /// CG grid cursor group and the title_clock when it landed there (its glow flash restarts on each move)
@@ -375,6 +407,8 @@ pub struct Ui {
     gal_ret: [i32; 3],
     /// cGalleryMenu + 60: the mode shown before the current one
     gal_prev: i32,
+    /// The mode the next gallery open starts on (off_AE0288[0] taken by cGallery state 0).
+    gal_first: i32,
     /// a replay picked in the gallery waits for the gallery to fade out: (scene id, node, mode before)
     replay_pending: Option<(i32, i32, i32)>,
     /// colour of that overlay (NEW GAME fades to white)
@@ -483,6 +517,13 @@ pub struct Ui {
     conf_test_row: Option<usize>,
     /// dword_46F81C: frames a held - / + waits before it repeats (20 from the press, then a step every frame)
     conf_hold: u32,
+    /// overseas language change (sub_2D720 / sub_2D910's dword_9D3A44 steps) and the button it shows picked
+    lang_seq: Option<LangSeq>,
+    lang_pick: Option<usize>,
+    /// dword_9D3A60: config input waits these frames (counted down once no capture shows)
+    lang_cool: u32,
+    /// time towards the next 60 Hz step of `lang_seq` / `lang_cool`
+    lang_ms: f32,
     /// a held control changed a setting; the file is written once the hold ends
     conf_hold_dirty: bool,
     /// the confirm button is held (a held A with left / right drags a config slider)
@@ -500,10 +541,60 @@ const CONF_VIEW: [f32; 4] = [407.0, 165.0, 1402.0, 858.0];
 /// Scroll range per tab in canvas pixels (qword_46F810 + 16).
 /// Config scroll range of the system tab (0x46F820); the sound tab's follows its rows (conf_max).
 const CONF_MAX_SYSTEM: f32 = 485.0;
+/// The overseas system tab's range (0x35EF00): the language row sits below the radios.
+const CONF_MAX_SYSTEM_EN: f32 = 750.0;
+/// Overseas btn_base1 cells (x0, y0, x1, y1) of the radio objects 69 / 70 / 72..77 (frames 0x35EA98..) for
+/// columns normal / hover / selected, drawn without offset; `english` takes sub_2BFE0's widths for objects
+/// 74 (normal only) / 75 / 77 (241 / 441 / 448..889 / 896..1337 against 240 / 256..496 / 512..752).
+fn en_radio_cell(k: usize, v: bool, col: usize, english: bool) -> [f32; 4] {
+    let c = col as f32;
+    let narrow = |y: f32| [256.0 * c, y, 256.0 * c + 240.0, y + 48.0];
+    let wide = |y: f32| match col {
+        0 => [0.0, y, 441.0, y + 48.0],
+        1 => [448.0, y, 889.0, y + 48.0],
+        _ => [896.0, y, 1337.0, y + 48.0],
+    };
+    match (k, v) {
+        // the sound tab's voice radios (objects 95..98) share the first pair's frames
+        (0 | 4 | 5, true) => [256.0 * c, 16.0, 256.0 * c + 120.0, 64.0],
+        (0 | 4 | 5, false) if col == 2 => [512.0, 100.0, 632.0, 148.0],
+        (0 | 4 | 5, false) => [256.0 * c, 104.0, 256.0 * c + 120.0, 152.0],
+        (1, true) => [256.0 * c, 192.0, 256.0 * c + 248.0, 240.0],
+        (1, false) => [256.0 * c, 280.0, 256.0 * c + 248.0, 328.0],
+        (2, true) if col == 0 => [0.0, 368.0, if english { 241.0 } else { 240.0 }, 416.0],
+        (2, true) => [256.0 * c, 368.0, 256.0 * c + 248.0, 416.0],
+        (2, false) if english => wide(456.0),
+        (2, false) => narrow(456.0),
+        (3, true) => narrow(544.0),
+        (_, false) if english => wide(632.0),
+        _ => narrow(632.0),
+    }
+}
+
+/// Overseas btn_base2 cells of the check objects 57 / 61 (row 0) and 71 (row 80) (frames 0x35EFF4..): 288
+/// wide from x 8 + 304 col, or for English 392 wide from 400 col (sub_2BFE0).
+fn en_toggle_cell(t: usize, col: usize, english: bool) -> [f32; 4] {
+    let y = if t < 2 { 0.0 } else { 80.0 };
+    let c = col as f32;
+    if english { [400.0 * c, y, 400.0 * c + 392.0, y + 72.0] } else { [8.0 + 304.0 * c, y, 296.0 + 304.0 * c, y + 72.0] }
+}
 /// Config scroll tween length (sub_9AD04: 12 frames).
 const CONF_SCROLL_MS: f32 = 200.0;
 /// Voice setting rows (conf_faceicon / conf_name entries).
 const VOICE_ROWS: usize = 19;
+
+/// A language change of the overseas config: the dword_9D3A44 step (0: sub_2D720 still to run) and the
+/// config word picked.
+#[derive(Clone, Copy, Debug)]
+struct LangSeq {
+    state: u32,
+    word: i16,
+    /// pressed this frame
+    fresh: bool,
+}
+
+/// The overseas config's language button texture (conf_parts index 19, object image 1242), whatever its name.
+const CONF_LANG_TEX: &str = "conf_parts#19";
 
 /// A config screen control. Positions come from the layout table at 0x46D238 (640x448 units) and
 /// the object frames at 0x46B370.
@@ -520,6 +611,8 @@ enum Ctl {
     Radio(usize, bool),
     Mute(usize),
     Test(usize),
+    /// overseas language buttons (objects 78..81, type 10): languages 0..3
+    Lang(usize),
 }
 
 impl Ctl {
@@ -534,6 +627,7 @@ impl Ctl {
             Ctl::Radio(i, v) => 500 + i * 2 + usize::from(v),
             Ctl::Mute(i) => 600 + i,
             Ctl::Test(i) => 700 + i,
+            Ctl::Lang(i) => 800 + i,
         }
     }
 
@@ -548,6 +642,7 @@ impl Ctl {
             500..=599 => Ctl::Radio((c - 500) / 2, c % 2 == 1),
             600..=699 => Ctl::Mute(c - 600),
             700..=799 => Ctl::Test(c - 700),
+            800..=803 => Ctl::Lang(c - 800),
             _ => return None,
         })
     }
@@ -571,6 +666,19 @@ const NAME_RECTS: [[f32; 4]; VOICE_ROWS + 1] = {
         [32, 352, 168, 400], [32, 416, 168, 464], [184, 32, 320, 80], [184, 96, 320, 144], [184, 160, 320, 208],
         [184, 224, 320, 272], [184, 288, 320, 336], [184, 416, 320, 464], [184, 352, 320, 400], [336, 32, 472, 80],
         [336, 96, 472, 144], [336, 160, 472, 208], [336, 224, 472, 272], [336, 352, 472, 400],
+        [336, 416, 472, 464],
+    ];
+    rects(T)
+};
+
+/// English conf_name cells (overseas sub_2D040 with language 1: table 0x2319E4 in a 504x624 sheet): names 3, 6,
+/// 10 and 17 take wider cells below the others; every other language keeps the 0x34D5A0 table.
+const NAME_RECTS_EN: [[f32; 4]; VOICE_ROWS + 1] = {
+    const T: [[i16; 4]; VOICE_ROWS + 1] = [
+        [32, 32, 168, 80], [32, 96, 168, 144], [32, 160, 168, 208], [32, 480, 232, 528], [32, 288, 168, 336],
+        [32, 352, 168, 400], [248, 480, 448, 528], [184, 32, 320, 80], [184, 96, 320, 144], [184, 160, 320, 208],
+        [32, 544, 232, 592], [184, 288, 320, 336], [184, 416, 320, 464], [184, 352, 320, 400], [336, 32, 472, 80],
+        [336, 96, 472, 144], [336, 160, 472, 208], [248, 544, 448, 592], [336, 352, 472, 400],
         [336, 416, 472, 464],
     ];
     rects(T)
@@ -608,6 +716,19 @@ const SAVE_TITLES: [[i32; 4]; 38] = [
     [848, 256, 1104, 296], [848, 200, 1104, 240], [848, 200, 1104, 240], [848, 200, 1104, 240], [848, 312, 1104, 352],
     [848, 368, 1104, 408], [0, 0, 1, 1],
 ];
+/// The overseas build's savetitle rects (sub_4F240: off_351878 for English, off_351870 otherwise; the latter
+/// is the Japanese table with phases 16 and 18 widened to x1 571).
+const SAVE_TITLES_EN: [[i32; 4]; 38] = [
+    [0, 0, 1, 1], [64, 112, 504, 152], [64, 56, 504, 96], [64, 167, 504, 207], [64, 167, 504, 207],
+    [64, 223, 504, 263], [64, 223, 504, 263], [64, 279, 504, 319], [64, 279, 504, 319], [64, 335, 504, 375],
+    [64, 335, 504, 375], [64, 390, 504, 430], [64, 390, 504, 430], [522, 56, 1222, 96], [522, 167, 1222, 207],
+    [522, 112, 1222, 152], [522, 223, 1222, 263], [522, 279, 1222, 319], [522, 335, 1222, 375],
+    [522, 390, 1222, 430], [1241, 112, 1669, 152], [1241, 56, 1669, 96], [1241, 223, 1669, 263],
+    [1241, 167, 1669, 207], [64, 446, 504, 486], [1241, 335, 1669, 375], [1241, 279, 1669, 319],
+    [1241, 390, 1669, 430], [1688, 56, 2168, 96], [1688, 112, 2168, 152], [1688, 167, 2168, 207],
+    [1688, 279, 2168, 319], [1688, 223, 2168, 263], [1688, 223, 2168, 263], [1688, 223, 2168, 263],
+    [1688, 335, 2168, 375], [1688, 390, 2168, 430], [0, 0, 1, 1],
+];
 /// Route of phases 11..36 for the save info panel (dword_3506B0: 548 arc = 0, 549 ciel = 1, 550 unknown = 2).
 const INFO_ROUTE: [u8; 26] = [2, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1];
 /// system_phasetitle_ja source rects (x0, y0, x1, y1) by phase index F023 (dword_5912E8 + 156*4).
@@ -621,9 +742,34 @@ const PHASE_TITLES: &[[i32; 4]] = &[
     [1192, 216, 1760, 296], [1192, 408, 1760, 488], [1192, 312, 1760, 392], [1192, 312, 1760, 392], [1192, 312, 1760, 392],
     [1192, 600, 1760, 680], [1192, 504, 1760, 584], [0, 0, 1, 1],
 ];
+/// The overseas phase title cells (dword_5912E8 + 232 words) for English: the English texture's wider cells.
+const PHASE_TITLES_EN: &[[i32; 4]] = &[
+    [0, 0, 1, 1], [2633, 698, 3541, 798], [24, 26, 1260, 126], [24, 122, 1260, 222], [24, 122, 1260, 222],
+    [24, 218, 1260, 318], [24, 218, 1260, 318], [24, 314, 1260, 414], [24, 314, 1260, 414], [24, 410, 1260, 510],
+    [24, 410, 1260, 510], [2633, 794, 3541, 894], [2633, 794, 3541, 894], [24, 506, 1260, 606],
+    [24, 698, 1260, 798], [24, 602, 1260, 702], [24, 794, 1260, 894], [24, 890, 1260, 990], [1318, 26, 2586, 126],
+    [1318, 122, 2586, 222], [1318, 314, 2586, 414], [1318, 218, 2586, 318], [1318, 506, 2586, 606],
+    [1318, 410, 2586, 510], [1318, 602, 2586, 702], [1318, 794, 2586, 894], [1318, 698, 2586, 798],
+    [1318, 890, 2586, 990], [2633, 26, 3541, 126], [2633, 122, 3541, 222], [2633, 218, 3541, 318],
+    [2633, 410, 3541, 510], [2633, 313, 3541, 413], [2633, 313, 3541, 413], [2633, 313, 3541, 413],
+    [2633, 506, 3541, 606], [2633, 602, 3541, 702], [0, 0, 1, 1],
+];
+/// The overseas phase title cells (+ 308 words) for the Chinese languages.
+const PHASE_TITLES_ZH: &[[i32; 4]] = &[
+    [0, 0, 1, 1], [1192, 696, 1760, 776], [24, 24, 592, 104], [24, 120, 592, 200], [24, 120, 592, 200],
+    [24, 216, 592, 296], [24, 216, 592, 296], [24, 312, 592, 392], [24, 312, 592, 392], [24, 408, 592, 488],
+    [24, 408, 592, 488], [1192, 792, 1760, 872], [1192, 792, 1760, 872], [24, 504, 592, 584], [24, 696, 592, 776],
+    [24, 600, 592, 680], [24, 792, 604, 872], [24, 888, 592, 968], [608, 24, 1188, 104], [608, 120, 1176, 200],
+    [608, 312, 1176, 392], [608, 216, 1176, 296], [608, 504, 1176, 584], [608, 408, 1176, 488],
+    [608, 600, 1176, 680], [608, 792, 1176, 872], [608, 696, 1176, 776], [608, 888, 1176, 968],
+    [1192, 24, 1760, 104], [1192, 120, 1760, 200], [1192, 216, 1760, 296], [1192, 408, 1760, 488],
+    [1192, 312, 1760, 392], [1192, 312, 1760, 392], [1192, 312, 1760, 392], [1192, 504, 1760, 584],
+    [1192, 600, 1760, 680], [0, 0, 1, 1],
+];
 /// Button guide (sub_4A8F0): per guide index (unk_34FD48, 160 bytes each) a list of
-/// (0 = help_key icon / 1 = help_txt_ja word, cell) pairs.
-const GUIDE_SEQ: [&[(u8, u8)]; 11] = [
+/// (0 = help_key icon / 1 = help_txt_ja word, cell) pairs. Index 11 (the save list's, with X 削除) is the
+/// overseas build's; the Japanese one draws index 11 from its empty table past the end.
+const GUIDE_SEQ: [&[(u8, u8)]; 12] = [
     &[(0, 10), (1, 0), (0, 7), (1, 1), (0, 0), (1, 2), (0, 11), (1, 26)],
     &[(0, 10), (1, 0), (0, 15), (1, 13)],
     &[(0, 10), (1, 0), (0, 7), (1, 1), (0, 0), (1, 12), (0, 15), (1, 13), (0, 11), (1, 26)],
@@ -635,6 +781,7 @@ const GUIDE_SEQ: [&[(u8, u8)]; 11] = [
     &[(0, 10), (1, 0), (0, 7), (1, 1), (0, 14), (0, 13), (1, 13), (0, 0), (1, 2)],
     &[(0, 10), (1, 0), (0, 15), (1, 23), (0, 11), (1, 25), (0, 12), (1, 24)],
     &[(0, 10), (1, 0), (0, 7), (1, 1), (0, 0), (1, 2)],
+    &[(0, 10), (1, 0), (0, 7), (1, 1), (0, 9), (1, 16), (0, 0), (1, 2), (0, 11), (1, 26)],
 ];
 /// help_key cells (a0080h, x0 y0 x1 y1): 0..6 +pad, 7 A, 8 Y, 9 X, 10 B, 11 L stick, 12 R stick, ...
 const GUIDE_ICONS: [[u16; 4]; 23] = [
@@ -663,7 +810,8 @@ const GUIDE_ICONS: [[u16; 4]; 23] = [
     [200, 104, 240, 144],
 ];
 /// help_txt_ja word cells (x0 y0 x1 y1): CONTHELP_TXT_UV.BIN (allui, loaded by sub_9A420; i16 count, then
-/// count cells per language), Japanese = language 0 (sub_2DE70). 0 戻る 1 決定 2 移動 3 解除 4 再生 5 変更 6 初期化
+/// from byte 8 count cells per language), Japanese = language 0 (sub_2DE70); the fallback when the file is
+/// missing. 0 戻る 1 決定 2 移動 3 解除 4 再生 5 変更 6 初期化
 /// 7 セーブ 8 ロード 9 ボイス登録 10 ボイス再生 11 クイックジャンプ 12 カーソル移動 13 ページ変更 14 キャラクター変更
 /// 15 連続再生 16 削除 17 再生(長押しで連続再生) 18 データコピー 19 データ削除 20 再生曲変更 21 停止 22 ループ変更
 /// 23 画像の切替 24 拡大・縮小 25 移動 26 スクロール
@@ -817,13 +965,7 @@ const MUSIC_CTL: [(f32, f32); 6] = [(1432.0, 576.0), (1512.0, 576.0), (1592.0, 5
 
 impl Ui {
     pub fn new(game: &mut Game, r: &Renderer) -> Self {
-        let mut tex = HashMap::new();
-        for stem in ["TITLE_PARTS_JA", "MENU_PARTS_JA", "SAVE_PARTS_JA", "CONF_PARTS_JA", "DIALOG_PARTS_JA", "DISP_PARTS_JA", "MODEPNL_PARTS_JA"] {
-            match game.assets.ui_textures(r, stem) {
-                Ok(list) => tex.extend(list),
-                Err(e) => tracing::warn!("ui textures {stem}: {e:#}"),
-            }
-        }
+        let tex = Self::load_textures(game, r, false);
         let file = SaveFile::load();
         let mut ui = Self {
             screen: Screen::Title,
@@ -836,12 +978,18 @@ impl Ui {
             slots: Vec::new(),
             popup: None,
             save_wait: None,
+            delete_wait: None,
+            save_cool: 0,
+            save_flash: 0.0,
+            save_seen: None,
+            save_notes: None,
             save_pending: None,
             save_order: None,
             dlg_t: 0.0,
             dlg_out: None,
             title_movie: false,
             on_title: false,
+            back_btn: 0.0,
             complete: None,
             cg_unlocked: Vec::new(),
             music_ok: Vec::new(),
@@ -862,6 +1010,7 @@ impl Ui {
             under: false,
             last_track: None,
             sysmes: Vec::new(),
+            guide_words: (usize::MAX, Vec::new()),
             title_clock: 0.0,
             cg_flash: (None, 0.0),
             cg_sub: None,
@@ -904,6 +1053,7 @@ impl Ui {
             black_top: 1.2,
             gal_ret: [-1; 3],
             gal_prev: -1,
+            gal_first: -1,
             replay_pending: None,
             black_col: [0.0; 3],
             cont_slot: None,
@@ -956,6 +1106,10 @@ impl Ui {
             conf_test_se: None,
             conf_test_row: None,
             conf_hold: 0,
+            lang_seq: None,
+            lang_pick: None,
+            lang_cool: 0,
+            lang_ms: 0.0,
             conf_hold_dirty: false,
             enter_held: false,
             touch: touch::Touch::new(),
@@ -975,6 +1129,85 @@ impl Ui {
     }
 
     /// Write settings and progress (and the records already in memory) to savedata.bin.
+    /// The system atlases of the game language (sub_9A940), and GALLERY_PARTS when `gallery`. Textures are
+    /// found by name; the overseas language buttons (conf_parts #19) also by position.
+    fn load_textures(game: &Game, r: &Renderer, gallery: bool) -> HashMap<String, TexRef> {
+        let mut tex = HashMap::new();
+        let stems = ["TITLE_PARTS", "MENU_PARTS", "SAVE_PARTS", "CONF_PARTS", "DIALOG_PARTS", "DISP_PARTS", "MODEPNL_PARTS", "GALLERY_PARTS"];
+        for stem in stems.into_iter().filter(|s| gallery || *s != "GALLERY_PARTS") {
+            let atlas = game.assets.ui_atlas(stem);
+            match game.assets.ui_textures(r, &atlas) {
+                Ok(list) => {
+                    if stem == "CONF_PARTS"
+                        && let Some((_, t)) = list.get(19)
+                    {
+                        tex.insert(CONF_LANG_TEX.to_string(), t.clone());
+                    }
+                    tex.extend(list);
+                }
+                Err(e) => tracing::warn!("ui textures {atlas}: {e:#}"),
+            }
+        }
+        tex
+    }
+
+    /// One 60 Hz frame of the overseas language change (sub_2D910 with dword_9D3A44 set): the screen is
+    /// captured (sub_A2550) as the change starts; step 10 writes the config word and reloads the language's
+    /// text, atlases and fonts (sub_9A940, sub_2BFE0, sub_AB0F0) and lays the shown text out again (sub_7FE20
+    /// / sub_7D0C0); step 15 fades the capture out over 250 ms (sub_A27F0) and step 16 waits for it. A pick
+    /// of the word already set does nothing (sub_2D720).
+    fn lang_frame(&mut self, game: &mut Game, r: &Renderer) {
+        let Some(mut q) = self.lang_seq else {
+            if game.screen_clear() && self.lang_cool > 0 {
+                self.lang_cool -= 1;
+            }
+            return;
+        };
+        // the press sets config state 10; sub_2D910 runs sub_2D720 for it the next frame
+        if q.fresh {
+            q.fresh = false;
+            self.lang_seq = Some(q);
+            return;
+        }
+        if q.state == 0 {
+            if q.word == self.file.language() {
+                self.lang_seq = None;
+                self.lang_pick = None;
+                return;
+            }
+            q.state = 1;
+        }
+        match q.state {
+            1 => {
+                game.freeze_screen();
+                q.state = 2;
+            }
+            10 => {
+                self.file.set_language(q.word);
+                game.change_language(r, q.word);
+                let gallery = self.tex.contains_key("gallerymenu_btn");
+                self.tex = Self::load_textures(game, r, gallery);
+                self.sysmes.clear();
+                self.font_sys = None;
+                self.store_global(game);
+                q.state = 11;
+            }
+            15 => {
+                game.thaw_screen(250.0);
+                q.state = 16;
+            }
+            16 => {
+                if game.screen_clear() {
+                    self.lang_seq = None;
+                    self.lang_pick = None;
+                    return;
+                }
+            }
+            n => q.state = n + 1,
+        }
+        self.lang_seq = Some(q);
+    }
+
     pub fn store_global(&mut self, game: &Game) {
         game.store_system(&mut self.file);
         if let Err(e) = self.file.store() {
@@ -985,15 +1218,31 @@ impl Ui {
     /// Put a snapshot into a record, then write the file. The save list rebuilds its preview from the
     /// record (sub_884F0), so nothing else is stored.
     fn write_record(&mut self, game: &mut Game, slot: usize, data: &SaveData) -> anyhow::Result<()> {
+        self.put_record(game, slot, data)?;
+        game.store_system(&mut self.file);
+        self.file.store()?;
+        Ok(())
+    }
+
+    /// The record into the in-memory save file only (the auto save's shift included).
+    fn put_record(&mut self, game: &mut Game, slot: usize, data: &SaveData) -> anyhow::Result<()> {
         let rec = game.encode_record(data).ok_or_else(|| anyhow::anyhow!("position not saveable"))?;
         if slot == save::AUTO_FIRST {
             self.file.shift_auto();
         }
         self.file.set_record(slot, &rec);
         self.file.update_continue();
-        game.store_system(&mut self.file);
-        self.file.store()?;
         Ok(())
+    }
+
+    /// sub_52AA0 with dword_AFFCC4 running: the record goes into the list, the file is written by a later save.
+    fn write_memory(&mut self, game: &mut Game, slot: usize) {
+        let Some(data) = game.save_data() else { return };
+        if let Err(e) = self.put_record(game, slot, &data) {
+            tracing::warn!("save to slot {slot}: {e:#}");
+            return;
+        }
+        self.refresh_slots(game);
     }
 
     /// cGallery mode buttons (objects 379..384, sub_6124): CG, Music, Flowchart, Movie, Ending, Back
@@ -1069,7 +1318,11 @@ impl Ui {
 
     /// sub_926F0(1): every ending node 533..556 completed (unlocks the QA_25 button, object 418).
     fn all_endings(game: &Game) -> bool {
-        (533..=556).all(|n| crate::game::get_bit(&game.endings, n))
+        match game.assets.build {
+            knife_core::exe::Build::Japanese => (533..=556).all(|n| crate::game::get_bit(&game.endings, n)),
+            // sub_FF40: every record's completed node
+            knife_core::exe::Build::Overseas => (0..24).all(|i| Self::ending_ok(game, i)),
+        }
     }
 
     /// Movies in the movie gallery (sub_17DD0): the prologue, then each opening once unlocked.
@@ -1167,7 +1420,15 @@ impl Ui {
 
     /// Ending entry i reached (3 main endings, 21 bad ends, 24 = the QA_25 button).
     fn ending_ok(game: &Game, i: usize) -> bool {
-        if i == 24 { Self::all_endings(game) } else { crate::game::get_bit(&game.nodes, crate::gallery::ENDINGS[i].0) }
+        use crate::game::get_bit;
+        match game.assets.build {
+            _ if i == 24 => Self::all_endings(game),
+            knife_core::exe::Build::Japanese => get_bit(&game.nodes, crate::gallery::ENDINGS[i].0),
+            knife_core::exe::Build::Overseas => {
+                let (a, b) = crate::gallery::EN_ENDING_DONE[i];
+                [a, b].into_iter().any(|n| n >= 0 && get_bit(&game.endings, n as usize))
+            }
+        }
     }
 
     /// Put the cursor on `a` (an entry of the current screen's items).
@@ -1769,30 +2030,49 @@ impl Ui {
         self.screen == Screen::Game
     }
 
+    /// sub_4EC00 (overseas): the system menu shows (dword_B359F4 > 0: open, or fading, and kept at 1 under
+    /// its save / load screens and dialogs; 0 while the chart runs) or its config screen is open (states
+    /// 11 / 12). The overseas sub_391A0 then draws no message window, text or choice.
+    pub fn system_menu_shown(&self) -> bool {
+        let under_menu = self.stack.contains(&Screen::Menu);
+        match self.screen {
+            Screen::Menu => self.scr_a * self.menu_a > 0.0,
+            Screen::Config => true,
+            Screen::Flowchart { .. } => false,
+            _ => under_menu,
+        }
+    }
+
     // ---- help balloon -----------------------------------------------------------------------
 
-    /// Load a UI font from romfs (ja2 / ja3).
     /// The shared system font (nn::pl::GetSharedFont): sub_A7790 slots with flag 0x100000 (every type-3 text
     /// object by default, sub_25C94; the help balloon, banner, save list scene names, menu chapter name and
     /// music panel) set +101785, and sub_C406C then draws them with font variant 3 (sub_CBC68: the font set
     /// sub_CAA50 builds from the shared fonts sub_C9F3C fetches). Switch (save list "SCENE プロローグ", flags
-    /// 0x183040): the 0x80000 / 0x200000 font index (+55436) does not change it. Falls back to TsukuGo when
-    /// the assets dir has no `nintendo_udsg-r_std_003.bfttf`.
+    /// 0x183040): the 0x80000 / 0x200000 font index (+55436) does not change it. The shared fonts are the
+    /// language's (`Assets::shared_font_names`); falls back to the UI font (TsukuGo) when the assets dir has none.
     fn sys_font(game: &Game, r: &Renderer) -> Option<FontAtlas> {
-        let path = &game.assets.romfs.join("nintendo_udsg-r_std_003.bfttf");
-        match std::fs::read(path) {
-            Ok(data) => {
-                let data = knife_core::format::bfttf::decode(&data).unwrap_or(data);
-                return FontAtlas::new(r, data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok();
+        for name in game.assets.shared_font_names() {
+            let path = &game.assets.romfs.join(name);
+            match std::fs::read(path) {
+                Ok(data) => {
+                    let data = knife_core::format::bfttf::decode(&data).unwrap_or(data);
+                    return FontAtlas::new(r, data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok();
+                }
+                Err(e) => tracing::warn!("system font {}: {e}", path.display()),
             }
-            Err(e) => tracing::warn!("system font {}: {e}; using TsukuGo", path.display()),
         }
-        Self::ui_font(game, r, "ja2/TT_TsukuGo-D.ttf")
+        Self::ui_font(game, r, "2")
     }
 
-    fn ui_font(game: &Game, r: &Renderer, path: &str) -> Option<FontAtlas> {
-        let data = std::fs::read(game.assets.romfs.join(path)).map_err(|e| tracing::warn!("{path}: {e}")).ok()?;
-        FontAtlas::new(r, data).map_err(|e| tracing::warn!("{path}: {e:#}")).ok()
+    /// A font of the language's folders (`Assets::font_path`).
+    fn ui_font(game: &Game, r: &Renderer, suffix: &str) -> Option<FontAtlas> {
+        let path = game.assets.font_path(suffix).or_else(|| {
+            tracing::warn!("no font in {}{suffix}", game.assets.language_folder());
+            None
+        })?;
+        let data = std::fs::read(&path).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok()?;
+        FontAtlas::new(r, data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok()
     }
 
     /// Help text of the focused object (object tables: system menu 0x591438, config 0x46B370):
@@ -1895,7 +2175,7 @@ impl Ui {
             out.push(Quad::rect(t.clone(), [(x - 20.0) * 3.0, y * H / 448.0, bw * 3.0, bh * H / 448.0], [1.0, 1.0, 1.0, a * 0.7]));
         }
         // sub_AB710: the slot at (x + 2, y + 3), white text with a dark rim
-        let (tx, base) = ((x + 2.0) * 3.0, (y + 3.0) * H / 448.0 + SYS_ASCENT * SIZE[1]);
+        let (tx, base) = ((x + 2.0) * 3.0, (y + 3.0) * H / 448.0 + SYS_ASCENT * gs() * SIZE[1]);
         for (ddx, ddy, c) in [(-1.5, 0.0, 0.0), (1.5, 0.0, 0.0), (0.0, -1.5, 0.0), (0.0, 1.5, 0.0), (0.0, 0.0, 1.0)] {
             font.draw_str_slot(r, out, &text, SIZE, SPACING, [tx + ddx, base + ddy], [c, c, c, if c > 0.0 { a } else { a * 0.6 }]);
         }
@@ -1920,6 +2200,17 @@ impl Ui {
         } else if let Some(scene) = game.assets.scene_by_id(260) {
             game.start_scene(scene, None);
             self.screen = Screen::Game;
+        }
+    }
+
+    /// The screens that turn the touch back button on (sub_4A790(1)): the backlog (sub_28F80), the config
+    /// (sub_2B680 / sub_2C6E0), the save list (sub_50ED0 / sub_50FC0), the flowchart (sub_110D4) and a CG
+    /// group's grid (sub_8D08 / sub_9384); closing them and the gallery's mode switch (sub_6E28) turn it off.
+    fn back_btn_on(&self) -> bool {
+        match self.screen {
+            Screen::Backlog { .. } | Screen::Config | Screen::SaveLoad { .. } | Screen::Flowchart { .. } => true,
+            Screen::Gallery => !self.gal_side,
+            _ => false,
         }
     }
 
@@ -1982,7 +2273,13 @@ impl Ui {
 
     fn load_notice(&mut self, game: &Game, r: &Renderer) {
         if self.notice.is_none() {
-            self.notice = game.assets.parts_texture(r, 1);
+            // overseas sub_B5650 state 3: screen 1 becomes 1 + language (past 3: 1), parts.mrg 1..4 holding the
+            // notice per language, and state 8 then steps past the other three (qword_1835524 = 4 - language)
+            let index = match game.assets.build {
+                knife_core::exe::Build::Overseas => 1 + if game.assets.language() > 3 { 1 } else { game.assets.language() },
+                knife_core::exe::Build::Japanese => 1,
+            };
+            self.notice = game.assets.parts_texture(r, index);
         }
     }
 
@@ -2172,6 +2469,8 @@ impl Ui {
         // sub_7624 -> sub_82FC); the system menu fades in from 0 (state 16)
         match self.screen {
             Screen::Title if Self::is_gallery_mode(from) => {
+                // cGallery state 1: [0] = the mode it closes with (sub_82E4), the first mode of the next open
+                self.gal_ret[0] = Self::gal_mode(from).map_or(-1, |m| m as i32);
                 // leaving the gallery (sub_48AC0 mode 0 substate 10): sub_8D2E0 restarts the title (black, state
                 // 0, fading in at 0.012 in state 2) and the backdrop and strips fade out at 0.02 over it, so the
                 // backdrop crossfades into the title instead of going to black first
@@ -2206,15 +2505,24 @@ impl Ui {
     fn items(&self, game: &Game) -> Vec<([f32; 4], Action)> {
         match self.screen {
             // title menu (sub_8D2E0 / sub_8D5D0): sprite objects 232..237 placed from the slot table at
-            // unk_352AF4 in a 640x448 space; CONTINUE only shows when there is something to resume
+            // unk_352AF4 in a 640x448 space; CONTINUE only shows when there is something to resume. The touch
+            // area is the objects' own rect (unk_65CBD8: (0, 4)-(98, 25) from the slot, top-left anchored,
+            // whole units inclusive, sub_AE840), not the 72 px sprite: the slots are 23.23 apart, so the
+            // sprites overlap but the touch areas do not
             Screen::Title if self.press => Vec::new(),
-            Screen::Title => self
-                .title_entries()
-                .into_iter()
-                .enumerate()
-                .map(|(i, (a, _, _))| (Self::title_slot(i, self.title_entries().len()), a))
-                .collect(),
-            // system menu (sub_4C370): objects 197..201 at x 26.667, y 43.556 + 31.111*i (640x448 units)
+            Screen::Title => {
+                let n = self.title_entries().len();
+                let ky = H / 448.0;
+                self.title_entries()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (a, _, _))| {
+                        (Self::object_rect([272.0, Self::title_slot(i, n)[1] / ky], [0, 4, 98, 25]), a)
+                    })
+                    .collect()
+            }
+            // system menu (sub_4C370): objects 197..201 at x 26.667, y 43.556 + 31.111*i (640x448 units), touch
+            // rect (0, 0)-(74, 29) (unk_591438)
             Screen::Menu => [
                 Action::OpenSave,
                 Action::OpenLoad,
@@ -2224,7 +2532,7 @@ impl Ui {
             ]
             .iter()
             .enumerate()
-            .map(|(i, a)| ([80.0, 105.0 + i as f32 * 75.0, 224.0, 88.0], *a))
+            .map(|(i, a)| (Self::menu_tab_rect(i), *a))
             .collect(),
             // save list (sub_4F240): four save_win frames at x 133.67, y 36.919 + 93.748*i (640x448)
             Screen::SaveLoad { save, scroll } => {
@@ -2330,12 +2638,11 @@ impl Ui {
             Screen::Endings => {
                 // cGalleryEnding (sub_DAF8 / sub_DDA4): reached endings get a play button, ending_btn
                 // (object 394+i, 112x112 at 720 + 480i, 128) or ending_badendbtn (397+i, 88x88 on the plate)
-                use crate::game::get_bit;
                 // an unreached entry has no object, but sub_F6F8 can still put the cursor on one (column 7 of
                 // row 2 going up from the QA button): it gets an empty rect, so nothing is drawn or touched there
                 let mut v: Vec<([f32; 4], Action)> = (0..24)
                     .map(|i| {
-                        let rc = if !get_bit(&game.nodes, crate::gallery::ENDINGS[i].0) {
+                        let rc = if !Self::ending_ok(game, i) {
                             [0.0; 4]
                         } else if i < 3 {
                             [720.0 + i as f32 * 480.0, 128.0, 112.0, 112.0]
@@ -2354,13 +2661,18 @@ impl Ui {
             }
             // sub_4AE90: buttons 0 (Yes) at 330 and 1 (No) at 252, y 249.01 (640x448 units), 216x56
             Screen::Confirm(c) => {
-                // sub_4AE90: buttons at y 249.01 of 448, 261.46 under a thumbnail
-                let y = if c.thumbnail() { 261.46 * H / 448.0 } else { 600.0 };
-                vec![([990.0, y, 216.0, 56.0], Action::Yes), ([756.0, y, 216.0, 56.0], Action::No)]
+                // sub_4AE90: Yes (object 0) at x 330, No (object 1) at 252, y 249.01 of 448 (261.46 under a
+                // thumbnail); touch rect (0, -2)-(72, 24) (unk_590F08)
+                let y = if c.thumbnail() { 261.46 } else { 249.01 };
+                vec![
+                    (Self::object_rect([330.0, y], [0, -2, 72, 24]), Action::Yes),
+                    (Self::object_rect([252.0, y], [0, -2, 72, 24]), Action::No),
+                ]
             }
             // sub_28A90: a tap left of x 543 (640x448 units, clear of the scroll bar) asks for the quick jump;
             // the button guide (sub_4A410: x >= 546, y > 393) closes
-            Screen::Backlog { .. } => vec![([0.0, 0.0, 543.0 * 3.0, H], Action::BacklogJump), ([546.0 * 3.0, 393.0 * H / 448.0, W - 546.0 * 3.0, H - 393.0 * H / 448.0], Action::Back)],
+            // (the button guide's corner closes it: `back_btn_on`)
+            Screen::Backlog { .. } => vec![([0.0, 0.0, 543.0 * 3.0, H], Action::BacklogJump)],
             Screen::Game => {
                 let _ = game;
                 Vec::new()
@@ -2386,6 +2698,20 @@ impl Ui {
         v.push((Action::OpenConfig, "titlemenu", cell(200.0)));
         v.push((Action::OpenExtra, "titlemenu", cell(288.0)));
         v
+    }
+
+    /// Touch area of a sprite object (sub_AE840) in screen pixels: the object's rect (x0, y0)-(x1, y1) in
+    /// 640x448 units from its position truncated to whole units, top-left anchored, bounds inclusive.
+    fn object_rect(pos: [f32; 2], r: [i32; 4]) -> [f32; 4] {
+        let (kx, ky) = (W / 640.0, H / 448.0);
+        let (x, y) = (pos[0].trunc() + r[0] as f32, pos[1].trunc() + r[1] as f32);
+        [x * kx, y * ky, (r[2] - r[0] + 1) as f32 * kx, (r[3] - r[1] + 1) as f32 * ky]
+    }
+
+    /// System menu tab `i` (objects 197..201, sub_4C370): touch rect (0, 0)-(74, 29) (unk_591438) at
+    /// (26.667, 43.556 + 31.111 i).
+    fn menu_tab_rect(i: usize) -> [f32; 4] {
+        Self::object_rect([26.667, 43.556 + i as f32 * 31.111], [0, 0, 74, 29])
     }
 
     /// Slot rectangle on the canvas: x 272, y from unk_352AF4 (4 entries from 312.36, 5 from 298.67,
@@ -2806,7 +3132,13 @@ impl Ui {
 
     /// Controls of the config screen with their top-left on the canvas (content scrolled).
     fn conf_layout(&self) -> Vec<(Ctl, [f32; 2])> {
-        let u = |x: f32, y: f32| [x * 3.0, y * H / 448.0 - self.conf_scroll];
+        self.conf_layout_at(self.conf_scroll)
+    }
+
+    /// The config controls at scroll `scroll`; the positions are the grid's floats (dword_46CDB0 + 1160 + 40 row
+    /// + 8 column, 640 x 448 units), exact so the scroll (sub_29930) truncates as on the Switch.
+    fn conf_layout_at(&self, scroll: f32) -> Vec<(Ctl, [f32; 2])> {
+        let u = |x: f32, y: f32| [x * 3.0, y * H / 448.0 - scroll];
         let mut v = vec![
             (Ctl::Tab(0), [408.0, 96.0]),
             (Ctl::Tab(1), [656.0, 96.0]),
@@ -2815,45 +3147,53 @@ impl Ui {
         ];
         match self.conf_tab {
             0 => {
-                for (i, (pm, sl)) in [(100.8, 56.0), (175.052, 130.252), (246.4, 201.6), (306.548, 261.748)].into_iter().enumerate() {
+                let rows = [(100.8, 56.000004, 94.162964), (175.05185, 130.25185, 168.41481), (246.4, 201.59999, 0.0), (306.54816, 261.74817, 0.0)];
+                for (i, (pm, sl, tg)) in rows.into_iter().enumerate() {
                     v.push((Ctl::Minus(i), u(245.0, pm)));
-                    v.push((Ctl::Slider(i), u(120.667, sl)));
+                    v.push((Ctl::Slider(i), u(120.666664, sl)));
                     v.push((Ctl::Plus(i), u(452.0, pm)));
                     if i < 2 {
-                        v.push((Ctl::Toggle(i), u(475.0, pm - 6.637)));
+                        v.push((Ctl::Toggle(i), u(475.0, tg)));
                     }
                 }
-                let radios = [(0, 364.622, 384.948), (1, 427.674, 448.0), (2, 491.141, 511.467), (3, 557.096, 577.422)];
+                let radios = [(0, 364.62222, 384.94815), (1, 427.67407, 448.0), (2, 491.14075, 511.46667), (3, 557.0963, 577.42224)];
                 for (k, yt, yf) in radios {
-                    v.push((Ctl::Radio(k, true), u(243.667, yt)));
-                    v.push((Ctl::Radio(k, false), u(243.667, yf)));
+                    v.push((Ctl::Radio(k, true), u(243.66667, yt)));
+                    v.push((Ctl::Radio(k, false), u(243.66667, yf)));
                     if k == 0 {
-                        v.push((Ctl::Toggle(2), u(290.333, 360.059)));
+                        v.push((Ctl::Toggle(2), u(290.33334, 360.05927)));
+                    }
+                }
+                // overseas: the language buttons (grid rows 12..15 at 0x35C378)
+                if crate::assets::overseas() {
+                    for (k, y) in [616.4148, 636.7407, 657.06665, 677.3926].into_iter().enumerate() {
+                        v.push((Ctl::Lang(k), u(243.66667, y)));
                     }
                 }
             }
             1 => {
-                for (i, y) in [104.948, 132.326, 160.533].into_iter().enumerate() {
-                    v.push((Ctl::Minus(i), u(245.333, y)));
-                    v.push((Ctl::Slider(i), u(121.0, y - 44.8)));
-                    v.push((Ctl::Plus(i), u(452.333, y)));
-                    v.push((Ctl::Mute(i), u(476.667, y - 4.978)));
+                let rows = [(104.94815, 60.14815, 99.970375), (132.32593, 87.525925, 127.34815), (160.53334, 115.73334, 155.55556)];
+                for (i, (y, sl, mute)) in rows.into_iter().enumerate() {
+                    v.push((Ctl::Minus(i), u(245.33333, y)));
+                    v.push((Ctl::Slider(i), u(120.99999, sl)));
+                    v.push((Ctl::Plus(i), u(452.3333, y)));
+                    v.push((Ctl::Mute(i), u(476.66666, mute)));
                     if i == 1 {
-                        v.push((Ctl::Test(0), u(560.667, 128.593)));
+                        v.push((Ctl::Test(0), u(560.6667, 128.59259)));
                     }
                 }
-                for (k, yt, yf) in [(4, 236.444, 258.844), (5, 297.007, 319.407)] {
-                    v.push((Ctl::Radio(k, true), u(242.667, yt)));
-                    v.push((Ctl::Radio(k, false), u(242.667, yf)));
+                for (k, yt, yf) in [(4, 236.44444, 258.84445), (5, 297.00742, 319.4074)] {
+                    v.push((Ctl::Radio(k, true), u(242.66667, yt)));
+                    v.push((Ctl::Radio(k, false), u(242.66667, yf)));
                 }
                 // character rows (sub_29FA0): 370.01 + 50.607 n over the shown rows
                 for (n, &[k, ..]) in self.voice_rows.iter().enumerate() {
-                    let y = 370.01 + 50.607 * n as f32;
+                    let y = n as f32 * 50.607 + 370.01;
                     v.push((Ctl::Minus(3 + k), u(245.0, y)));
-                    v.push((Ctl::Slider(3 + k), u(120.67, y - 44.8)));
+                    v.push((Ctl::Slider(3 + k), u(120.67, y + -44.8)));
                     v.push((Ctl::Plus(3 + k), u(452.0, y)));
-                    v.push((Ctl::Mute(3 + k), u(476.33, y - 4.978)));
-                    v.push((Ctl::Test(1 + k), u(560.33, y - 3.733)));
+                    v.push((Ctl::Mute(3 + k), u(476.33, y + -4.9778)));
+                    v.push((Ctl::Test(1 + k), u(560.33, y + -3.7333)));
                 }
             }
             _ => {}
@@ -2871,8 +3211,18 @@ impl Ui {
             // the knob object (0x46B370 entries 81, 86, 90, 99 + 5k...): rect (144, 39)-(167, 63) of 640 x 448 inside
             // the conf_sbtn sprite, at value 0 (`items` adds the knob's travel)
             Ctl::Slider(_) => [x + 432.0, y + 39.0 * 1080.0 / 448.0, 69.0, 24.0 * 1080.0 / 448.0],
+            Ctl::Toggle(t) if crate::assets::overseas() => {
+                let [x0, _, x1, _] = en_toggle_cell(t, 0, crate::text::english());
+                [x, y, x1 - x0, 72.0]
+            }
             Ctl::Toggle(_) => [x + 2.0, y, 304.0, 72.0],
+            Ctl::Radio(k, v) if crate::assets::overseas() => {
+                let [x0, _, x1, _] = en_radio_cell(k, v, 0, crate::text::english());
+                [x, y, x1 - x0, 48.0]
+            }
             Ctl::Radio(k, v) => [x + 10.0, y, RADIO_CELLS[k][usize::from(!v)].1 - 10.0, 68.0],
+            // the object rect (0, 7)-(56, 26) of 640 x 448
+            Ctl::Lang(_) => [x, y + 7.0 * H / 448.0, 168.0, 19.0 * H / 448.0],
             Ctl::Mute(_) => [x, y, 136.0, 64.0],
             Ctl::Test(_) => [x, y, 104.0, 56.0],
         }
@@ -2933,6 +3283,14 @@ impl Ui {
             Ctl::Mute(i) if i < 3 => st.mute >> i & 1 != 0,
             Ctl::Mute(i) => st.char_mute >> (i - 3) & 1 != 0,
             Ctl::Tab(i) => self.conf_tab == i,
+            // sub_2A550: the config word's button (1..3), else the first; a press selects its own at once
+            // (sub_29500 type 10)
+            Ctl::Lang(k) => {
+                k == self.lang_pick.unwrap_or(match self.file.language() {
+                    w @ 1..=3 => w as usize,
+                    _ => 0,
+                })
+            }
             _ => false,
         }
     }
@@ -2992,6 +3350,8 @@ impl Ui {
             Ctl::Test(0) => self.conf_test_se = game.conf_test_se(self.conf_test_se.take()),
             // sub_2B930 case 1: a voice row's test button plays the row's last voice (G031 + 2 row) on player 4 at
             // the row's volume, unless the row is muted; a row without one yet clears the held row
+            // started by `Action::Setting` (sub_2B930 -> sub_2D720)
+            Ctl::Lang(_) => {}
             Ctl::Test(t) => {
                 let k = t - 1;
                 let g = |n: usize| game.var(&format!("G{n:03}"));
@@ -3009,7 +3369,7 @@ impl Ui {
             }
         }
         // sub_2A9B0 after a change: the held voice row's mute and volume reach the scene voice
-        if !matches!(c, Ctl::Tab(_) | Ctl::Default | Ctl::Test(0))
+        if !matches!(c, Ctl::Tab(_) | Ctl::Default | Ctl::Test(0) | Ctl::Lang(_))
             && let Some(k) = self.conf_test_row
         {
             game.conf_test_row_volume(k);
@@ -3106,22 +3466,27 @@ impl Ui {
         let [vx, vy, vw, vh] = CONF_VIEW;
         let clip = [[vx, vy], [vx + vw, vy], [vx + vw, vy + vh], [vx, vy + vh]];
         // sub_2B460: slots 58 / 59 at 0.74 of the 60 px base glyph, laid out like the messages (`text::layout`:
-        // advance + 4 px character spacing)
-        let size = 60.0 * 0.74;
+        // advance + 4 px character spacing; English: sub_A7790's 0.9 and the font's kerning)
+        let size = 60.0 * 0.74 * gs();
+        let english = crate::text::english();
         for (k, row) in [126.93, 201.19].into_iter().enumerate() {
             let text = self.sysmes.get(138 + k).cloned().unwrap_or_default();
             let [p, shown, _] = self.conf_prev[k];
             let y = row * H / 448.0 - self.conf_scroll;
             let font = game.font_mut();
             let mut x = 252.333 * 3.0;
+            let mut prev = None;
             for (i, c) in text.chars().enumerate() {
                 let i = i as f32;
+                if english {
+                    x += font.kern(prev.replace(c), c, size);
+                }
                 let a = if p - shown > 1e-3 { ((p - i) / (p - shown)).clamp(0.0, 1.0) } else if i < p { 1.0 } else { 0.0 };
                 if a > 0.0
-                    && let Some(q) = font.quad(r, c, size, x, y + 47.0, [1.0, 1.0, 1.0, a])
+                    && let Some(q) = font.quad(r, c, size, x, y + crate::text::msg_ascent(crate::game::ASCENT * 0.74 / 0.76), [1.0, 1.0, 1.0, a])
                 {
                     // the messages' dark rim (sub_A7790 draws both)
-                    let mut q = crate::text::FontAtlas::rim(q, 2.0 * size / (60.0 * 0.76), 0.55);
+                    let mut q = crate::text::FontAtlas::rim(q, crate::text::edge_rim(1, size), crate::text::RIM_ALPHA);
                     q.clip = Some(clip);
                     out.push(q);
                 }
@@ -3138,8 +3503,10 @@ impl Ui {
         let n0 = out.len();
         match self.conf_tab {
             0 => {
+                // (sprite 1230, overseas 1233: the overseas system_bg is taller, with the language row)
                 let [x, y] = u(128.667, 68.03);
-                self.sprite(out, "system_bg", [x, y, 1432.0, 1336.0], None);
+                let (w, h) = self.tex.get("system_bg").map_or((1432.0, 1336.0), |t| (t.width as f32, t.height as f32));
+                self.sprite(out, "system_bg", [x, y, w, h], None);
             }
             1 => {
                 let [x, y] = u(128.667, 68.03);
@@ -3155,7 +3522,7 @@ impl Ui {
                     let f = FACE_RECTS[face];
                     self.sprite(out, "conf_faceicon", [fx, fy, f[2], f[3]], Some(f));
                     let [nx, ny] = u(144.0, 394.9 + n);
-                    let nm = NAME_RECTS[name];
+                    let nm = if game.assets.language() == 1 { NAME_RECTS_EN } else { NAME_RECTS }[name];
                     self.sprite(out, "conf_name", [nx, ny, nm[2], nm[3]], Some(nm));
                 }
                 let [x, y] = u(128.667, 360.06 + self.voice_rows.len() as f32 * 50.607);
@@ -3214,10 +3581,23 @@ impl Ui {
                     let src = if hovered(i) { [0.0, 0.0, 936.0, 248.0] } else { [0.0, 256.0, 936.0, 248.0] };
                     self.sprite(q, "conf_sbtn", [kx, y, 936.0, 248.0], Some(src));
                 }
+                Ctl::Toggle(t) if crate::assets::overseas() => {
+                    let [x0, y0, x1, y1] = en_toggle_cell(t, col as usize, crate::text::english());
+                    self.sprite(q, "btn_base2", [x, y, x1 - x0, y1 - y0], Some([x0, y0, x1 - x0, y1 - y0]));
+                }
                 Ctl::Toggle(t) => {
                     let row = if t < 2 { 0.0 } else { 80.0 };
                     // frames 0x46F4B0..: offset (-10/3, 0) of 640 x 448, source from x -2 (the cell's 0 at x - 8)
                     self.sprite(q, "btn_base2", [x - 8.0, y, 304.0, 72.0], Some([col * 304.0, row, 304.0, 72.0]));
+                }
+                Ctl::Radio(k, v) if crate::assets::overseas() => {
+                    let [x0, y0, x1, y1] = en_radio_cell(k, v, col as usize, crate::text::english());
+                    self.sprite(q, "btn_base1", [x, y, x1 - x0, y1 - y0], Some([x0, y0, x1 - x0, y1 - y0]));
+                }
+                Ctl::Lang(k) => {
+                    // texture 1242 (conf_parts #19): a row of 88 per language, columns 256 apart
+                    let src = [col * 256.0, 88.0 * k as f32, 248.0, 80.0];
+                    self.sprite(q, CONF_LANG_TEX, [x, y, 248.0, 80.0], Some(src));
                 }
                 Ctl::Radio(k, v) => {
                     let (cy, w) = RADIO_CELLS[k][usize::from(!v)];
@@ -3327,7 +3707,7 @@ impl Ui {
         // the cursor to the tabs as pad Left does (enter_side) and moves the tab cursor; a click opens it
         if matches!(self.screen, Screen::SaveLoad { .. } | Screen::Config)
             && self.stack.last() == Some(&Screen::Menu)
-            && let Some(i) = (0..5).find(|&i| rect_hit([80.0, 105.0 + i as f32 * 75.0, 224.0, 88.0], (x, y)))
+            && let Some(i) = (0..5).find(|&i| rect_hit(Self::menu_tab_rect(i), (x, y)))
         {
             if !self.side {
                 self.enter_side();
@@ -3422,7 +3802,19 @@ impl Ui {
             self.intro_input(game);
             return;
         }
-        if self.screen == (Screen::SaveLoad { save: false, scroll: 0 }) && self.save_list(false).is_empty() && self.mouse.0 >= 368.0 {
+        // sub_4A410: with the back button fully in (state 2), a touch at x >= 546, y > 393 (640x448 units)
+        // presses B
+        if self.back_btn >= 1.0 && self.back_btn_on() && self.mouse.0 >= 546.0 * 3.0 && self.mouse.1 > 393.0 * H / 448.0 {
+            self.cancel(game, r);
+            return;
+        }
+        // sub_50FC0: a touch confirms only on the cursor's own row object (8 + cursor, sub_AE0B0), so on an
+        // empty list only the first frame's place shows the popup (Switch: a tap lower down does nothing)
+        let [fx, fy] = Self::save_frame(0);
+        if self.screen == (Screen::SaveLoad { save: false, scroll: 0 })
+            && self.save_list(false).is_empty()
+            && rect_hit([fx + 32.0, fy + 28.0, 898.0, 212.0], self.mouse)
+        {
             game.play_sys_sound(2);
             self.popup(game, 193, 480.0);
             return;
@@ -3431,7 +3823,7 @@ impl Ui {
         // a tap opens that tab (the open one too, which restarts it)
         if matches!(self.screen, Screen::SaveLoad { .. } | Screen::Config)
             && self.stack.last() == Some(&Screen::Menu)
-            && let Some(i) = (0..5).find(|&i| rect_hit([80.0, 105.0 + i as f32 * 75.0, 224.0, 88.0], self.mouse))
+            && let Some(i) = (0..5).find(|&i| rect_hit(Self::menu_tab_rect(i), self.mouse))
         {
             self.help_t = 0.0;
             self.sys_tab = i;
@@ -3487,6 +3879,13 @@ impl Ui {
                 } else {
                     self.gal_to_side(game);
                 }
+            }
+            // sub_4CEA0: B (or a left / up swipe) closes the system menu and moves the remembered touch to y 398
+            Screen::Menu => {
+                if !self.busy() {
+                    self.touch.at[1] = 398.0;
+                }
+                self.act(game, r, Action::Back);
             }
             _ => self.act(game, r, Action::Back),
         }
@@ -3631,9 +4030,10 @@ impl Ui {
             }
             return;
         }
-        if matches!(self.screen, Screen::Confirm(_)) && dx != 0 {
-            // No is on the left, Yes on the right
-            self.hover = Some(usize::from(dx < 0));
+        if matches!(self.screen, Screen::Confirm(_)) && (dx != 0 || dy != 0) {
+            // sub_49F00 state 2: any direction (pad or stick, mask 0xF000F0) toggles between No and Yes, so left
+            // from No goes to Yes (index 0 Yes, 1 No)
+            self.hover = Some(usize::from(self.hover != Some(1)));
             return;
         }
         if Self::gal_mode(self.screen).is_some() && self.gal_nav(game, r, dx, dy, enter) {
@@ -3719,6 +4119,9 @@ impl Ui {
                     rows.push(row(&[Ctl::Radio(k, true)]));
                     rows.push(row(&[Ctl::Radio(k, false)]));
                 }
+                for k in 0..4 {
+                    rows.push(row(&[Ctl::Lang(k)]));
+                }
             }
             1 => {
                 for i in 0..3 {
@@ -3793,12 +4196,11 @@ impl Ui {
         // sub_29930: keep the selected control in view. With y its unscrolled position (1080 units), the
         // scroll goes to y - 260 when that is above it, else to y - 870 when that is below it; voice volume
         // knobs (objects 99 + 5k, placed 44.8 units above their row) use y - 152 / y - 772.
-        if let Some((c, p)) = self.hover.and_then(|h| layout.get(h).copied())
+        if let Some((c, [_, y])) = self.hover.and_then(|h| self.conf_layout_at(0.0).get(h).copied())
             && !matches!(c, Ctl::Tab(_) | Ctl::Default)
         {
-            let y = p[1] + self.conf_scroll;
             let knob = self.conf_tab == 1 && matches!(c, Ctl::Slider(i) if i >= 3);
-            let (top, bottom) = if knob { (y - 152.0, y - 772.0) } else { (y - 260.0, y - 870.0) };
+            let (top, bottom) = if knob { (y - 260.0 + 108.0, y - 870.0 + 98.0) } else { (y - 260.0, y - 870.0) };
             let cur = self.conf_target[self.conf_tab];
             if top < cur {
                 self.conf_scroll_to(top);
@@ -3872,6 +4274,7 @@ impl Ui {
     /// Scroll range of tab `tab` (conf_max for the open one).
     fn conf_max_of(&self, tab: usize) -> f32 {
         match tab {
+            0 if crate::assets::overseas() => CONF_MAX_SYSTEM_EN,
             0 => CONF_MAX_SYSTEM,
             1 => (122.0 * self.voice_rows.len() as f32).max(113.0) - 113.0,
             _ => 0.0,
@@ -4035,7 +4438,10 @@ impl Ui {
             || self.cont_slot.is_some()
             || self.load_popup.is_some()
             || self.save_wait.is_some()
+            || self.delete_wait.is_some()
             || (self.screen == Screen::Config && (self.conf_next.is_some() || self.conf_ca < 1.0))
+            || self.lang_seq.is_some()
+            || self.lang_cool > 0
     }
 
     /// An answered confirm dialog still up: input waits for dword_B34B54 (sub_496F0).
@@ -4237,7 +4643,9 @@ impl Ui {
                 self.go_to_title(game);
             }
             Action::OpenExtra => {
-                // cGallery state 0: the menu takes [2] as its mode before, then [0] and [2] go to -1
+                // cGallery state 0: the menu takes [0] as its first mode (sub_6124, 0 when unset) and [2] as its
+                // mode before, then [0] and [2] go to -1
+                self.gal_first = self.gal_ret[0];
                 self.gal_prev = self.gal_ret[2];
                 self.gal_ret[0] = -1;
                 self.gal_ret[2] = -1;
@@ -4251,7 +4659,7 @@ impl Ui {
             }
             Action::EnterGallery => {
                 if !self.tex.contains_key("gallerymenu_btn") {
-                    match game.assets.ui_textures(r, "GALLERY_PARTS_JA") {
+                    match game.assets.ui_textures(r, &game.assets.ui_atlas("GALLERY_PARTS")) {
                         Ok(list) => self.tex.extend(list),
                         Err(e) => tracing::warn!("gallery parts: {e:#}"),
                     }
@@ -4260,18 +4668,38 @@ impl Ui {
                 self.black_speed = 0.0;
                 self.black_under = false;
                 self.menu_bg.fade(0.04);
-                self.act(game, r, Action::OpenGallery);
+                // the first mode (cGalleryMenu + 48): the one the gallery last closed on
+                match std::mem::replace(&mut self.gal_first, -1) {
+                    m @ (1 | 3 | 4) => self.act(game, r, Self::hub_items()[m as usize].1),
+                    2 => {
+                        self.act(game, r, Action::OpenGallery);
+                        self.gal_tab = 2;
+                        self.open_flow_at(game, true, -1);
+                    }
+                    _ => self.act(game, r, Action::OpenGallery),
+                }
             }
             Action::OpenMusic => {
                 use crate::game::get_bit;
                 if self.sysmes.is_empty() {
                     self.sysmes = game.assets.sysmes();
                 }
+                // cGalleryMusic (sub_19518) first marks the BGM playing (sub_9C460: the last one started, here
+                // the gallery's) heard (sub_64F60, n <= 0x417)
+                if let Some((n, _)) = game.sound.bgm_state()
+                    && (0..=0x417).contains(&n)
+                {
+                    crate::game::set_bit(&mut game.heard, n as usize);
+                }
                 self.music_ok = crate::gallery::music_unlocked(
                     |n| n > 0 && get_bit(&game.heard, n as usize),
                     |n| get_bit(&game.nodes, n),
                     game.movie_flags,
                 );
+                // sub_19EC4 marks a row's own BGM heard when an alternate or a flag unlocked it (sub_64F60)
+                for (i, _) in self.music_ok.iter().enumerate().filter(|(_, ok)| **ok) {
+                    crate::game::set_bit(&mut game.heard, crate::gallery_table::MUSIC[i].0 as usize);
+                }
                 self.enter_mode(game, Screen::Music);
             }
             Action::Track(i) => {
@@ -4332,23 +4760,25 @@ impl Ui {
             Action::Movie(i) => {
                 let flag = crate::gallery::MOVIES[i].1;
                 if flag.is_none_or(|f| game.movie_flags & (1 << f) != 0) {
-                    // sub_183EC: sound 1, then the dialog
+                    // sub_183EC: A plays the movie at once (sub_4F28) with sound 1; its dialog 25 (state 3,
+                    // sub_1873C) is never entered, as A sets state 4 directly
+                    self.play_gallery_movie(game, i);
                     self.snd(game, 1);
-                    self.confirm(game, Confirm::Movie(i));
                 }
             }
             Action::OpenEndings => self.enter_mode(game, Screen::Endings),
             Action::Ending(i) => {
-                let ok = if i == 24 { Self::all_endings(game) } else { crate::game::get_bit(&game.nodes, crate::gallery::ENDINGS[i].0) };
+                let ok = Self::ending_ok(game, i);
                 if ok {
-                    // sub_E7A4: sound 1, then the dialog
+                    // sub_E7A4: sound 1, then the dialog; cGalleryEnding keeps its cursor (+56 / +60) under it
+                    self.gal_mem = Some(Action::Ending(i));
                     self.snd(game, 1);
                     self.confirm(game, Confirm::Ending(i));
                 }
             }
             Action::OpenGallery => {
                 if !self.tex.contains_key("cg_thumb_all") {
-                    match game.assets.ui_textures(r, "CG_THUMB_PARTS_JA") {
+                    match game.assets.ui_textures(r, &game.assets.ui_atlas("CG_THUMB_PARTS")) {
                         Ok(list) => self.tex.extend(list),
                         Err(e) => tracing::warn!("gallery thumbnails: {e:#}"),
                     }
@@ -4424,6 +4854,10 @@ impl Ui {
             }
             Action::Slot(i) => {
                 let Screen::SaveLoad { save, .. } = self.screen else { return };
+                // sub_50FC0 0x52230: with dword_AFFCC4 running the press is taken as navigation only
+                if self.save_cool > 0 {
+                    return;
+                }
                 if save {
                     if self.slots.get(i).is_some_and(|s| s.is_some()) {
                         self.confirm(game, Confirm::Overwrite(i));
@@ -4447,6 +4881,16 @@ impl Ui {
                 match Ctl::from_code(i) {
                     Some(Ctl::Default) => {
                         self.confirm(game, Confirm::Defaults);
+                        return;
+                    }
+                    // objects 78..81: byte_9D3A24 = 4 + language, config state 10 (sub_2D720) the next frame,
+                    // input held for 5 frames past the change (dword_9D3A60)
+                    Some(Ctl::Lang(k)) => {
+                        self.snd(game, 1);
+                        self.conf_hold = 20;
+                        self.lang_pick = Some(k);
+                        self.lang_cool = 5;
+                        self.lang_seq = Some(LangSeq { state: 0, word: k as i16, fresh: true });
                         return;
                     }
                     Some(Ctl::Toggle(_) | Ctl::Radio(..) | Ctl::Mute(_)) => self.snd(game, 1),
@@ -4489,7 +4933,11 @@ impl Ui {
                 m.t += secs;
                 if m.t >= 0.5 {
                     game.gallery_movie = true;
-                    game.play_movie(r, crate::movie::MOVIES[crate::gallery::MOVIES[m.n].0]);
+                    {
+                        // jp_18EA4: the language's copy (sub_41260)
+                        let entry = crate::movie::localized(crate::gallery::MOVIES[m.n].0, game.assets.language());
+                        game.play_movie(r, &crate::movie::movie_name(entry).unwrap_or_default());
+                    }
                     m.phase = 1;
                 }
             }
@@ -4680,7 +5128,6 @@ impl Ui {
     /// A confirm dialog's Yes, once its hold is over (the callers wait for sub_496F0() == 0).
     fn confirm_yes(&mut self, game: &mut Game, r: &Renderer, c: Confirm) {
         match c {
-            Confirm::Movie(i) => self.play_gallery_movie(game, i),
             // cGalleryEnding: the "Teach me, Ciel-sensei" scene replays (sub_5040(scene, -1, -1))
             Confirm::Ending(i) => self.gal_replay(crate::gallery::ENDINGS[i].1, -1, -1),
             Confirm::Title => {
@@ -4696,6 +5143,7 @@ impl Ui {
             // byte_B359DC = 1: F024 stays, so the story ends back in the gallery
             Confirm::EndReplay => self.leave_to_title(game, r),
             Confirm::Overwrite(i) => self.save(game, r, i),
+            Confirm::Delete(i) => self.delete(game, i),
             // state 18, Yes: popup 184 held open (sub_4ABE0(0xB8) + sub_4ABD0(1)), state 19 loads once it shows
             Confirm::Load(i) => {
                 self.popup(game, 184, f32::INFINITY);
@@ -4763,6 +5211,68 @@ impl Ui {
         }
     }
 
+    /// sub_50FC0 (overseas) state 23, once the dialog has closed: "Deleting..." (188) held, the record cleared
+    /// and the file written (sub_4EC60(2)); state 24 plays sound 1 when the write is done ("Failed" 189
+    /// otherwise), and state 25 15 frames on closes the popup, rebuilds the list (sub_51CF0) and shows
+    /// "Deleted" (217 of the overseas file) for 300 frames; state 26 waits for it to close.
+    fn delete(&mut self, game: &mut Game, slot: usize) {
+        self.popup_held(game, 188, f32::INFINITY);
+        // state 23 sets dword_AFFCC4 to 180 (sub_40E70)
+        self.save_cool = 180;
+        self.file.delete_record(slot);
+        self.file.update_continue();
+        match self.file.store() {
+            Ok(()) => self.delete_wait = Some(0.0),
+            Err(e) => {
+                tracing::warn!("deleting save {slot}: {e:#}");
+                self.popup(game, 189, 480.0);
+                self.refresh_slots(game);
+            }
+        }
+    }
+
+    /// sub_51CF0: the list again (sub_50790), its scroll kept in range and the cursor on the last entry when
+    /// the list got shorter than it.
+    fn delete_refresh(&mut self, game: &mut Game) {
+        self.save_order = None;
+        self.refresh_slots(game);
+        let Screen::SaveLoad { save, scroll } = self.screen else { return };
+        let count = self.save_list(save).len();
+        let mut cur = self.hover.filter(|&h| h < SLOTS_PER_PAGE).unwrap_or(0);
+        let scroll = if count == 0 {
+            cur = 0;
+            0
+        } else if count > SLOTS_PER_PAGE {
+            scroll.min(count - SLOTS_PER_PAGE)
+        } else {
+            cur = cur.min(count - 1);
+            0
+        };
+        self.screen = Screen::SaveLoad { save, scroll };
+        self.hover = Some(cur);
+        self.save_seen = Some((save, self.hover, scroll));
+        self.save_notes = self.cursor_notes();
+        self.save_pointer_row(game);
+    }
+
+    /// The save list's X (overseas sub_50FC0 state 2, 0x1000): a used entry under the cursor asks to delete it.
+    pub(super) fn save_delete_key(&mut self, game: &mut Game) {
+        let Screen::SaveLoad { save, scroll } = self.screen else { return };
+        // (0x1000 && sub_40E90: not while dword_AFFCC4 runs)
+        if game.assets.build != knife_core::exe::Build::Overseas || self.side || self.busy() || self.save_cool > 0 {
+            return;
+        }
+        let Some(slot) = self.hover.filter(|&h| h < SLOTS_PER_PAGE).and_then(|h| self.save_list(save).get(scroll + h).copied()) else {
+            return;
+        };
+        if self.slots.get(slot).is_some_and(|s| s.is_some()) {
+            self.confirm(game, Confirm::Delete(slot));
+        } else {
+            // state 21 (overseas 0x51FC0, LABEL_293): a blank slot gets popup 193 "No save data found."
+            self.popup(game, 193, 480.0);
+        }
+    }
+
     /// sub_50FC0 state 9, 41 frames after the popup closed: the list is rebuilt (sub_50790) with the cursor on
     /// the new save: entry 1 when the list (count, the blank slot included) is 2..4 long, else scroll 1 and
     /// row 0 while a blank slot leads, else entry 0.
@@ -4781,6 +5291,38 @@ impl Ui {
         let (scroll, cur) = if count < 5 || used >= save::LIST_SLOTS { (0, usize::from(count > 1 && count <= 4)) } else { (1, 0) };
         self.screen = Screen::SaveLoad { save, scroll };
         self.hover = Some(cur);
+        self.save_seen = Some((save, self.hover, scroll));
+        self.save_notes = self.cursor_notes();
+        self.save_pointer_row(game);
+    }
+
+    /// sub_50FC0 state 2 after a list rebuild, which sets the cursor without sub_AE0E0: the hovered object
+    /// (sub_AE0B0) is still the entry last touched or pointed at (sub_AE840 keeps it while no touch or mouse
+    /// move is active, until a pad move refocuses another object), so the next frame the cursor goes back to
+    /// it with sound 0 and the flash (Switch: a touch save on the new-save entry leaves the cursor there)
+    fn save_pointer_row(&mut self, game: &mut Game) {
+        if self.key_focus || self.side {
+            return;
+        }
+        let items = self.items(game);
+        let Some(h) = items.iter().position(|(r, a)| matches!(a, Action::Slot(_)) && rect_hit(*r, self.mouse)) else { return };
+        if self.hover != Some(h) {
+            self.hover = Some(h);
+            self.snd(game, 0);
+            self.save_flash = 1.0;
+            if let Screen::SaveLoad { save, scroll } = self.screen {
+                self.save_seen = Some((save, self.hover, scroll));
+            }
+            self.save_notes = self.cursor_notes();
+        }
+    }
+
+    /// sub_50B10: the notes text of the save list's cursor entry (slot 38), none for a free entry
+    fn cursor_notes(&self) -> Option<String> {
+        let Screen::SaveLoad { save, scroll } = self.screen else { return None };
+        let h = self.hover.filter(|&h| h < SLOTS_PER_PAGE)?;
+        let slot = *self.save_list(save).get(scroll + h)?;
+        self.slots.get(slot).cloned().flatten().map(|d| d.preview)
     }
 
     pub fn debug_save(&mut self, game: &mut Game, r: &Renderer, slot: usize) -> bool {
@@ -4800,10 +5342,12 @@ impl Ui {
         if self.screen != Screen::Game {
             return;
         }
-        // sub_52860 (mode panel): written silently, the Quick Save banner shows
+        // sub_52860 (mode panel): written silently, the Quick Save banner shows; sub_4E170 then sets
+        // dword_AFFCC4 to 180 (sub_40E70)
         if game.can_save() && self.write_quiet(game, r, save::QUICK_SLOT) {
             self.show_banner(1);
         }
+        self.save_cool = 180;
     }
 
     pub fn quick_load(&mut self, game: &mut Game, r: &Renderer) {
@@ -4847,8 +5391,15 @@ impl Ui {
         // and its backdrop fade out at 1/30 per frame and the title follows once both are done (sub_4D7E0)
         // and none at all while saving is off (F025, sub_47B10)
         let off = game.var("F025") != 0;
-        if !(same || off || !game.can_save() || !self.write_quiet(game, r, save::AUTO_FIRST)) {
-            self.show_banner(2);
+        if !(same || off || !game.can_save()) {
+            // sub_52AA0 puts the record in the list either way; with dword_AFFCC4 running it returns before
+            // the file write (sub_4EC60(2)) and so without the banner. The caller then sets 180.
+            if self.save_cool > 0 {
+                self.write_memory(game, save::AUTO_FIRST);
+            } else if self.write_quiet(game, r, save::AUTO_FIRST) {
+                self.show_banner(2);
+            }
+            self.save_cool = 180;
         }
         self.title_after_banner = true;
         self.closing = true;
@@ -4902,13 +5453,14 @@ impl Ui {
     }
 
     /// sub_91350, in 960x540 (x2 here): a navy box at 0.5 alpha with a black one at 0.753 inset by 0.5 over
-    /// x 384..936, y 480..517.5 (+ the rise offset), and SYSMES 239 (text slot 65, 0.42 of the 60 px glyph)
-    /// at (401, 490).
+    /// x 385..940 (English 355..940), y 480..517.5 (+ the rise offset), and SYSMES 239 (text slot 65, 0.42 of
+    /// the 60 px glyph) at x 401 (English 371), y 490.
     fn draw_complete(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
         let Some(c) = self.complete else { return };
         let y = (480.0 + c.off) * 2.0;
-        out.push(Quad::rect(r.white.clone(), [768.0, y, 1104.0, 75.0], [0.19216, 0.24706, 0.58039, 0.50196 * c.a]));
-        out.push(Quad::rect(r.white.clone(), [769.0, y + 1.0, 1102.0, 73.0], [0.0, 0.0, 0.0, 0.75294 * c.a]));
+        let (x0, tx) = if crate::text::english() { (355.0, 371.0) } else { (385.0, 401.0) };
+        out.push(Quad::rect(r.white.clone(), [x0 * 2.0, y, (940.0 - x0) * 2.0, 75.0], [0.19216, 0.24706, 0.58039, 0.50196 * c.a]));
+        out.push(Quad::rect(r.white.clone(), [x0 * 2.0 + 1.0, y + 1.0, (940.0 - x0) * 2.0 - 2.0, 73.0], [0.0, 0.0, 0.0, 0.75294 * c.a]));
         if self.sysmes.is_empty() {
             self.sysmes = game.assets.sysmes();
         }
@@ -4919,8 +5471,8 @@ impl Ui {
             self.font_sys = Self::sys_font(game, r);
         }
         let Some(font) = self.font_sys.as_mut() else { return };
-        let base = (490.0 + c.off) * 2.0 + SYS_ASCENT * SIZE[1];
-        font.draw_str_slot_rimmed(r, out, &text, SIZE, 4.0, [802.0, base], [1.0, 1.0, 1.0, c.a]);
+        let base = (490.0 + c.off) * 2.0 + SYS_ASCENT * gs() * SIZE[1];
+        font.draw_str_slot_rimmed(r, out, &text, SIZE, 4.0, [tx * 2.0, base], [1.0, 1.0, 1.0, c.a], 1);
     }
 
     fn show_banner(&mut self, idx: usize) {
@@ -4985,6 +5537,11 @@ impl Ui {
                 game.sound.stop_test_voice();
             }
         }
+        self.lang_ms += dt;
+        while self.lang_ms >= 1000.0 / 60.0 {
+            self.lang_ms -= 1000.0 / 60.0;
+            self.lang_frame(game, r);
+        }
         // dt is in milliseconds; the UI clocks run in seconds
         let secs = dt / 1000.0;
         self.stick_tick = (self.stick_tick + dt * 0.06).min(4.0);
@@ -4993,6 +5550,26 @@ impl Ui {
             self.stick_frame(game, r);
             self.drag_frame(game);
             self.conf_hold_frame(game);
+            // sub_40EB0 in sub_48AC0 (off_AE04E8 2 / 3; the title's LOAD runs in mode 2)
+            let story = self.screen == Screen::Game || self.stack.contains(&Screen::Game);
+            let load = matches!(self.screen, Screen::SaveLoad { .. })
+                || self.stack.iter().any(|s| matches!(s, Screen::SaveLoad { .. }));
+            if story || load {
+                self.save_cool = self.save_cool.saturating_sub(1);
+            }
+            self.save_flash = (self.save_flash - 0.2).max(0.0);
+            if let Screen::SaveLoad { save, scroll } = self.screen {
+                let cur = (save, self.hover, scroll);
+                if !self.side && self.save_seen.is_some_and(|(s, h, sc)| s == save && (h, sc) != (cur.1, cur.2)) {
+                    self.save_flash = 1.0;
+                }
+                if self.save_seen != Some(cur) {
+                    self.save_notes = self.cursor_notes();
+                }
+                self.save_seen = Some(cur);
+            } else {
+                self.save_seen = None;
+            }
         }
         self.gal_scroll.step(dt);
         // sub_9CBC / sub_1A7FC: while a stick, drag or slider scroll runs (flag bit 5), each frame re-picks the
@@ -5049,6 +5626,20 @@ impl Ui {
                 self.save_wait = Some(n);
             }
         }
+        if let Some(w) = self.delete_wait {
+            let n = w + secs * 60.0;
+            if w < 1.0 && n >= 1.0 {
+                self.snd(game, 1);
+            }
+            // state 24 the frame after (frame 1), then state 25 counting dword_F1F470 down from 15 (frame 17)
+            if n >= 17.0 {
+                self.delete_wait = None;
+                self.delete_refresh(game);
+                self.popup(game, crate::assets::SYSMES_DELETED, 300.0);
+            } else {
+                self.delete_wait = Some(n);
+            }
+        }
         if let Some(p) = &mut self.popup {
             let f = secs * 60.0;
             p.age += f;
@@ -5087,9 +5678,13 @@ impl Ui {
             }
         }
         // sub_4CBA0 -> sub_49630(1, ..) -> sub_2E000: the system menu blurs the scene (+1/12 per frame from
-        // 0.001) and the message text is hidden; it ends once the backdrop has faded out (sub_2E030(0, 1))
+        // 0.001) and the message text is hidden; it ends once the backdrop has faded out (sub_2E030(0, 1)).
+        // The backlog blurs it the same way (sub_28F80 state 1) until its own fade-out ends (state 8 /
+        // sub_28D50: sub_2E030(0, 0) at alpha 0).
         let f60 = secs * 60.0;
-        if self.screen == Screen::Menu && self.stack.contains(&Screen::Game) && game.menu_blur.is_none() {
+        let backlog = matches!(self.screen, Screen::Backlog { .. })
+            || self.stack.iter().any(|s| matches!(s, Screen::Backlog { .. }));
+        if (self.screen == Screen::Menu || backlog) && self.stack.contains(&Screen::Game) && game.menu_blur.is_none() {
             game.menu_blur = Some(0.001);
         } else if let Some(a) = &mut game.menu_blur {
             let over_game = self.screen == Screen::Game || self.stack.contains(&Screen::Game);
@@ -5099,9 +5694,8 @@ impl Ui {
                 *a = (*a + f60 / 12.0).min(1.0);
             }
         }
-        game.hide_text = matches!(self.screen, Screen::Backlog { .. })
-            || self.stack.iter().any(|s| matches!(s, Screen::Backlog { .. }))
-            || game.menu_blur.is_some() || self.touch.hidden;
+        game.hide_text = backlog || game.menu_blur.is_some() || self.touch.hidden;
+        game.touch_hidden = self.touch.hidden;
         if let Some(t) = self.playing_track.filter(|_| !self.music_paused) {
             // sub_1D314: the BGM loops between the track's loop points; with repeat the clock wraps back by the
             // loop's length past the end, without it the clock holds at the end and the track fades out over
@@ -5253,6 +5847,7 @@ impl Ui {
         if self.screen == Screen::Config && self.conf_tab == 0 {
             self.conf_preview_update(game, f);
         }
+        self.back_btn = (self.back_btn + if self.back_btn_on() { 0.04 } else { -0.04 } * f).clamp(0.0, 1.0);
         let on_title = self.screen == Screen::Title;
         if on_title != self.on_title {
             self.on_title = on_title;
@@ -5387,7 +5982,13 @@ impl Ui {
         self.sprite(out, "system_scenebg", [752.0, 0.0, 1168.0, 80.0], None);
         self.sprite(out, "underline", [0.0, 72.0, W, 16.0], None);
         let phase = game.var("F023");
-        if let Some(&[x0, y0, x1, y1]) = usize::try_from(phase).ok().and_then(|p| PHASE_TITLES.get(p)) {
+        // sub_4C370: the cell table by language (overseas: English + 232, Chinese + 308, Japanese + 156 words)
+        let cells = match game.assets.language() {
+            0 => PHASE_TITLES,
+            1 => PHASE_TITLES_EN,
+            _ => PHASE_TITLES_ZH,
+        };
+        if let Some(&[x0, y0, x1, y1]) = usize::try_from(phase).ok().and_then(|p| cells.get(p)) {
             let src = [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32];
             self.sprite(out, "system_phasetitle_ja", [8.0, 0.0, src[2], src[3]], Some(src));
         }
@@ -5402,10 +6003,11 @@ impl Ui {
             if let Some(font) = self.font_sys.as_mut() {
                 const SIZE: [f32; 2] = [60.0 * 0.36, 60.0 * 0.36];
                 let w = font.measure_slot(&t, SIZE, 1.0);
-                font.draw_str_slot(r, out, &t, SIZE, 1.0, [1824.0 - w, 17.0 * H / 448.0 + SYS_ASCENT * SIZE[1]], [0.0, 0.0, 0.0, 1.0]);
+                font.draw_str_slot(r, out, &t, SIZE, 1.0, [1824.0 - w, 17.0 * H / 448.0 + SYS_ASCENT * gs() * SIZE[1]], [0.0, 0.0, 0.0, 1.0]);
             }
         }
-        self.sprite(out, "menu_window", [56.0, 0.0, 312.0, H], None);
+        // texture 502 at (18.667, 1) in 640x448 units (sub_4C370)
+        self.sprite(out, "menu_window", [56.0, H / 448.0, 312.0, H], None);
         // sub_4CB30: while saving is off (F025) Save and Load show their normal cell in every state at alpha
         // 0x8F (sprite sets 0x5912F8 / 0x591348)
         let locked = game.var("F025") != 0;
@@ -5561,14 +6163,24 @@ impl Ui {
                 let (u0, u1) = if d.flip { ((x + w) / tw, x / tw) } else { (x / tw, (x + w) / tw) };
                 out.push(Quad::rect(t.clone(), d.dst, [1.0, 1.0, 1.0, d.alpha]).with_uv_rect(u0, y / th, u1, (y + h) / th));
             }
-            let clip = [[0.0, 0.0], [W, 0.0], [W, fx::LOGO_CLIP_Y], [0.0, fx::LOGO_CLIP_Y]];
+            let cy = fx::logo_clip_y();
+            let clip = [[0.0, 0.0], [W, 0.0], [W, cy], [0.0, cy]];
             for q in &mut out[n0..] {
                 q.clip = Some(clip);
             }
         }
-        for (k, (y0, y1)) in [(0.0, 285.0), (285.0, 570.0), (570.0, 648.0)].into_iter().enumerate() {
+        // sub_8D5D0: three slices of texture 317 (jd_65CBD0 + 24 * language) at unk_231580[language] in
+        // 960x544 units; English draws a wider logo lower, in two slices (the first cell is empty)
+        let english = game.assets.language() == 1;
+        let (lx, ly, w, slices) = if english {
+            (35.0, 111.82222 * H / 544.0, 1850.0, [(0.0, 1.0), (1.0, 330.0), (330.0, 440.0)])
+        } else {
+            (680.0, 36.266666 * H / 544.0, 560.0, [(0.0, 285.0), (285.0, 570.0), (570.0, 648.0)])
+        };
+        for (k, (y0, y1)) in slices.into_iter().enumerate() {
             let alpha = if self.logo_rising { a.powi(k as i32 + 1) } else { a };
-            self.sprite_c(out, "title_titlelog", [680.0, 72.0 + y0, 560.0, y1 - y0], Some([0.0, y0, 560.0, y1 - y0]), alpha, Blend::Alpha);
+            let w = if english && k == 0 { 1.0 } else { w };
+            self.sprite_c(out, "title_titlelog", [lx, ly + y0, w, y1 - y0], Some([0.0, y0, w, y1 - y0]), alpha, Blend::Alpha);
         }
         if self.press {
             // press_start blinks (qword_1536188: 1/60 per frame up and down), top-centre at (960, 823)
@@ -5576,11 +6188,12 @@ impl Ui {
             self.sprite_c(out, "press_start", [724.0, 823.17, 472.0, 88.0], None, blink, Blend::Alpha);
         } else {
             let pulse = 1.0 - ((self.title_clock * 0.5) % 2.0 - 1.0).abs();
-            self.sprite_c(out, "titlemenu_lumi", [720.0, 552.0, 488.0, 256.0], None, hi * pulse, Blend::Add);
-            let items = self.items(game);
+            // texture 321 at unk_231560[language] (960x544 units; English y 196.948)
+            let ly = if game.assets.language() == 1 { 196.94815 } else { 278.04443 } * H / 544.0;
+            self.sprite_c(out, "titlemenu_lumi", [720.0, ly, 488.0, 256.0], None, hi * pulse, Blend::Add);
             let entries = self.title_entries();
-            for (i, (rc, _)) in items.iter().enumerate() {
-                let (_, tex, normal) = entries[i];
+            for (i, &(_, tex, normal)) in entries.iter().enumerate() {
+                let rc = Self::title_slot(i, entries.len());
                 let src = Self::title_src(normal, usize::from(self.hover == Some(i)));
                 self.sprite_c(out, tex, [rc[0], rc[1], src[2], src[3]], Some(src), hi, Blend::Alpha);
             }
@@ -5637,8 +6250,11 @@ impl Ui {
             Screen::Music if matches!(self.hover.and_then(|h| self.items(game).get(h).map(|(_, a)| *a)), Some(Action::MusicCtl(_) | Action::MusicVol)) => Some(10),
             Screen::Flowchart { .. } => Some(if self.flow.as_ref().is_some_and(|c| c.scroll_max > 0.0) { 0 } else { 10 }),
             Screen::CgView { .. } => Some(9),
+            // the overseas save list's guide (11) adds X 削除
+            Screen::SaveLoad { .. } if game.assets.build == knife_core::exe::Build::Overseas => Some(11),
             Screen::Music | Screen::SaveLoad { .. } => Some(0),
-            Screen::Config => Some(2),
+            // sub_2AA80 (overseas 0x2BA10): the Controls tab (dword_AED32C == 2) has guide 1 (B back, L/R page)
+            Screen::Config => Some(if self.conf_tab == 2 { 1 } else { 2 }),
             Screen::Backlog { .. } => Some(3),
             _ => None,
         }
@@ -5690,7 +6306,7 @@ impl Ui {
             let (tex, r, bottom, pad) = if kind == 0 {
                 ("help_key", GUIDE_ICONS[id as usize], 445.0, 6.0)
             } else {
-                ("help_txt_ja", GUIDE_WORDS[id as usize], 444.0, 4.0)
+                ("help_txt_ja", self.guide_words.1.get(id as usize).copied().unwrap_or(GUIDE_WORDS[id as usize]), 444.0, 4.0)
             };
             let [x0, y0, x1, y1] = r.map(f32::from);
             self.sprite(out, tex, [x, (bottom + dy) * k - (y1 - y0), x1 - x0, y1 - y0], Some([x0, y0, x1 - x0, y1 - y0]));
@@ -5700,15 +6316,17 @@ impl Ui {
 
     /// dialog_win (824x416) centred on the screen, scaled by the opening animation.
     /// sub_4AE90's thumbnail (the quick save, record 139, loaded by sub_89590 and made by sub_89AD0): 100 *
-    /// 0.82667 * 0.825 x 53 * 1.0859 * 0.825 units hanging from (320, 202) over a black frame 2 units wider each
-    /// side, once it is made.
+    /// 0.82667 * 0.825 x 53 * 1.0859 * 0.825 units hanging from (320, 202) (English 214) over a black frame 2
+    /// units wider each side, once it is made.
     fn draw_dialog_thumb(&self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
         let Some(d) = self.slots.get(save::QUICK_SLOT).cloned().flatten() else { return };
-        let Some(t) = game.preview(save::QUICK_SLOT, &d.layers) else { return };
+        let Some(t) = game.preview(save::QUICK_SLOT, &d) else { return };
         let (w, h) = (100.0 * 0.82667 * 0.825, 53.0 * 1.0859 * 0.825);
         let (ux, uy) = (W / 640.0, H / 448.0);
-        out.push(Quad::rect(r.white.clone(), [(318.0 - w / 2.0) * ux, 200.0 * uy, (w + 4.0) * ux, (h + 4.0) * uy], [0.0, 0.0, 0.0, 1.0]));
-        out.push(Quad::rect(t, [(320.0 - w / 2.0) * ux, 202.0 * uy, w * ux, h * uy], [1.0; 4]));
+        // the frame's top: 212 for English (the longer message), else 200
+        let y = if crate::text::english() { 212.0 } else { 200.0 };
+        out.push(Quad::rect(r.white.clone(), [(318.0 - w / 2.0) * ux, y * uy, (w + 4.0) * ux, (h + 4.0) * uy], [0.0, 0.0, 0.0, 1.0]));
+        out.push(Quad::rect(t, [(320.0 - w / 2.0) * ux, (y + 2.0) * uy, w * ux, h * uy], [1.0; 4]));
     }
 
     /// dialog_win at alpha `t`, scaled by `k` about the centre.
@@ -5733,8 +6351,8 @@ impl Ui {
         let size = [60.0 * 0.37 * k, 60.0 * 0.46044 * k];
         let lay = crate::game::LAYOUT;
         let top = (224.0 - 42.311 * k) * H / 448.0;
-        let baseline = top + lay.ascent * size[1] / lay.size;
-        let pitch = crate::text::PAIR_METRIC * size[1] / crate::text::BASE_SIZE + 14.0;
+        let baseline = top + crate::text::msg_ascent(lay.ascent * size[1] / lay.size);
+        let pitch = crate::text::line_feed() * gs() * size[1] / crate::text::BASE_SIZE + 14.0;
         let font = game.font_mut();
         for (i, line) in msg.split('^').enumerate() {
             let lw = font.measure_slot(line, size, 4.0);
@@ -5755,8 +6373,8 @@ impl Ui {
         const SIZE: [f32; 2] = [60.0 * 0.6, 60.0 * 0.7];
         const SPACING: f32 = 4.0;
         let lay = crate::game::LAYOUT;
-        let baseline = top + lay.ascent * SIZE[1] / lay.size;
-        let pitch = crate::text::PAIR_METRIC * SIZE[1] / crate::text::BASE_SIZE + line_sp + 14.0;
+        let baseline = top + crate::text::msg_ascent(lay.ascent * SIZE[1] / lay.size);
+        let pitch = crate::text::line_feed() * gs() * SIZE[1] / crate::text::BASE_SIZE + line_sp + 14.0;
         let font = game.font_mut();
         for (k, line) in msg.split('^').enumerate() {
             let w = font.measure_slot(line, SIZE, SPACING);
@@ -5765,10 +6383,13 @@ impl Ui {
     }
 
     pub fn draw(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
+        if self.guide_words.0 != game.assets.language() {
+            self.guide_words = (game.assets.language(), game.assets.guide_words());
+        }
         self.draw_screen(game, r, out);
         if self.screen == Screen::Game {
             self.draw_choice_dialog(game, r, out);
-            self.draw_touch_game(game, r, out);
+            self.draw_touch_game(r, out);
         }
         self.draw_ripples(r, out);
     }
@@ -5822,14 +6443,23 @@ impl Ui {
                     let [fx, fy] = Self::save_frame(i);
                     let src = if hovered(i) { [31.0, 336.0, 960.0, 272.0] } else { [32.0, 32.0, 960.0, 272.0] };
                     self.sprite(out, "save_win", [fx, fy, 960.0, 272.0], Some(src));
+                    if hovered(i) && self.save_flash > 0.0 {
+                        self.sprite_c(out, "save_win", [fx, fy, 960.0, 272.0], Some([31.0, 336.0, 960.0, 272.0]), self.save_flash, Blend::Add);
+                    }
                     let Some(d) = self.slots.get(slot).cloned().flatten() else { continue };
                     if hovered(i) {
                         selected = Some(d.clone());
                     }
                     // sub_4F240: 100 * 0.827 x 53 * 1.092 units at (151, y + 23.23), quad scale 1.15 about its top left
                     let thumb = [fx + 52.0, fy + 56.0, 300.0 * 0.827 * 1.15, 53.0 * 1.092 * 1.15 * H / 448.0];
-                    // drawn only once made (word_F1F438[40]); nothing in its place until then
-                    if let Some(t) = game.preview(slot, &d.layers) {
+                    // drawn only once made (word_F1F438[40]); nothing in its place until then. Overseas the whole
+                    // entry (frame overlay, date, time, AUTO tag, titles) waits for it too: a fresh save's row stays
+                    // blank until its thumbnail is made, while the info panel already shows the record
+                    let pic = game.preview(slot, &d);
+                    if pic.is_none() && game.assets.build == knife_core::exe::Build::Overseas {
+                        continue;
+                    }
+                    if let Some(t) = pic {
                         out.push(Quad::rect(t, thumb, [1.0; 4]));
                     }
                     self.sprite(out, "save_scene_plus", [fx, fy, 960.0, 272.0], Some([32.0, 32.0, 960.0, 272.0]));
@@ -5848,7 +6478,16 @@ impl Ui {
                     }
                     let var = |k: &str| d.vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map_or(0, |v| v.1);
                     let phase = var("F023").clamp(0, 37) as usize;
-                    let [x0, y0, x1, y1] = SAVE_TITLES[phase];
+                    let [x0, y0, x1, y1] = match (game.assets.build, game.assets.language()) {
+                        (knife_core::exe::Build::Overseas, 1) => SAVE_TITLES_EN[phase],
+                        (b, _) => {
+                            let mut r = SAVE_TITLES[phase];
+                            if b == knife_core::exe::Build::Overseas && matches!(phase, 16 | 18) {
+                                r[2] = 571;
+                            }
+                            r
+                        }
+                    };
                     let src = [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32];
                     self.sprite(out, "savetitle", [fx + 359.0, fy + 121.0, src[2], src[3]], Some(src));
                     let scene = usize::try_from(var("F022")).ok().and_then(|t| self.sysmes.get(t + 395)).cloned();
@@ -5860,7 +6499,7 @@ impl Ui {
                         }
                         if let Some(font) = self.font_sys.as_mut() {
                             const SIZE: [f32; 2] = [60.0 * 0.35, 60.0 * 0.35];
-                            let base = fy + 79.644 * H / 448.0 + SYS_ASCENT * SIZE[1];
+                            let base = fy + 79.644 * H / 448.0 + SYS_ASCENT * gs() * SIZE[1];
                             font.draw_str_slot(r, out, &sc, SIZE, 1.0, [fx + 423.0, base], [0.0, 0.0, 0.0, 1.0]);
                         }
                     }
@@ -5878,27 +6517,31 @@ impl Ui {
                     // sub_50B10: slot 38 in the message font (flags 0x83040) at 0.4, box 130 x 46, spacing
                     // (-5, -7) + (4, 14), laid out like the messages (dash runs in the exfont); sub_4F240 places it
                     // at (463.333, 259.259)
-                    let size = 60.0 * 0.4;
+                    let size = 60.0 * 0.4 * gs();
                     let lay = crate::text::Layout {
                         left: 1390.0,
                         // sub_A7790: the box width in px, (int)(130 * 1920 / 640)
                         right: 1390.0 + 390.0,
                         size,
-                        spacing: -1.0,
-                        line_height: crate::text::PAIR_METRIC * size / crate::text::BASE_SIZE + 7.0,
-                        ascent: crate::game::LAYOUT.ascent * size / crate::game::LAYOUT.size,
+                        // character spacing -5 + 4 (English -4 + 4, sub_50B10)
+                        spacing: if crate::text::english() { 0.0 } else { -1.0 },
+                        line_height: crate::text::line_feed() * size / crate::text::BASE_SIZE + 7.0,
+                        ascent: crate::text::msg_ascent(crate::game::LAYOUT.ascent * 60.0 * 0.4 / crate::game::LAYOUT.size),
                     };
-                    let runs = crate::text::parse_markup(&d.preview);
+                    let runs = crate::text::parse_markup_edge(self.save_notes.as_deref().unwrap_or(""), false);
                     let mut placed = Vec::new();
                     let font = game.font_mut();
                     let top = 259.259 * H / 448.0 + lay.ascent;
                     crate::text::layout(font, &lay, &runs, lay.left, top, 0, &mut placed);
                     // colour 0 (black); sub_A8330(38, 4): the writer shows 4 lines
-                    for pc in placed.iter().filter(|pc| pc.baseline < top + 3.5 * lay.line_height) {
+                    let shown = |pc: &&crate::text::PlacedChar| pc.baseline < top + 3.5 * lay.line_height;
+                    for pc in placed.iter().filter(shown) {
                         if let Some(q) = font.placed_quad(r, pc, 0.0, 0.0, [0.0, 0.0, 0.0, 1.0]) {
                             out.push(q);
                         }
                     }
+                    // the note slot has no edge: the plain bar sheet
+                    out.extend(placed.iter().filter(shown).filter_map(|pc| game.bar_quad(pc, None, [0.0, 0.0, 0.0, 1.0], false)));
                 }
                 // the sub_9B0C4 widget (qword_F1F480, sub_50E00): range max(entries, 4) - 4, thumb at the top row
                 let range = self.save_list(save).len().saturating_sub(SLOTS_PER_PAGE);
@@ -5940,8 +6583,11 @@ impl Ui {
             // node preview (thumcg_top + 1 + n, 430x243) at 1380,120, the "this scene" tag at
             // 1672,120, and SYSMES title / description at 1392,404 and 1392,452
             Screen::Flowchart { .. } => {
-                // over the submenu backdrop (sub_4B880), as the system menu / gallery left it
-                out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 1.0]));
+                // over the submenu backdrop (sub_4B880), as the system menu / gallery left it: in game over the
+                // blurred scene (flow_bg is translucent, alpha 140..255; Switch: the scene shows through)
+                if matches!(screen, Screen::Flowchart { gallery: true }) {
+                    out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 1.0]));
+                }
                 self.draw_menu_layer(out);
                 // the chart fades in / out over 0.5 s (quad in / out); in the gallery the menu frame and
                 // buttons fade the other way at the same time (sub_7328 / sub_7624: 0.5 s quad out / in) with
@@ -5951,8 +6597,13 @@ impl Ui {
                     self.draw_below(game, r, out, (1.0 - s) * (1.0 - s));
                 }
                 let nf = out.len();
-                self.sprite(out, "flow_bg", [0.0, 0.0, W, H], None);
-                self.sprite(out, "flow_infobase", [1352.0, 96.0, 488.0, 496.0], None);
+                // flow_bg (object +72) has the chart's 1920x1022 scissor too (sub_1FA60): the guide bar's strip
+                // shows the frame below (Switch EN in game: the bar over the blurred menu backdrop)
+                self.sprite(out, "flow_bg", [0.0, 0.0, W, FLOW_VIEW], Some([0.0, 0.0, W, FLOW_VIEW]));
+                // flow_infobase at its own size: 488x496, the overseas flow_infobase_en 488x560 (its "Note."
+                // band under the picture, the description box taller)
+                let base_h = self.tex.get("flow_infobase").map_or(496.0, |t| t.height as f32);
+                self.sprite(out, "flow_infobase", [1352.0, 96.0, 488.0, base_h], None);
                 let clip = [[0.0, 0.0], [W, 0.0], [W, FLOW_VIEW], [0.0, FLOW_VIEW]];
                 let n0 = out.len();
                 if let Some(c) = &self.flow {
@@ -6016,11 +6667,23 @@ impl Ui {
                 let old = self.flow_old.filter(|_| e < 1.0).and_then(panel);
                 for (info, a, preview_a) in [(old, 1.0 - e, 1.0 - e), (cur, e, 1.0)] {
                     let Some((_, preview, name, desc)) = info else { continue };
+                    let overseas = game.assets.build == knife_core::exe::Build::Overseas;
                     if let Some(img) = game.assets.flow_preview_name(preview).and_then(|n| game.assets.image(r, &n)) {
                         // scale 2/3 in the scene's 1280-wide space: native texels on the canvas
                         let (w, h) = (img.tex.width as f32, img.tex.height as f32);
                         let uv = img.tex.uv_max();
-                        out.push(Quad::rect(img.tex.clone(), [1380.0, 120.0, w, h], [1.0, 1.0, 1.0, preview_a]).with_uv_rect(0.0, 0.0, uv[0], uv[1]));
+                        // overseas: the previews of nodes 107, 114, 188 and 481 stack a 645-wide strip per
+                        // language, from y (int)(language * 364.5 + 0.5), 364 - language % 2 high (sub_250A0)
+                        let strip = (overseas && matches!(preview, 107 | 114 | 188 | 481)).then(|| {
+                            let l = game.assets.language() as i32;
+                            ((l as f32 * 364.5 + 0.5) as i32 as f32, (364 - (l & 1)) as f32)
+                        });
+                        let q = match strip {
+                            Some((y0, sh)) => Quad::rect(img.tex.clone(), [1380.0, 120.0, 645.0, sh], [1.0, 1.0, 1.0, preview_a])
+                                .with_uv_rect(0.0, y0 / h * uv[1], 645.0 / w * uv[0], (y0 + sh) / h * uv[1]),
+                            None => Quad::rect(img.tex.clone(), [1380.0, 120.0, w, h], [1.0, 1.0, 1.0, preview_a]).with_uv_rect(0.0, 0.0, uv[0], uv[1]),
+                        };
+                        out.push(q);
                     }
                     let text = |i: i32| usize::try_from(i).ok().and_then(|i| self.sysmes.get(i)).cloned().unwrap_or_default();
                     let (name, desc) = (text(name), text(desc));
@@ -6028,33 +6691,36 @@ impl Ui {
                     // (1392, 452), widget scale (1.2, 1.0), boxes 400 x 48 / 400 x 200, spacing (-3, -12); title
                     // colour 0x4210 (RGB565 66,65,132), description colour 0 (black). Neither sets 0x100000, so
                     // the message font. sub_25DD4 -> sub_AB4D0 scale 1.2 * 640 / 1920 x 1.0 * 448 / 1080,
-                    // character spacing -3 + 4 px, line spacing -12 + 14 px; sub_A7790 box width (int)(400 * 1920 / 640) px
+                    // character spacing -3 + 4 px, line spacing -12 + 14 px; sub_A7790 box width (int)(400 * 1920 / 640) px.
+                    // Overseas: boxes 200 x 48 / 150 x 200 (English: 136 wide, both at x 1390 = 0x44ADC000, character spacing
+                    // -3.75); sub_25DD4 adds slot flags 0x9001000 (0x1000: no sub_C3834 hold, which in the
+                    // Japanese build only hides the texts on the change frame, where the fade-in is at 0)
                     const SIZE: [f32; 2] = [1.2 * 640.0 / 1920.0 * 60.0, 448.0 / 1080.0 * 60.0];
-                    const SPACING: f32 = 1.0;
-                    const BOX: f32 = 1200.0;
+                    let english = crate::text::english();
+                    let spacing = if english { -3.75 + 4.0 } else { 1.0 };
+                    let x = if english { 1390.0 } else { 1392.0 };
+                    let (title_box, desc_box) = match (overseas, english) {
+                        (false, _) => (400.0, 400.0),
+                        (true, false) => (200.0, 150.0),
+                        (true, true) => (200.0, 136.0),
+                    };
                     let lay = crate::game::LAYOUT;
-                    let ascent = lay.ascent * SIZE[1] / lay.size;
-                    let pitch = crate::text::PAIR_METRIC * SIZE[1] / crate::text::BASE_SIZE + 2.0;
+                    let ascent = crate::text::msg_ascent(lay.ascent * SIZE[1] / lay.size);
+                    let pitch = crate::text::line_feed() * gs() * SIZE[1] / crate::text::BASE_SIZE + 2.0;
                     let font = game.font_mut();
                     let title = [66.0 / 255.0, 65.0 / 255.0, 132.0 / 255.0, a];
-                    font.draw_str_slot(r, out, &name, SIZE, SPACING, [1392.0, 404.0 + ascent], title);
                     // SYSMES marks line breaks with '^'; the writer wraps at the box width
-                    let mut li = 0;
-                    for para in desc.split('^') {
-                        let mut line = String::new();
-                        for c in para.chars() {
-                            let mut next = line.clone();
-                            next.push(c);
-                            if !line.is_empty() && font.measure_slot(&next, SIZE, SPACING) > BOX {
-                                font.draw_str_slot(r, out, &line, SIZE, SPACING, [1392.0, 452.0 + ascent + li as f32 * pitch], [0.0, 0.0, 0.0, a]);
+                    let mut block = |text: &str, y: f32, bx: f32, color: [f32; 4]| {
+                        let mut li = 0;
+                        for para in text.split('^') {
+                            for line in font.wrap_slot(para, SIZE, spacing, bx * 3.0) {
+                                font.draw_str_slot(r, out, &line, SIZE, spacing, [x, y + ascent + li as f32 * pitch], color);
                                 li += 1;
-                                next = c.to_string();
                             }
-                            line = next;
                         }
-                        font.draw_str_slot(r, out, &line, SIZE, SPACING, [1392.0, 452.0 + ascent + li as f32 * pitch], [0.0, 0.0, 0.0, a]);
-                        li += 1;
-                    }
+                    };
+                    block(&name, 404.0, title_box, title);
+                    block(&desc, 452.0, desc_box, [0.0, 0.0, 0.0, a]);
                 }
                 if cur.is_some() {
                     self.sprite(out, "flow_info", [1672.0, 120.0, 144.0, 32.0], None);
@@ -6126,13 +6792,13 @@ impl Ui {
                     let id = if ok { crate::gallery_table::MUSIC[i].1 as usize } else { 244 };
                     // the one-line rows leave out the title's '^' break (the panel title breaks there)
                     let title = self.sysmes.get(id).map_or_else(|| "？？？".into(), |t| t.replace('^', ""));
-                    // white rows (the playing track is not marked), every row at half alpha but the cursor row
-                    let c = if ok { [1.0; 4] } else { [0.55, 0.58, 0.68, 1.0] };
-                    let c = [c[0], c[1], c[2], if list_row == Some(i) { 1.0 } else { 0.5 }];
+                    // white rows, locked ones too (sub_1A1A4 builds them alike; the playing track is not marked),
+                    // every row at half alpha (sub_1FA20(row, 0.5)) but the cursor row
+                    let c = [1.0, 1.0, 1.0, if list_row == Some(i) { 1.0 } else { 0.5 }];
                     // sub_1A1A4: text slot 61 + i at (438, 131 + 59 i), scale 1.3333 x 1.2 (26.67 x 29.87 px cells)
                     if let Some(font) = self.font_sys.as_mut() {
                         const ROW: [f32; 2] = [60.0 * 1.3333 * 640.0 / 1920.0, 60.0 * 1.2 * 448.0 / 1080.0];
-                        font.draw_str_slot_rimmed(r, out, &title, ROW, 4.0, [438.0, y + 22.0 + SYS_ASCENT * ROW[1]], c);
+                        font.draw_str_slot_rimmed(r, out, &title, ROW, 4.0, [438.0, y + 22.0 + SYS_ASCENT * gs() * ROW[1]], c, 1);
                     }
                 }
                 let clip = [[0.0, GAL_CLIP[0]], [W, GAL_CLIP[0]], [W, GAL_CLIP[1]], [0.0, GAL_CLIP[1]]];
@@ -6148,19 +6814,25 @@ impl Ui {
                     // sub_1DAB8: title and credit lines (歌 / 作詞 / 作曲 / 編曲 + name) starting at
                     // 260 - 32 * (lines / 2) - 16. Text objects (box 420 x 64, sub_1B7D8) at scale 1.2: sub_25DD4 hands
                     // sub_A7790 1.2 * 640 / 1920 x 1.2 * 448 / 1080 of the 60 px base glyph; the title (slot 52,
-                    // params 0x4697A8) has line spacing -16 + 14 px. The credits start the title's height (sub_261CC:
-                    // last line minus first) + 58 below it, 32 apart.
+                    // params 0x4697A8) has line spacing -16, which sub_25DD4 scales by the object's 1.2 like the glyphs:
+                    // (1.2 * -16 + 14) px after the message fonts' line feed at the glyph height (Switch, English
+                    // "Comp:^Keita Haga": baselines 30 px apart). The credits start the title's height (sub_261CC: last
+                    // line minus first) + 58 below it, 32 apart.
                     const SIZE: [f32; 2] = [60.0 * 1.2 * 640.0 / 1920.0, 60.0 * 1.2 * 448.0 / 1080.0];
                     let credits = crate::gallery_table::MUSIC_CREDITS[t];
-                    let lines = 1 + credits.iter().filter(|&&c| c >= 0).count();
+                    // English: the lyrics / composition / arrangement rows break after their label ('^'), count
+                    // as two lines, sit 32 more apart and the first credit row 4 more (overseas sub_1DAB8, the
+                    // three given line spacing -16 by sub_25FC8)
+                    let english = crate::text::english();
+                    let lines: usize = 1 + credits.iter().enumerate().filter(|&(_, &c)| c >= 0).map(|(k, _)| if english && k > 0 { 2 } else { 1 }).sum::<usize>();
                     let mut y = 260.0 - 32.0 * (lines / 2) as f32 - 16.0;
-                    let pitch = crate::text::PAIR_METRIC * SIZE[1] / crate::text::BASE_SIZE + 14.0 - 16.0;
+                    let pitch = crate::text::line_feed() * gs() * SIZE[1] / crate::text::BASE_SIZE + 1.2 * -16.0 + 14.0;
                     let Some(font) = self.font_sys.as_mut() else { return };
                     // sub_26054's flag 0x100 -> nn::font draw flags 0x11 (sub_A84F0: each line centred, origin centred);
                     // the lines keep their trailing spaces. Switch: all three lines centre 7 px left of x 1600
                     let mut centred = |s: &str, y: f32| {
                         let w = font.measure_slot(s, SIZE, 4.0);
-                        font.draw_str_slot_rimmed(r, out, s, SIZE, 4.0, [1593.0 - w / 2.0, y + SYS_ASCENT * SIZE[1]], [1.0; 4]);
+                        font.draw_str_slot_rimmed(r, out, s, SIZE, 4.0, [1593.0 - w / 2.0, y + SYS_ASCENT * gs() * SIZE[1]], [1.0; 4], 1);
                     };
                     let title = self.sysmes.get(crate::gallery_table::MUSIC[t].1 as usize).cloned().unwrap_or_default();
                     for (k, part) in title.split('^').enumerate() {
@@ -6171,8 +6843,14 @@ impl Ui {
                         if c >= 0 {
                             let label = self.sysmes.get(245 + k).cloned().unwrap_or_default();
                             let name = self.sysmes.get(c as usize).cloned().unwrap_or_default();
-                            centred(&format!("{label} {name}"), y);
+                            let sep = if english && k > 0 { "^" } else { " " };
+                            for (n, part) in format!("{label}{sep}{name}").split('^').enumerate() {
+                                centred(part, y + n as f32 * pitch);
+                            }
                             y += 32.0;
+                            if english {
+                                y += if k > 0 { 32.0 } else { 4.0 };
+                            }
                         }
                     }
                 }
@@ -6191,9 +6869,9 @@ impl Ui {
                 const NUM: [f32; 2] = [60.0 * 1.25 * 640.0 / 1920.0, 60.0 * 448.0 / 1080.0];
                 let Some(font) = self.font_sys.as_mut() else { return };
                 let time = format!("{:2}:{:02}", el as u32 / 60, el as u32 % 60);
-                font.draw_str_slot_rimmed(r, out, &time, NUM, 4.0, [1548.0, 503.0 + SYS_ASCENT * NUM[1]], [1.0; 4]);
+                font.draw_str_slot_rimmed(r, out, &time, NUM, 4.0, [1548.0, 503.0 + SYS_ASCENT * NUM[1]], [1.0; 4], 1);
                 let vol = format!("{:3}", (self.music_vol * 100.0) as i32);
-                font.draw_str_slot_rimmed(r, out, &vol, NUM, 4.0, [1562.0, 878.0 + SYS_ASCENT * NUM[1]], [1.0; 4]);
+                font.draw_str_slot_rimmed(r, out, &vol, NUM, 4.0, [1562.0, 878.0 + SYS_ASCENT * NUM[1]], [1.0; 4], 1);
                 let blink = 0.5 + 0.5 * (self.title_clock * 3.0).sin().abs();
                 for (y, frac) in [(424.0, if len > 0.0 { (el / len).min(1.0) } else { 0.0 }), (792.0, self.music_vol)] {
                     self.spr(out, "music_slider", 1392.0, y, None);
@@ -6238,7 +6916,6 @@ impl Ui {
                 }
             }
             Screen::Endings => {
-                use crate::game::get_bit;
                 let nb = self.draw_hub_bg(out, &white, Some("ending_title"));
                 let cur = hover.and_then(|h| items.get(h)).map(|(_, a)| *a);
                 if Self::all_endings(game) {
@@ -6246,7 +6923,7 @@ impl Ui {
                     self.spr(out, "ending_btn", 1702.0, 894.0, Some([sx, 8.0, 112.0, 112.0]));
                 }
                 for e in 0..24 {
-                    let ok = get_bit(&game.nodes, crate::gallery::ENDINGS[e].0);
+                    let ok = Self::ending_ok(game, e);
                     let hov = cur == Some(Action::Ending(e));
                     if e < 3 {
                         let icon = if ok { ["ending_icon_Arcueid", "ending_icon_Ciel_1", "ending_icon_Ciel_2"][e] } else { "ending_icon_non" };
@@ -6290,25 +6967,34 @@ impl Ui {
                 }
                 let n0 = out.len();
                 out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.85, 0.85, 0.85, 1.0]));
+                // sub_BE84 -> sub_251A4: the entry's source rect (x, y, w, h) of the image; overseas, a CG that
+                // stacks a strip per language moves down by its height times the language
                 let pic = |ui: &Self, game: &mut Game, group: usize, i: usize| {
                     let e = ui.cg_entry(group, i)?;
-                    let img = game.assets.image(r, e.name)?;
-                    Some((img.tex.clone(), e.width.max(1) as f32, e.height.max(1) as f32))
+                    let strip = if crate::gallery::language_strip(e.name) { game.assets.language() as f32 } else { 0.0 };
+                    // sub_BE84 -> sub_B6A20: the picture bakes from the sRGB "Jpeg Tex" (grade::Bake::linear)
+                    let img = game.assets.image_graded(r, e.name, crate::grade::Bake { linear: true, ..crate::grade::Bake::NONE })?;
+                    let (w, h) = (e.width.max(1) as f32, e.height.max(1) as f32);
+                    // the table is in 1920-wide units, the images are stored at 1280 (IMG1685: 2106 x 1266 of a
+                    // 1404 x 844 texture)
+                    let (tw, th) = (img.tex.width.max(1) as f32 * 1.5, img.tex.height.max(1) as f32 * 1.5);
+                    let uv = img.tex.uv_max();
+                    let (x0, y0) = (e.x as f32, e.y as f32 + h * strip);
+                    let src = [x0 / tw * uv[0], y0 / th * uv[1], (x0 + w) / tw * uv[0], (y0 + h) / th * uv[1]];
+                    Some((img.tex.clone(), w, h, src))
                 };
-                if let Some((tex, w, h)) = pic(self, game, group, pos) {
+                if let Some((tex, w, h, [u0, v0, u1, v1])) = pic(self, game, group, pos) {
                     let rc = self.cg_rect(w, h);
-                    let uv = tex.uv_max();
-                    out.push(Quad::rect(tex, rc, [1.0; 4]).with_uv_rect(0.0, 0.0, uv[0], uv[1]));
+                    out.push(Quad::rect(tex, rc, [1.0; 4]).with_uv_rect(u0, v0, u1, v1));
                 }
                 // a picture change: sprite 176 (the capture, here the old view) over the new picture at colour
                 // alpha 1 - u through the rule, a sub_9FE00 draw (progress = that alpha, the rule read inverted)
                 if let CgFx::Switch(og, old, zoom, pan, next) = self.cg_fx
-                    && let Some((tex, w, h)) = pic(self, game, og, old)
+                    && let Some((tex, w, h, [u0, v0, u1, v1])) = pic(self, game, og, old)
                 {
                     let (rc, _, _) = Self::cg_geom(w, h, zoom, pan);
-                    let uv = tex.uv_max();
                     let c = 1.0 - u;
-                    let mut q = Quad::rect(tex, rc, [1.0, 1.0, 1.0, c]).with_uv_rect(0.0, 0.0, uv[0], uv[1]);
+                    let mut q = Quad::rect(tex, rc, [1.0, 1.0, 1.0, c]).with_uv_rect(u0, v0, u1, v1);
                     q.rule = game
                         .assets
                         .image(r, if next { "RULE_27" } else { "RULE_26" })
@@ -6325,8 +7011,11 @@ impl Ui {
                 out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 0.75]));
                 out.extend(game.backlog_quads(r, scroll));
                 let n = game.backlog_len();
-                // sub_9B0C4: with nothing to scroll (max <= min) the slider sits at the top
-                self.draw_scroll_bar(out, if n > 1 { 1.0 - scroll as f32 / (n - 1) as f32 } else { 0.0 }, 608.0);
+                // sub_9B0C4: with nothing to scroll (max <= min) the slider sits at the top; the overseas
+                // sub_27D10 draws the widget only with more than one page (AE71E4 >= 1)
+                if n > 1 || game.assets.build != knife_core::exe::Build::Overseas {
+                    self.draw_scroll_bar(out, if n > 1 { 1.0 - scroll as f32 / (n - 1) as f32 } else { 0.0 }, 608.0);
+                }
                 self.fade_quads(out, n0, self.scr_a);
             }
             Screen::Confirm(c) => {
@@ -6343,11 +7032,14 @@ impl Ui {
                     if c.thumbnail() {
                         self.draw_dialog_thumb(game, r, out);
                     }
-                    for (i, (rc, a)) in items.iter().enumerate() {
-                        // dialog_btn_ja frames: Yes (224,0) / glow (0,135), No (224,67) / glow (0,202)
+                    for (i, (_, a)) in items.iter().enumerate() {
+                        // dialog_btn_ja frames: Yes (224,0) / glow (0,135), No (224,67) / glow (0,202), drawn at
+                        // native size from the object position
                         let y = if *a == Action::Yes { 0.0 } else { 67.0 };
                         let src = if hovered(i) { [0.0, y + 135.0, 216.0, 56.0] } else { [224.0, y, 216.0, 56.0] };
-                        self.sprite(out, "dialog_btn_ja", *rc, Some(src));
+                        let by = if c.thumbnail() { 261.46 * H / 448.0 } else { 600.0 };
+                        let rc = [if *a == Action::Yes { 990.0 } else { 756.0 }, by, 216.0, 56.0];
+                        self.sprite(out, "dialog_btn_ja", rc, Some(src));
                     }
                 }
                 // the button guide of the screen below stays on top of the dialog and its backdrop (Switch: the
@@ -6410,6 +7102,13 @@ impl Ui {
         if self.black > 0.0 && !self.black_under {
             let [cr, cg, cb] = self.black_col;
             out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [cr, cg, cb, self.black.min(1.0)]));
+            // sub_8D5D0 draws the NEW GAME white twice: blended at w (effect 27), then added at w / 2 (effect
+            // 30), so the screen is white well before w reaches 1 (Switch: about 1 s after the press)
+            if self.black_col == [1.0; 3] {
+                let mut q = Quad::rect(white.clone(), [0.0, 0.0, W, H], [1.0, 1.0, 1.0, self.black.min(1.0) * 0.5]);
+                q.blend = Blend::Add;
+                out.push(q);
+            }
         }
     }
 }

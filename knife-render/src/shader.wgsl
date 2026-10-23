@@ -94,6 +94,13 @@ fn fs_sprite(i: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
 
+// shader noalpha: the texture's rgb times the colour, alpha 1
+@fragment
+fn fs_noalpha(i: VsOut) -> @location(0) vec4<f32> {
+    let t = sample_img(i);
+    return vec4<f32>(t.rgb * i.color.rgb, 1.0);
+}
+
 // Sprite whose rgb is replaced by a solid color, keeping the texture alpha
 // (used for silhouettes / color fills such as STEC mode 1).
 @fragment
@@ -124,6 +131,13 @@ fn fs_text(i: VsOut) -> @location(0) vec4<f32> {
             }
         }
         c = sum / 16.0;
+    }
+    // hy.z = 1 (exfont glyphs with their own border, the inline glyph tags' edged set): half coverage is the
+    // border, drawn black, full coverage the fill in the vertex colour
+    if i.hy.z > 0.5 {
+        let a = clamp(2.0 * c, 0.0, 1.0);
+        let f = clamp(2.0 * c - 1.0, 0.0, 1.0);
+        return vec4<f32>(i.color.rgb * f * i.color.a, a * i.color.a);
     }
     return vec4<f32>(i.color.rgb * c * i.color.a, c * (2.0 - c) * i.color.a);
 }
@@ -220,21 +234,23 @@ fn fs_rule(i: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
 
-// One pass of a separable gaussian blur: params = (dir x, dir y, sigma, -).
+// One pass of a separable gaussian blur: params = (dir x, dir y, sigma, half tap count). As sub_A0A90 /
+// sub_9CCD0 build it: taps -n..n (n = ceil(3 sigma)), each weighted exp(-k^2 / 2 sigma^2) / sqrt(2 pi sigma^2)
+// and summed additively, not renormalised.
 @fragment
 fn fs_blur(i: VsOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(tex0));
     let stp = tu.params.xy / dims;
     let sigma = max(tu.params.z, 0.01);
+    let n = i32(tu.params.w);
+    let norm = sqrt(2.0 * sigma * sigma * 3.1416);
     var acc = vec3<f32>(0.0);
-    var wsum = 0.0;
-    for (var k = -12; k <= 12; k++) {
+    for (var k = -n; k <= n; k++) {
         let x = f32(k);
-        let w = exp(-x * x / (2.0 * sigma * sigma));
+        let w = exp(-x * x / (2.0 * sigma * sigma)) / norm;
         acc += textureSampleLevel(tex0, samp, i.uv + stp * x, 0.0).rgb * w;
-        wsum += w;
     }
-    return vec4<f32>(acc / wsum, 1.0);
+    return vec4<f32>(acc, 1.0);
 }
 
 // The final blit (sub_D7BD0): shader noalpha_srgb raises the frame to 2.2 and the sRGB swapchain encodes it.
@@ -256,7 +272,7 @@ fn fs_present_srgb(i: VsOut) -> @location(0) vec4<f32> {
 
 // Backdrop-reading layer blends (the exe's nexl_nxshader_ps_* family, blend state 7): tex0 = sprite,
 // tex1 = copy of the target taken before this quad, tex2 = optional rule mask.
-// params = (op, fill, target w, target h), params2 = (rule progress or -1, rule flags, -, -).
+// params = (op, fill, target w, target h), params2 = (rule progress or -1, rule flags, noalpha, -).
 // Formulas follow the shader disassembly; s = texture rgb * colour rgb, a = texture alpha * colour alpha.
 fn ps_mix(d: vec3<f32>, r: vec3<f32>, a: f32) -> vec3<f32> {
     return d + a * (r - d);
@@ -264,8 +280,11 @@ fn ps_mix(d: vec3<f32>, r: vec3<f32>, a: f32) -> vec3<f32> {
 
 @fragment
 fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
-    let t = sample_img(i);
-    let d = textureLoad(tex1, vec2<i32>(i.pos.xy), 0).rgb;
+    var t = sample_img(i);
+    // params2.z: the source drawn through noalpha first (alpha 1)
+    if (tu.params2.z > 0.5) { t.a = 1.0; }
+    let d4 = textureLoad(tex1, vec2<i32>(i.pos.xy), 0);
+    let d = d4.rgb;
     var s = t.rgb * i.color.rgb;
     if (tu.params.y > 0.5) { s = i.color.rgb; }
     var ca = i.color.a;
@@ -276,9 +295,9 @@ fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
     let one = vec3<f32>(1.0);
     let zero = vec3<f32>(0.0);
     let op = u32(tu.params.x + 0.5);
-    // the alpha-weighted shaders leave the backdrop alone where a = 0 (their `$p0 exit`)
-    if (a <= 0.0 && op <= 15u) {
-        return vec4<f32>(d, 1.0);
+    // the alpha-weighted shaders leave the backdrop, alpha included, alone where a = 0 (their `$p0 exit`)
+    if (a <= 0.0 && (op <= 15u || op == 19u)) {
+        return d4;
     }
     var o = d;
     switch (op) {
@@ -319,6 +338,8 @@ fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
         case 16u: { o = min(d + s * ca, one); }
         case 17u: { o = max(d - ca * (one - s), zero); }
         case 18u: { o = s; }
+        // normal: the backdrop premultiplied by its own alpha
+        case 19u: { o = ps_mix(d * d4.a, s, a); }
         default: {}
     }
     return vec4<f32>(o, 1.0);

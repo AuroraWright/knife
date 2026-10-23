@@ -17,6 +17,7 @@ pub use choice::{ChoiceKind, ChoiceOpt, DIALOG_BUTTON_Y, DIALOG_BUTTONS};
 use choice::Choice;
 use story_movie::StoryMovie;
 
+use knife_core::exe::Build;
 use knife_core::vm::parse::{Command, Op, Scene};
 use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, RenderTarget, Renderer, Shade, TexRef};
 
@@ -28,6 +29,13 @@ use crate::{
     text::{self, FontAtlas, Layout, PlacedChar},
 };
 
+/// A screen capture (`Game::freeze_screen`): still to be taken, its alpha and its fade per frame.
+struct Freeze {
+    capture: bool,
+    alpha: f32,
+    step: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Wait {
     None,
@@ -38,6 +46,11 @@ pub enum Wait {
     Layer(i32, i32),
     Choice,
     Voice,
+    /// a message with an end code (`@e` / `@n`, or MSAD's): the script goes on once its text is out
+    /// (sub_81B30 turns AE04B8 bit 1 into 0x40) and, with `voice` (bit 4: an `@e` message's own voice that
+    /// sub_6E0D0 played), once that voice ends (sub_802C0 clears bit 4 when sub_9C400 reports none); a
+    /// click or a skip ends it early. No click icon.
+    Message { voice: bool },
     Movie,
     Halt,
 }
@@ -53,6 +66,9 @@ pub struct Page {
     pub chars: Vec<PlacedChar>,
     /// raw texts of the messages on the page (for saves)
     texts: Vec<String>,
+    /// per message: F(847 + its index on the page) when it was written, which its history record keeps
+    /// (sub_28470 spaces the backlog entries with it)
+    extras: Vec<i32>,
     pen: (f32, f32),
     order: usize,
     /// where the last message's layout started (pen, order): MSAD lays the grown message out again from here
@@ -75,6 +91,8 @@ pub struct Page {
     msgs: Vec<(usize, bool, f32, f32)>,
     /// SELD options listed after the page's messages (history entries of type 12, shown in the backlog)
     choice_texts: Vec<String>,
+    /// their F(847 + index), as `extras`
+    choice_extras: Vec<i32>,
 }
 
 /// Message text (sub_391A0): text slots 464 units wide at glyph scale 0.76 of the W / 32 px font size
@@ -83,24 +101,50 @@ pub struct Page {
 /// START_SCRIPT, every normal scene) draws from x 88 units (v278; 30 when sub_2DF20, non-Japanese) with line
 /// n's box top at word_136BAB2 (65 units) + n * pitch (the dword_AFECCC table); the pitch is slot 19's
 /// measured two-line height: the pair font's (exfont + shared font, sub_CAE88) line feed at its 40 px base
-/// size, `text::PAIR_METRIC`, scaled by 45.6 / 40, plus the 24 px spacing = 81 px (Switch: 81 in Astris and
-/// choice.mov).
+/// size, `text::line_feed` (50), scaled by 45.6 / 40, plus the 24 px spacing = 81 px (Switch: 81 in Astris and
+/// choice.mov). `msg_layout` fills in `line_height`.
 pub const LAYOUT: Layout = Layout {
     left: 88.0 * 3.0,
     right: (88.0 + 464.0) * 3.0,
     size: 60.0 * 0.76,
     spacing: 4.0,
-    line_height: text::PAIR_METRIC * 60.0 * 0.76 / text::BASE_SIZE + 24.0,
+    line_height: 0.0,
     ascent: ASCENT,
 };
+/// English (overseas build, sub_391A0 with sub_2DF20, docked): page text from x 32 units, line 0's box at
+/// (int)(65 - 9.8824) = 55 units, the slot sub_39050 widens from 464 to 573 units, and every text slot's
+/// glyphs at 0.9 of the W / 32 size (sub_A7790); the pitch is English's 53 px line feed at that size plus 24.
+pub const EN_LAYOUT: Layout = Layout {
+    left: 32.0 * 3.0,
+    right: (32.0 + 573.0) * 3.0,
+    size: EN_SIZE,
+    spacing: 4.0,
+    line_height: 0.0,
+    // the font's ascent applies at run time (`msg_layout`)
+    ascent: ASCENT * 0.9,
+};
+const EN_SIZE: f32 = 60.0 * 0.9 * 0.76;
+/// English message slot width in 640-wide units (sub_39050: 464 -> 573 for non-bubble windows)
+const EN_WIDTH: f32 = 573.0;
 /// F822 != 1 (LABEL_135): the message alone (no earlier history entries) from x 169.58 units, line 0's box
 /// at 43.141 units (trainscene.mov: glyph tops y 116, first glyph x 562 after the indent).
-const WINDOW_LAYOUT: Layout = Layout { left: 169.58 * 3.0, right: (169.58 + 464.0) * 3.0, ..LAYOUT };
-/// Glyph baseline below a line box top: page line 0 (box 65 units = 156.7 px) has its 「 ink top at y 166
-/// on the Switch (Astris), baseline 204.85 for TsukuMin's 0.852 em 「 top.
-const ASCENT: f32 = 204.85 - 65.0 * UY;
-/// Baseline of the first line: line box 0 at 65 units.
-const TOP_BASELINE: f32 = 65.0 * UY + ASCENT;
+const WINDOW_LEFT: f32 = 169.58;
+/// The overseas build's message layout keeps the Japanese one for Japanese and Chinese; the docked game
+/// (sub_A59D0: the 1920x1080 display mode) never takes its handheld branch (box 46, 0.85 glyphs, 508 wide).
+pub fn msg_layout() -> Layout {
+    let lay = if text::english() { EN_LAYOUT } else { LAYOUT };
+    // the line spacing (a8 + 14) * H / 1080 = 24 px after the font set's line feed at the glyph size; the
+    // baseline at the pair font's ascent
+    Layout { line_height: text::line_feed() * lay.size / text::BASE_SIZE + 24.0, ascent: text::msg_ascent(ASCENT), ..lay }
+}
+/// Baseline of the page's first line (box 65 units, English 55).
+pub fn top_baseline() -> f32 {
+    (if text::english() { 55.0 } else { 65.0 }) * UY + msg_layout().ascent
+}
+/// Glyph baseline below a line box top for the Japanese fonts: their pair ascent 41 + 1 at the 40 px base
+/// (`text::msg_ascent`), scaled to the 45.6 px glyphs (Switch: page line 0's baseline 47.91 px below its box at
+/// 65 units, a sub-pixel fit of the prologue's first page in both builds).
+pub const ASCENT: f32 = (text::JA_ASCENT + 1.0) * 60.0 * 0.76 / text::BASE_SIZE;
 const WINDOW_TOP_BASELINE: f32 = 43.141 * UY + ASCENT;
 /// 640x448 units -> canvas pixels.
 const UX: f32 = CANVAS_W as f32 / 640.0;
@@ -127,6 +171,40 @@ const BUBBLE_TEXT: [(f32, f32); 15] = [
 ];
 /// Text width of window types 3..32 in 640-wide units (flt_34DEFC, by type - 3; others 464).
 const BUBBLE_WIDTH: [f32; 3] = [299.83, 405.57, 509.77];
+/// The overseas build's window types 0..55 (flt_231D74: image slot, origin in 1280x720 units). DISP_PARTS has
+/// three more images before the bubbles, and types 33..55 reuse bubble images at other origins.
+const EN_WINDOWS: [(u16, f32, f32); 56] = [
+    (60, 0.0, 0.0), (61, 0.0, 0.0), (62, 0.0, 0.0),
+    (94, 525.0, 414.0), (95, 525.0, 414.0), (96, 328.0, 393.0), (97, 328.0, 393.0), (98, 90.0, 388.0), (99, 90.0, 388.0),
+    (100, 525.0, 44.0), (101, 525.0, 44.0), (102, 328.0, 34.0), (103, 328.0, 34.0), (104, 90.0, 13.0), (105, 90.0, 13.0),
+    (106, 94.0, 414.0), (107, 94.0, 414.0), (108, 79.0, 393.0), (109, 79.0, 393.0), (110, 63.0, 388.0), (111, 63.0, 388.0),
+    (112, 94.0, 44.0), (113, 94.0, 44.0), (114, 79.0, 34.0), (115, 79.0, 34.0), (116, 63.0, 13.0), (117, 63.0, 13.0),
+    (118, 338.0, 229.0), (119, 338.0, 229.0), (120, 196.0, 210.0), (121, 196.0, 210.0), (122, 71.0, 198.0), (123, 71.0, 198.0),
+    (96, 318.0, 393.0), (96, 318.0, 393.0), (98, 70.0, 388.0), (98, 90.0, 378.0), (98, 250.0, 378.0), (99, 300.0, 388.0),
+    (102, 268.0, 34.0), (102, 98.0, 34.0), (103, 198.0, 34.0), (104, -5.0, 13.0), (104, 90.0, 13.0), (104, 105.0, 23.0),
+    (105, 90.0, 13.0), (108, -101.0, 393.0), (110, 43.0, 388.0), (110, 63.0, 388.0), (114, 29.0, 34.0), (116, -47.0, 13.0),
+    (116, -17.0, 13.0), (117, 18.0, 13.0), (122, 21.0, 198.0), (122, 61.0, 198.0), (123, 11.0, 198.0),
+];
+/// The overseas build's bubble text origins by window type (flt_232020, 1280x720 units).
+const EN_BUBBLE_TEXT: [(f32, f32); 56] = [
+    (0.0, 0.0), (0.0, 0.0), (0.0, 0.0),
+    (98.0, 80.0), (98.0, 80.0), (100.0, 114.0), (100.0, 114.0), (100.0, 138.0), (100.0, 138.0), (98.0, 67.0),
+    (98.0, 67.0), (100.0, 84.0), (100.0, 84.0), (100.0, 89.0), (100.0, 89.0), (79.0, 80.0), (79.0, 80.0),
+    (90.0, 114.0), (90.0, 114.0), (113.0, 138.0), (113.0, 138.0), (79.0, 67.0), (79.0, 67.0), (90.0, 84.0),
+    (90.0, 84.0), (113.0, 89.0), (113.0, 89.0), (98.0, 67.0), (98.0, 67.0), (100.0, 64.0), (100.0, 64.0),
+    (100.0, 89.0), (100.0, 89.0), (70.0, 110.0), (80.0, 102.0), (81.0, 134.0), (99.0, 120.0), (90.0, 120.0),
+    (99.0, 110.0), (65.0, 80.0), (65.0, 80.0), (85.0, 82.66), (45.0, 89.0), (65.0, 89.0), (95.0, 65.0),
+    (99.0, 69.0), (90.0, 110.0), (104.0, 120.0), (85.0, 126.0), (89.0, 82.66), (103.0, 65.0), (93.0, 89.0),
+    (103.0, 89.0), (70.0, 80.33), (82.0, 55.0), (70.0, 80.33),
+];
+/// The overseas build's bubble text widths (jd_34DEFC, by type - 3) for the types bit-set in
+/// EN_BUBBLE_WIDTH_MASK (sub_39050); the others keep the message width.
+const EN_BUBBLE_WIDTH: [f32; 40] = [
+    299.83, 299.83, 405.57, 405.57, 509.77, 509.77, 299.83, 299.83, 405.57, 405.57, 509.77, 509.77, 299.83, 299.83,
+    405.57, 405.57, 509.77, 509.77, 299.83, 299.83, 405.57, 405.57, 509.77, 509.77, 299.83, 299.83, 405.57, 405.57,
+    509.77, 509.77, 299.83, 299.83, 299.83, 299.83, 299.83, 299.83, 299.83, 299.83, 299.83, 580.0,
+];
+const EN_BUBBLE_WIDTH_MASK: u64 = 0x80_3FFF_FFFF;
 /// Window offsets in 1280x720 units: x by F1106 (flt_34D84C), y by F1107 (flt_34D8B8); out of range = 0.
 const WINDOW_DX: [f32; 27] = [
     0.0, 100.0, 120.0, 150.0, 20.0, 200.0, 250.0, 30.0, 40.0, 50.0, 500.0, 60.0, 70.0, 80.0, -100.0, -120.0, -150.0,
@@ -274,8 +352,13 @@ const ENTRY_TEXT: usize = 0x1fe;
 /// they were never recorded, as for the page a load restored).
 struct BacklogPage {
     texts: Vec<String>,
+    /// per entry: F(847 + its index) from its record (`Page::extras`)
+    extras: Vec<i32>,
     first: Option<u64>,
     last: Option<u64>,
+    /// the overseas sub_28470 draws entries of bubble windows (their F1105 >= 3, sub_39F40) with text flag
+    /// 0x800000, the bubble font (the Japanese build passes 0)
+    bubble: bool,
 }
 
 /// rewind history length (sub_814C0: 800 page records)
@@ -439,6 +522,10 @@ pub struct Game {
     backlog_pages: Vec<BacklogPage>,
     /// hide the message window and text (while the backlog is shown)
     pub hide_text: bool,
+    /// the player hid the message window (touch / hide button): not even the menu blur's capture has it
+    pub touch_hidden: bool,
+    /// the UI's system menu or its config is up (`Ui::system_menu_shown`, sub_4EC00)
+    pub system_menu_shown: bool,
     /// script / effect steps per frame (sub_3FBD0 runs its effect steps this many times): the touch
     /// gesture and mode panel skip and rewind speeds, 1 normally
     pub speed: u32,
@@ -481,6 +568,9 @@ pub struct Game {
     pub seek_node: bool,
     /// the seek ended this frame; sub_802C0's after-loop work is still to run
     seek_ended: bool,
+    /// overseas off_3516E0: the seek loop ended last frame (sub_41E80), so this frame runs its after-loop work
+    /// (sub_7DDA0) instead of the dispatch
+    seek_defer: bool,
     /// byte_146E648: a ZL rewind restored a message; until the next ring push, the message / MSAD / ATSV
     /// paths do not refresh the save point
     ring_restored: bool,
@@ -497,9 +587,16 @@ pub struct Game {
     msg_voice: Option<String>,
     speaker: i16,
     /// System menu over the game (sub_2E000 / sub_3BBA0): the scene is captured once, gaussian-blurred
-    /// (sub_A0A90: sigma 2.25 taps of 1.75 px) and crossfaded in at this alpha; None when no menu is up.
+    /// (sub_A0A90: sigma 2.25 taps of 1.75 px; overseas sub_9EC50 at half size) and crossfaded in at this
+    /// alpha; None when no menu is up.
     pub menu_blur: Option<f32>,
     menu_rt: Option<RenderTarget>,
+    /// overseas sub_9EC50's half-size buffers ("filter Defocus" off_351DB0 and its pass target)
+    menu_half: Option<[RenderTarget; 2]>,
+    /// overseas screen capture (sub_A2550: jd_18AFD94 / jd_18AFD98): the frame as it was, drawn over everything
+    /// at `alpha` (sub_A59F0), which falls by `step` per frame once released (sub_A27F0)
+    freeze: Option<Freeze>,
+    freeze_rt: Option<RenderTarget>,
     menu_captured: bool,
     movie: Option<crate::movie::Movie>,
     /// command index of the message currently shown
@@ -509,6 +606,8 @@ pub struct Game {
     wnty: i32,
     /// DISP_PARTS_JA textures in order: image slots DISP_SLOT0.. (message windows, wait icons)
     disp: Vec<TexRef>,
+    /// `relayout_page` runs: a message past the page bottom stays on the page
+    relaying: bool,
 
     stage_rt: RenderTarget,
     /// STNS render target 40, created on first use
@@ -516,7 +615,8 @@ pub struct Game {
     /// Save list previews (sub_884F0 / sub_89AD0): the Switch keeps no images, it rebuilds each preview
     /// from the record's stage block. Rendered in `render` (which has the renderer mutably), by slot.
     previews: std::collections::HashMap<usize, TexRef>,
-    preview_queue: Vec<(usize, Vec<Option<crate::save::LayerSave>>)>,
+    /// (slot, layers, overseas sub_86840 picture)
+    preview_queue: Vec<(usize, Vec<Option<crate::save::LayerSave>>, Option<String>)>,
     preview_rt: Option<RenderTarget>,
     /// images the queued previews need, read and decoded on worker threads so opening the save list does
     /// not stall on large stage images (cache keys in flight, and where they arrive)
@@ -529,6 +629,9 @@ pub struct Game {
     ghost: ghost::Ghost,
     /// FADE(40) scratch targets (the exe's render targets 2 and 3)
     ghost_rt: Option<[RenderTarget; 2]>,
+    /// The layer group surfaces (stage::Draw): pixel (off_AE0CC8) and mask (off_AE0CD0), which keep their
+    /// contents across frames, and the composite's scratch (render target 3)
+    group_rt: Option<[RenderTarget; 3]>,
     /// FCLN focus lines / falling notes, the stage byte that restarts them on load (6569) and their
     /// EFFECT_PARTS textures (FallNote0..2, FocusLine)
     focus: focus::Focus,
@@ -588,7 +691,7 @@ fn blend_mode(mode: i32) -> (Blend, Shade) {
 impl Game {
     pub fn new(assets: Assets, motions: MotionTable, font: FontAtlas, r: &Renderer) -> Self {
         let script = Arc::new(Scene::parse(b""));
-        let disp = assets.ui_textures(r, "DISP_PARTS_JA").unwrap_or_default();
+        let disp = assets.ui_textures(r, &assets.ui_atlas("DISP_PARTS")).unwrap_or_default();
         let mut g = Self::new_inner(assets, motions, font, r, script);
         g.disp = disp.into_iter().map(|(_, t)| t).collect();
         g
@@ -664,6 +767,8 @@ impl Game {
             ring_serial: 0,
             page_ring: (None, None),
             hide_text: false,
+            touch_hidden: false,
+            system_menu_shown: false,
             speed: 1,
             history: Default::default(),
             save_point: None,
@@ -676,6 +781,7 @@ impl Game {
             node_seq: 0,
             seek_node: false,
             seek_ended: false,
+            seek_defer: false,
             ring_restored: false,
             last_voice: None,
             pending_voice: None,
@@ -685,12 +791,16 @@ impl Game {
             speaker: 0,
             menu_blur: None,
             menu_rt: None,
+            menu_half: None,
+            freeze: None,
+            freeze_rt: None,
             menu_captured: false,
             movie: None,
             msg_pc: 0,
             stuck: (0, 0.0),
             wnty: 0,
             disp: Vec::new(),
+            relaying: false,
             stage_rt: r.create_target(CANVAS_W, CANVAS_H, "stage"),
             noise_rt: None,
             previews: Default::default(),
@@ -702,6 +812,7 @@ impl Game {
             blur_rt: r.create_target(CANVAS_W, CANVAS_H, "blur"),
             ghost: ghost::Ghost::default(),
             ghost_rt: None,
+            group_rt: None,
             focus: focus::Focus::default(),
             focus_saved: 0,
             focus_tex: None,
@@ -822,22 +933,7 @@ impl Game {
     }
 
     fn resolve_text(&self, s: &str) -> String {
-        // `$NNNNNN` references a script_text line, anywhere in the text (the QA scenes join two with `^`, a
-        // line break: `$042766^$042767`); scripts have no other `$`
-        let mut out = String::new();
-        let mut rest = s;
-        while let Some(at) = rest.find('$') {
-            out.push_str(&rest[..at]);
-            let tail = &rest[at + 1..];
-            let n = tail.bytes().take_while(u8::is_ascii_digit).count();
-            match tail[..n].parse::<usize>() {
-                Ok(i) => out.push_str(self.assets.line(i)),
-                Err(_) => out.push('$'),
-            }
-            rest = &tail[n..];
-        }
-        out.push_str(rest);
-        out
+        resolve_refs(&self.assets, s)
     }
 
     // ---- input ----------------------------------------------------------------
@@ -864,6 +960,18 @@ impl Game {
                     self.page.revealed = self.page.order as f32;
                 } else {
                     self.finish_click();
+                }
+            }
+            Wait::Message { .. } => {
+                if (self.page.revealed as usize) < self.page.order {
+                    self.page.revealed = self.page.order as f32;
+                } else {
+                    // sub_802C0's 0x40 branch: the click (AE0698 / the confirm keys) clears the wait, stopping
+                    // the voice when sub_9C3B0's condition holds
+                    self.wait = Wait::None;
+                    if self.settings.voice_stop_on_advance {
+                        self.sound.stop_voice();
+                    }
                 }
             }
             Wait::Transition => {}
@@ -899,6 +1007,16 @@ impl Game {
     // ---- per-frame update ---------------------------------------------------------
 
     pub fn update(&mut self, r: &Renderer, dt: f32) {
+        // sub_A59F0: the capture fades by its step per frame, gone at 0
+        if let Some(f) = &mut self.freeze
+            && !f.capture
+            && f.step > 0.0
+        {
+            f.alpha -= f.step * dt * 60.0 / 1000.0;
+            if f.alpha <= 0.0 {
+                self.freeze = None;
+            }
+        }
         if self.wait == Wait::Click {
             self.click_ms += dt;
         }
@@ -1046,6 +1164,11 @@ impl Game {
                     self.wait = Wait::None;
                 }
             }
+            Wait::Message { voice } => {
+                if self.page.revealed as usize >= self.page.order && (!voice || fast || !self.sound.voice_playing()) {
+                    self.wait = Wait::None;
+                }
+            }
             Wait::Click => {
                 let revealed = self.page.revealed as usize >= self.page.order;
                 // a skip passes a message once it has been up SKIP_FRAMES frames: sub_802C0 runs once a frame,
@@ -1096,6 +1219,11 @@ impl Game {
         // run the script. sub_802C0 dispatches once per 60 Hz frame, so under a skip each wait the script stops
         // at costs a frame (knife resolves the waits within the frame's speed steps); the next-scene seek
         // runs in one frame
+        // overseas sub_40ED0: while off_3516E0 is set, sub_802C0 is not called; its last frame runs sub_7DDA0
+        if std::mem::take(&mut self.seek_defer) {
+            self.seek_finish();
+            return;
+        }
         if self.skip && !self.seek_node && self.wait == Wait::None && !self.ended {
             if self.dispatch_ms < 1000.0 / 60.0 - 1.0 {
                 return;
@@ -1116,8 +1244,16 @@ impl Game {
             self.pc += 1;
             self.exec(r, &cmd);
             if self.seek_node {
+                // a pass of the seek loop ends where script_dispatch returns
+                if self.wait != Wait::None {
+                    self.seek_pass_end(r);
+                }
                 self.seek_clear_wait();
             }
+        }
+        // the pass that ended the seek: script_dispatch went on to the next wait first
+        if self.seek_ended && !self.seek_node {
+            self.seek_pass_end(r);
         }
         // sub_802C0: a stage an STCH / SCH2 changed with no FADS after it is presented as the dispatch returns
         // (sub_5D3A0(0, 0): sub_2E1B0(0, 0) ends any transition)
@@ -1129,7 +1265,11 @@ impl Game {
             }
         }
         if std::mem::take(&mut self.seek_ended) {
-            self.seek_finish();
+            if self.assets.build == knife_core::exe::Build::Overseas {
+                self.seek_defer = true;
+            } else {
+                self.seek_finish();
+            }
         }
         // sub_391A0 (the message layer's draw) clears the page (sub_53AB0(1)) in page mode while F823 == 0: the
         // scripts zero it right after a page's last click wait, so the text goes then, not at the next message
@@ -1201,12 +1341,28 @@ impl Game {
         }
     }
 
+    /// The overseas seek loop (sub_802C0) steps more after each pass's script_dispatch and sub_3FBD0(10): the
+    /// queued SE commands count down 64 frames (sub_65E50(64)) and every layer's motion runs on 60 frames
+    /// (sub_97B80(layer, 60.0) for layers 0..39).
+    fn seek_pass_end(&mut self, r: &Renderer) {
+        if self.assets.build != knife_core::exe::Build::Overseas {
+            return;
+        }
+        self.tick_se_delayed(64.0 * 1000.0 / 60.0);
+        for li in 0..self.stage.layers.len() {
+            let cur = self.motion_cur(li);
+            let Some(m) = self.stage.layers[li].as_mut().and_then(|l| l.motion.as_mut()) else { continue };
+            let f = self.motions.advance(m, 1000.0, &cur);
+            self.apply_motion(r, li, f);
+        }
+    }
+
     /// Each pass of sub_802C0's seek loop starts with every wait word zeroed (AE04B8 flags, AE04C0, AE04A8,
     /// the timer AE04B0, AE06E0, AE0A20, the STCF bitset AE08A8): a wait the script stops at ends without its
     /// effect finishing and without the click wait's exit (sub_40ED0 LABEL_307), and nothing is stepped
     /// between passes but the engine tasks (sub_3FBD0(10)).
     fn seek_clear_wait(&mut self) {
-        if matches!(self.wait, Wait::Time { .. } | Wait::Click | Wait::Transition | Wait::Layer(..) | Wait::Voice) {
+        if matches!(self.wait, Wait::Time { .. } | Wait::Click | Wait::Transition | Wait::Layer(..) | Wait::Voice | Wait::Message { .. }) {
             self.wait = Wait::None;
             self.page.waiting = false;
             self.click_ms = 0.0;
@@ -1250,7 +1406,7 @@ impl Game {
     /// sub_5AFC0: the message buffer is laid out again and shown in full (reveal counters at 768).
     fn redisplay_message(&mut self) {
         if self.page.texts.is_empty() && !self.msg_text.is_empty() {
-            let (t, _) = message_end(&self.resolve_text(&self.msg_text));
+            let t = message_end(&self.msg_text).0;
             self.show_message(&t, false);
         }
         self.page.revealed = self.page.order as f32;
@@ -1444,6 +1600,13 @@ impl Game {
             self.ring_restored = true;
             self.lay_out_rewound(&d);
         }
+        // a rewind that ends on an entry without a message (only the ring's oldest, a new game's first stage
+        // command in START_SCRIPT) shows no window until the next message: Switch EN, rewound from the third
+        // page of a new game, shows START_SCRIPT's white and the opening fade without the window
+        if how == Back::Rewind && kind != 0 {
+            self.page.visible = false;
+            self.page.alpha = 0.0;
+        }
         // the backlog shares the ring: pages from this entry on are gone, and the page around it is current again
         self.backlog_pages.retain(|p| p.last.is_some_and(|l| l < serial));
         // (its first message: the newest page start up to here, unless that belongs to a kept page)
@@ -1468,7 +1631,7 @@ impl Game {
         // (sub_3B2B0(0, 1): the laid-out message counts as read, dword_572B64)
         self.line_read = true;
         self.pc += 1;
-        self.show_message(&text, code != Some(b'n'));
+        self.show_message(&message_end(raw).0, code != Some(b'n'));
         crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
         self.page.revealed = self.page.order as f32;
         self.ring_hold = code == Some(b'n');
@@ -1535,6 +1698,10 @@ impl Game {
     pub fn next_scene(&mut self) {
         self.seek_node = true;
         self.seek_clear_wait();
+        // overseas: sub_2F1D0 marks the screen wobble's phase as wrapped (word_AFEB94), so it stops wobbling
+        if self.assets.build == knife_core::exe::Build::Overseas {
+            self.ghost.wrapped = true;
+        }
         // sub_802C0: sub_5EF10(0) stops the BGM and every SE channel at once, keeping their words
         self.seek_audio = Some(SoundState {
             bgm: self.sound.bgm_state(),
@@ -1605,9 +1772,13 @@ impl Game {
                 self.note_read(&c.name);
                 // sub_6E0D0: VPLY's voice plays unless skipping (a fast skip into unread text with
                 // read-only skip has stopped by now, so it plays there too) and becomes the replay voice
-                if let Some(n) = self.voice_to_play.take() {
-                    self.play_voice(&n, true);
-                }
+                let voiced = match self.voice_to_play.take() {
+                    Some(n) => {
+                        self.play_voice(&n, true);
+                        true
+                    }
+                    None => false,
+                };
                 let text = self.resolve_text(raw);
                 // sub_391A0 draws the last F823 - 1 history messages above this one: the page starts over at
                 // a message with F823 <= 1 (the scripts count F823 up before each message, zero it at a page end)
@@ -1625,9 +1796,13 @@ impl Game {
                     }
                 }
                 let (text, wait) = message_end(&text);
-                self.show_message(&text, wait);
+                self.show_message(&message_end(raw).0, wait);
                 crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
                 let (raw_text, code) = raw_message(raw, "");
+                if !wait {
+                    // (sub_6E0D0 sets bit 4 for the voice it played unless the code is `@n`)
+                    self.wait = Wait::Message { voice: voiced && code != Some(b'n') };
+                }
                 self.msg_text = raw_text;
                 self.record_message();
                 self.ring_hold = code == Some(b'n');
@@ -1689,6 +1864,16 @@ impl Game {
             // IFNX goes to the default case (a no-op), so the Switch block after it runs
             "IFP4" => {
                 if let Some(l) = c.arg(1).filter(|l| !l.is_empty()) {
+                    let l = l.to_string();
+                    self.goto_label(&l);
+                }
+            }
+            // IFLA(language, label) (script_dispatch 'I' "FLA"; sub_75950 replays it for a rewind): on when the
+            // game language (sub_2DE70) is the argument, else to the label
+            "IFLA" => {
+                if self.value(c.arg(0)) != self.assets.language() as i32
+                    && let Some(l) = c.arg(1).filter(|l| !l.is_empty())
+                {
                     let l = l.to_string();
                     self.goto_label(&l);
                 }
@@ -1810,7 +1995,11 @@ impl Game {
                     let (raw_text, code) = raw_message(a, &base);
                     self.msg_text = raw_text;
                     let (text, wait) = message_end(&self.resolve_text(a));
-                    self.append_message(&text, wait);
+                    self.append_message(&message_end(a).0, wait);
+                    if !wait {
+                        // sub_6E950 sets bit 1 but plays no voice
+                        self.wait = Wait::Message { voice: false };
+                    }
                     // the text hooker gets the addition (the message itself went out already)
                     crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.pc as u64);
                     if !wait {
@@ -1832,7 +2021,8 @@ impl Game {
                     }
                 }
                 let value = c.int_or(0, self.sel_opts.len() as i32);
-                let text = self.resolve_text(c.arg(1).unwrap_or(""));
+                // the option keeps the script's text; its `$` reference resolves where it is laid out
+                let text = c.arg(1).unwrap_or("").to_string();
                 let disabled = c.int_or(2, 0) == 1;
                 self.cmd_selr(value, &text, disabled);
             }
@@ -1944,7 +2134,7 @@ impl Game {
                 let delta = self.stage.get(li).map(|l| l.name.clone()).map_or((0.0, 0.0), |n| self.variant_delta(&n));
                 if let Some(l) = self.stage.get(li) {
                     let (centre, k) = match &l.source {
-                        Source::Image(img) => ([img.center_x, img.center_y], img.level),
+                        Source::Image(img) => (img.anchor(), img.level),
                         Source::Color(_) => ([0.0; 2], 1.0),
                     };
                     let mut piv = l.pivot.unwrap_or(centre);
@@ -2380,12 +2570,16 @@ impl Game {
                 // sub_40480 / sub_40A00: these movies set the flags the movie / music galleries check once they
                 // end, and can be skipped only when already watched
                 let flag = [(5, 0), (6, 1), (4, 2), (35, 3), (36, 4), (37, 5)].iter().find(|m| m.0 == n).map(|m| m.1);
-                match crate::movie::MOVIES.get(n.max(0) as usize).filter(|_| n >= 0) {
+                // sub_402A0 plays the language's copy (sub_41260) and picks the cover by that entry
+                let language = self.assets.language();
+                let entry = usize::try_from(n).ok().map(|n| crate::movie::localized(n, language));
+                match entry.and_then(crate::movie::movie_name) {
                     Some(name) if !self.skip_all => {
-                        self.play_movie(r, name);
+                        self.play_movie(r, &name);
                         if self.movie.is_some() {
                             let skippable = flag.is_none_or(|f| self.movie_flags & (1 << f) != 0);
-                            self.story_movie = Some(StoryMovie::new(n, flag, skippable));
+                            let entry = entry.unwrap_or_default() as i32;
+                            self.story_movie = Some(StoryMovie::new(n, entry, language, flag, skippable));
                             self.begin_mode_task();
                         }
                     }
@@ -2917,8 +3111,6 @@ impl Game {
             l.alpha = Tween::fixed(p.alpha.value());
             l.rotation = Tween::fixed(p.rotation.value_rot());
             l.parent = p.parent;
-            l.blend = p.blend;
-            l.stbr = p.stbr;
             l.rot2 = p.rot2;
             l.clip_inset = p.clip_inset;
             l.soxy = p.soxy;
@@ -2926,10 +3118,16 @@ impl Game {
             if src_layer.is_some() {
                 l.quake = p.quake;
             }
-            // the stage anchor (pivot) is reset to the image centre when the image changes
-            if p.name == l.name {
-                l.pivot = p.pivot;
-                l.shift = p.shift;
+            // cmd_STCH_impl resets the stage anchor on every call: without a source layer to the centre cut to
+            // whole units (the defaults, `Image::anchor`); with one (SCH2 arg 18) to the source's pivot moved by
+            // the difference of the two centres, the shift word (int) minus that
+            if src_layer.is_some()
+                && let (Source::Image(si), Source::Image(img)) = (&p.source, &l.source)
+            {
+                let sp = p.pivot.unwrap_or(si.anchor());
+                let moved = [sp[0] - si.center_x + img.center_x, sp[1] - si.center_y + img.center_y];
+                l.pivot = Some(moved);
+                l.shift = Some([-moved[0].trunc(), -moved[1].trunc()]);
             }
             // the commit reloads the texture only when the layer's image changes
             if src_layer.is_none() && p.name == l.name && (!p.pending || p.keeps_texture) {
@@ -2956,6 +3154,12 @@ impl Game {
                 }
             }
         }
+        // cmd_STCH_impl LABEL_296: the STBR byte (stage +124) becomes F982 when that is >= 1 and the image (arg 1,
+        // sub_55D30) lacks ImageInfo +65 bit 0, else -1 (none), also over a source layer's copied byte
+        let f982 = self.var("F982");
+        let own_blend = self.assets.image_index_of(&upper).and_then(|i| self.assets.tables.images.get(i)).is_some_and(|i| i.own_blend);
+        l.stbr = if f982 >= 1 && !own_blend { f982 as i8 as i32 } else { -1 };
+        l.blend = if l.stbr >= 0 { blend_mode(l.stbr).0 } else { Blend::Alpha };
         if let Some(z) = c.int(4) {
             l.zoom_x = Tween::fixed(z as f32 / 1000.0);
             l.zoom_y = Tween::fixed(z as f32 / 1000.0);
@@ -3100,9 +3304,12 @@ impl Game {
     fn clear_page(&mut self, finished: bool) {
         let mut texts = std::mem::take(&mut self.page.texts);
         texts.append(&mut self.page.choice_texts);
+        let mut extras = std::mem::take(&mut self.page.extras);
+        extras.append(&mut self.page.choice_extras);
         let (first, last) = std::mem::take(&mut self.page_ring);
         if finished && !texts.is_empty() {
-            self.backlog_pages.push(BacklogPage { texts, first, last });
+            let bubble = self.assets.build == Build::Overseas && self.var("F1105") >= 3;
+            self.backlog_pages.push(BacklogPage { texts, extras, first, last, bubble });
         }
         self.page.chars.clear();
         self.page.texts.clear();
@@ -3126,31 +3333,91 @@ impl Game {
     /// The message layout and its first baseline (sub_391A0: page mode, else LABEL_135). Window types 3..32
     /// put the text at the bubble's text origin (unk_34DAD8, plus the F1106 / F1107 offsets), flt_34DEFC wide.
     fn text_layout(&self) -> (Layout, f32) {
+        let base = msg_layout();
         if !self.page_mode() {
-            return (WINDOW_LAYOUT, WINDOW_TOP_BASELINE);
+            let right = (WINDOW_LEFT + self.msg_width()) * 3.0;
+            return (Layout { left: WINDOW_LEFT * 3.0, right, ..base }, WINDOW_TOP_BASELINE - ASCENT + base.ascent);
         }
         match self.window_type() {
-            Some(t @ 3..=32) => {
+            Some(t) if self.is_bubble(t) => {
                 let (left, top) = self.bubble_text_origin(t, self.window_offset());
-                let right = left + BUBBLE_WIDTH[(t - 3) % 6 / 2] * UX;
-                (Layout { left, right, ..LAYOUT }, top + ASCENT)
+                let right = left + self.bubble_width(t) * UX;
+                // the bubble font's own pair ascent (`text::bubble_ascent`)
+                let ascent = base.ascent * text::bubble_ascent();
+                (Layout { left, right, ascent, ..base }, top + ascent)
             }
-            _ => (LAYOUT, TOP_BASELINE),
+            _ => (base, top_baseline()),
         }
     }
 
-    /// Text origin of bubble type `t` (3..32) in canvas pixels: unk_34D94C + unk_34DAD8 + the window offset.
+    /// The window types of the build (unk_34D94C; the overseas build's flt_231D74 has 56).
+    fn windows(&self) -> &'static [(u16, f32, f32)] {
+        match self.assets.build {
+            Build::Japanese => &WINDOWS,
+            Build::Overseas => &EN_WINDOWS,
+        }
+    }
+
+    /// Window type `t`'s image slot and x / y scale (overseas sub_3A070): with English text, types 0..2 take
+    /// slots 63..65 (dword_232014; also any language outside the 1920x1080 mode), and types 33..55 stretch
+    /// their reused bubble images from the top left.
+    fn window_image(&self, t: usize) -> Option<(u16, f32, f32)> {
+        let &(slot, _, _) = self.windows().get(t)?;
+        if self.assets.build == Build::Japanese {
+            return Some((slot, 1.0, 1.0));
+        }
+        let slot = if t <= 2 && text::english() { 63 + t as u16 } else { slot };
+        let (sx, sy) = match t {
+            33 | 50 | 51 => (1.12, 1.0),
+            34 => (1.12, 1.09),
+            35 | 37 => (1.07, 1.0),
+            36 => (1.0, 1.09),
+            39 | 52 | 53 | 55 => (1.11, 1.0),
+            40 => (1.4, 1.0),
+            41 | 42 => (1.14, 1.0),
+            43 | 46 => (1.01, 1.0),
+            47 | 48 => (1.1, 1.0),
+            49 => (1.3, 1.0),
+            54 => (1.06, 1.0),
+            _ => (1.0, 1.0),
+        };
+        Some((slot, sx, sy))
+    }
+
+    /// Window types 3.. are the QA corner bubbles.
+    fn is_bubble(&self, t: usize) -> bool {
+        (3..self.windows().len()).contains(&t)
+    }
+
+    /// The message slot's width in 640-wide units (sub_39050: English 573).
+    fn msg_width(&self) -> f32 {
+        if text::english() { EN_WIDTH } else { 464.0 }
+    }
+
+    /// Text width of bubble type `t` in 640-wide units (flt_34DEFC; overseas sub_39050).
+    fn bubble_width(&self, t: usize) -> f32 {
+        match self.assets.build {
+            Build::Japanese => BUBBLE_WIDTH[(t - 3) % 6 / 2],
+            Build::Overseas if t - 3 < 40 && (EN_BUBBLE_WIDTH_MASK >> (t - 3)) & 1 != 0 => EN_BUBBLE_WIDTH[t - 3],
+            Build::Overseas => self.msg_width(),
+        }
+    }
+
+    /// Text origin of bubble type `t` in canvas pixels: unk_34D94C + unk_34DAD8 + the window offset.
     fn bubble_text_origin(&self, t: usize, (dx, dy): (f32, f32)) -> (f32, f32) {
-        let (_, wx, wy) = WINDOWS[t];
-        let (tx, ty) = BUBBLE_TEXT[(t - 3) / 2];
+        let (_, wx, wy) = self.windows()[t];
+        let (tx, ty) = match self.assets.build {
+            Build::Japanese => BUBBLE_TEXT[(t - 3) / 2],
+            Build::Overseas => EN_BUBBLE_TEXT[t],
+        };
         // 1280x720 units -> 640x448 -> canvas pixels
         ((wx + tx + dx) * 640.0 / 1280.0 * UX, (wy + ty + dy) * 448.0 / 720.0 * UY)
     }
 
-    /// The second bubble (F1111 in 3..32, page mode; F1109 instead only for non-Japanese text): sub_391A0 draws
-    /// it like the F1105 window with the F1112 / F1113 offsets.
+    /// The second bubble (F1111 a bubble type, page mode): sub_391A0 draws it like the F1105 window with the
+    /// F1112 / F1113 offsets.
     fn second_bubble(&self) -> Option<usize> {
-        usize::try_from(self.var("F1111")).ok().filter(|t| (3..=32).contains(t) && self.page_mode())
+        usize::try_from(self.var("F1111")).ok().filter(|&t| self.is_bubble(t) && self.page_mode())
     }
 
     /// Where sub_391A0 moves the current message with a second bubble: to the second bubble's text origin plus
@@ -3162,6 +3429,115 @@ impl Game {
         let (left, top) = self.bubble_text_origin(t, (at(&WINDOW_DX, "F1112"), at(&WINDOW_DY, "F1113")));
         let (lay, top1) = self.text_layout();
         Some((left - lay.left, top + ASCENT - top1 - lay.line_height))
+    }
+
+    /// sub_AB0F0: the message font of the game language (the first file of its folder) and the QA bubble font
+    /// (of `<folder>3`), each with the exfont runs (exfont_nx01.bffnt).
+    pub fn load_fonts(assets: &Assets, r: &Renderer) -> anyhow::Result<(FontAtlas, Option<FontAtlas>)> {
+        use anyhow::Context as _;
+        let exfont = std::fs::read(assets.romfs.join("exfont_nx01.bffnt"));
+        if let Err(e) = &exfont {
+            tracing::warn!("exfont: {e}");
+        }
+        let with_exfont = |mut f: FontAtlas| {
+            if let Ok(d) = &exfont {
+                f.load_exfont(r, d).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}"));
+            }
+            f
+        };
+        let path = assets.font_path("").with_context(|| format!("no font in {}", assets.language_folder()))?;
+        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let mut font = with_exfont(FontAtlas::new(r, data)?);
+        // the rest of the font list (sub_CA500): `<folder>2`, `<folder>3`
+        for suffix in ["2", "3"] {
+            if let Some(d) = assets.font_path(suffix).and_then(|p| std::fs::read(p).ok()) {
+                font.add_fallback(d).unwrap_or_else(|e| tracing::warn!("font {suffix}: {e:#}"));
+            }
+        }
+        let bubble = match assets.font_path("3").map(|p| std::fs::read(&p).with_context(|| format!("reading {}", p.display()))) {
+            Some(Ok(d)) => FontAtlas::new(r, d).map(with_exfont).map_err(|e| tracing::warn!("bubble font: {e:#}")).ok(),
+            Some(Err(e)) => {
+                tracing::warn!("bubble font: {e:#}");
+                None
+            }
+            None => {
+                tracing::warn!("no bubble font");
+                None
+            }
+        };
+        Ok((font, bubble))
+    }
+
+    /// The overseas config's language change (sub_2D910 states 10 / 11): the script text, SYSMES and the
+    /// language's atlases and fonts (sub_9A940 / sub_AB0F0), then the shown page laid out again in the new
+    /// language at once (sub_7FE20: flag 0x1000; sub_391A0 resolves the earlier history lines per frame) and
+    /// the shown choice (sub_7D0C0). Returns whether the language changed.
+    pub fn change_language(&mut self, r: &Renderer, word: i16) -> bool {
+        match self.assets.set_language(word) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::warn!("language {word}: {e:#}");
+                return false;
+            }
+        }
+        match Self::load_fonts(&self.assets, r) {
+            Ok((font, bubble)) => {
+                self.font = font;
+                self.font_bubble = bubble;
+            }
+            Err(e) => tracing::warn!("fonts: {e:#}"),
+        }
+        self.disp = self.assets.ui_textures(r, &self.assets.ui_atlas("DISP_PARTS")).unwrap_or_default().into_iter().map(|(_, t)| t).collect();
+        self.sysmes = None;
+        self.relayout_page();
+        self.relayout_choice();
+        true
+    }
+
+    /// The page's messages laid out again from their script text (each at the start the page gives it, as
+    /// sub_391A0 places them), fully shown; their read fades stay.
+    fn relayout_page(&mut self) {
+        let texts = std::mem::take(&mut self.page.texts);
+        self.page.extras.clear();
+        let msgs = std::mem::take(&mut self.page.msgs);
+        let (waiting, visible, msg_pc) = (self.page.waiting, self.page.visible, self.msg_pc);
+        self.relaying = true;
+        self.page.chars.clear();
+        self.page.order = 0;
+        let (lay, top) = self.text_layout();
+        self.page.pen = (lay.left, top);
+        for t in &texts {
+            self.show_message(t, false);
+        }
+        for (m, old) in self.page.msgs.iter_mut().zip(&msgs) {
+            m.2 = old.2;
+            m.3 = old.3;
+        }
+        self.relaying = false;
+        self.msg_pc = msg_pc;
+        self.page.revealed = self.page.order as f32;
+        self.page.waiting = waiting;
+        self.page.visible = visible;
+    }
+
+    /// sub_A2550: capture this frame and show it over everything at full alpha until `thaw_screen`.
+    pub fn freeze_screen(&mut self) {
+        self.freeze = Some(Freeze { capture: true, alpha: 1.0, step: 0.0 });
+    }
+
+    /// sub_A27F0(ms): the capture fades out linearly over `ms` (a step of 1000 / ms / 60 per frame).
+    pub fn thaw_screen(&mut self, ms: f32) {
+        if let Some(f) = &mut self.freeze
+            && f.alpha > 0.0
+        {
+            f.step = 1000.0 / ms / 60.0;
+        }
+    }
+
+    /// sub_A2860: false while a capture shows.
+    pub fn screen_clear(&self) -> bool {
+        self.freeze.is_none()
     }
 
     /// The QA bubble font (ja3 FOT-Seurat), set once at startup.
@@ -3182,9 +3558,10 @@ impl Game {
         }
     }
 
-    /// Message window type (stage word F1105; F1109 instead only for non-Japanese text, sub_2DF20).
+    /// Message window type (stage word F1105; for English F1109 instead when it is above 0, sub_2DF20).
     fn window_type(&self) -> Option<usize> {
-        usize::try_from(self.var("F1105")).ok()
+        let f1109 = self.var("F1109");
+        usize::try_from(if text::english() && f1109 > 0 { f1109 } else { self.var("F1105") }).ok()
     }
 
     /// Window offset in 1280x720 units: flt_34D84C[F1106], flt_34D8B8[F1107] (0 out of range).
@@ -3193,8 +3570,11 @@ impl Game {
         (at(&WINDOW_DX, "F1106"), at(&WINDOW_DY, "F1107"))
     }
 
+    /// Lay out a message (`text` as the script has it: `$` references resolve in the game language, and the
+    /// page keeps it unresolved, as the exe's history records do) at the page pen.
     fn show_message(&mut self, text: &str, wait: bool) {
-        let runs = text::parse_markup(text);
+        let shown = self.resolve_text(text);
+        let runs = text::parse_markup(&shown);
         self.page.visible = true;
         // lay out on a scratch copy; restart the page if it overflows
         let (lay, top) = self.text_layout();
@@ -3221,7 +3601,7 @@ impl Game {
         let order0 = self.page.order;
         let (x, b, order) = text::layout(self.msg_font(), &lay, &runs, start.0, start.1, order0, &mut placed);
         self.msg_pc = self.pc.saturating_sub(1);
-        if b > BOTTOM_LIMIT && !self.page.chars.is_empty() {
+        if b > BOTTOM_LIMIT && !self.page.chars.is_empty() && !self.relaying {
             self.clear_page(true);
             placed.clear();
             from = ((lay.left, top), 0);
@@ -3234,8 +3614,10 @@ impl Game {
         }
         self.page.last_start = from;
         let fade_frames = self.settings.text_ms[usize::from(self.line_read)] * 1.2;
-        self.page.msgs.push((self.page.chars.len(), text.trim_end().ends_with("@k"), 0.0, fade_frames));
+        self.page.msgs.push((self.page.chars.len(), shown.trim_end().ends_with("@k"), 0.0, fade_frames));
         self.page.chars.extend(placed);
+        let extra = self.var(&format!("F{}", 847 + self.page.texts.len()));
+        self.page.extras.push(extra);
         self.page.texts.push(text.to_string());
         if wait {
             self.page.waiting = true;
@@ -3253,7 +3635,8 @@ impl Game {
         };
         let base = last.strip_suffix("@k").unwrap_or(last);
         let text = format!("{base}{add}");
-        let runs = text::parse_markup(&text);
+        let shown = self.resolve_text(&text);
+        let runs = text::parse_markup(&shown);
         let (lay, _) = self.text_layout();
         let ((x0, y0), order0) = self.page.last_start;
         self.page.chars.truncate(first);
@@ -3263,7 +3646,7 @@ impl Game {
         self.page.order = order;
         self.page.chars.extend(placed);
         if let Some(m) = self.page.msgs.last_mut() {
-            m.1 = text.trim_end().ends_with("@k");
+            m.1 = shown.trim_end().ends_with("@k");
         }
         *self.page.texts.last_mut().unwrap() = text;
         self.page.visible = true;
@@ -3285,79 +3668,137 @@ impl Game {
     }
 
     /// Text quads of backlog page `back` (0 = the newest finished page), laid out like the message window
-    /// (sub_28470 lays the history out with the message text style at x 88 units).
+    /// (sub_28470 lays the history out with the message text style at x 88 units, English 32, the first line's
+    /// box at 65.059 units, English 55.176, in a 464-unit slot, English 573).
     pub fn backlog_quads(&mut self, r: &Renderer, back: usize) -> Vec<Quad> {
-        let texts = match self.backlog_pages.len().checked_sub(back + 1) {
-            Some(i) => self.backlog_pages[i].texts.clone(),
+        let (texts, extras, bubble) = match self.backlog_pages.len().checked_sub(back + 1) {
+            Some(i) => {
+                let p = &self.backlog_pages[i];
+                (p.texts.clone(), p.extras.clone(), p.bubble)
+            }
             None => return Vec::new(),
+        };
+        let mut lay = msg_layout();
+        // bubble entries in the bubble font take its pair ascent (`text::bubble_ascent`)
+        if bubble && self.font_bubble.is_some() {
+            lay.ascent *= text::bubble_ascent();
+        }
+        let top = if text::english() { 55.176 } else { 65.059 } * UY + lay.ascent;
+        let font = match &mut self.font_bubble {
+            Some(f) if bubble => f,
+            _ => &mut self.font,
         };
         let mut placed = Vec::new();
         let (mut pen_y, mut order) = (None, 0);
-        for t in &texts {
-            let runs = text::parse_markup(t);
-            let y = pen_y.map_or(TOP_BASELINE, |y: f32| y + LAYOUT.line_height + PARAGRAPH_GAP);
-            let (_, b, o) = text::layout(&self.font, &LAYOUT, &runs, LAYOUT.left, y, order, &mut placed);
+        for (i, t) in texts.iter().enumerate() {
+            let runs = text::parse_markup(&resolve_refs(&self.assets, t));
+            // sub_28470: entry i starts a line pitch below the last one (the first at the top line), then
+            // F(847 + i) of its record more lines down when 1..32, or (that - 64) lines when over 32, not above
+            // the top line (a choice's first option: the blank line its first SELR asked for)
+            let y = pen_y.map_or(top, |y: f32| y + lay.line_height + PARAGRAPH_GAP);
+            let y = match extras.get(i).copied().unwrap_or(0) {
+                v @ 1..=32 => y + v as f32 * lay.line_height,
+                v if v > 32 => (y + (v - 64) as f32 * lay.line_height).max(top),
+                _ => y,
+            };
+            let (_, b, o) = text::layout(font, &lay, &runs, lay.left, y, order, &mut placed);
             pen_y = Some(b);
             order = o;
         }
         let mut out = Vec::new();
         for pc in &placed {
-            Self::rimmed_glyph(&mut self.font, r, &mut out, pc, 1.0);
+            Self::rimmed_glyph(font, r, &mut out, pc, 1.0);
         }
+        out.extend(placed.iter().filter_map(|pc| self.bar_quad(pc, None, [1.0; 4], true)));
         out
+    }
+
+    /// The bar of a bar run's first character (`text::Bar`, drawn by sub_C6A58 after the slot's glyphs) when
+    /// `count` of its characters show (all when None), tinted `color` (the slot's text colour times its alpha):
+    /// the bar texture pair sub_A7790 gives every slot (sub_C3B48: ids 143 / 144, the overseas build 146 /
+    /// 147), DISP_PARTS bf_no_edge68x68_2 / bf_with_edge68x68_2 (image slots 79 / 80, overseas 82 / 83), the
+    /// second for an edged slot (+101836 + 4 * +101003).
+    pub fn bar_quad(&self, pc: &text::PlacedChar, count: Option<usize>, color: [f32; 4], edge: bool) -> Option<Quad> {
+        let bar = pc.bar?;
+        let n = count.map_or(bar.len, |c| c.min(usize::from(bar.len)) as u8);
+        if n == 0 {
+            return None;
+        }
+        let slot: u16 = if self.assets.build == Build::Overseas { 82 } else { 79 } + u16::from(edge);
+        let tex = self.disp.get(usize::from(slot - DISP_SLOT0))?;
+        let (rect, [u0, v0, u1, v1]) = bar.rects(pc.x, pc.size, n);
+        Some(Quad::rect(tex.clone(), rect, color).with_uv_rect(u0, v0, u1, v1))
     }
 
     /// A message glyph: white with a dark rim all around.
     fn rimmed_glyph(font: &mut FontAtlas, r: &Renderer, out: &mut Vec<Quad>, pc: &text::PlacedChar, alpha: f32) {
-        // rim taps 2 px orthogonal / 1.5 px diagonal at 0.55 each, composited with the fill in the shader:
-        // sub_391A0 fades a message by one alpha on the whole bordered glyph (Switch fire page: faded line =
-        // B + 0.39 (full - B) per pixel), not by fading separately drawn rim and fill quads
-        if let Some(q) = font.rimmed_quad(r, pc, 2.0, 0.55, alpha) {
+        // the edge of font index 1 (`text::edge_rim`) scaled with the glyph, composited with the fill in the
+        // shader: sub_391A0 fades a message by one alpha on the whole bordered glyph (Switch fire page: faded
+        // line = B + 0.39 (full - B) per pixel), not by fading separately drawn rim and fill quads
+        if let Some(q) = font.rimmed_quad(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, alpha) {
             out.push(q);
+        }
+    }
+
+    /// The MSQK offset of the message layer in canvas pixels.
+    fn msg_offset(&self) -> (f32, f32) {
+        (self.msg_quake.offset.0 * CANVAS_W as f32 / 640.0, self.msg_quake.offset.1 * CANVAS_H as f32 / 448.0)
+    }
+
+    /// The message window (layer 29) at window alpha `a`: the page-mode window image and a second bubble.
+    fn window_quads(&self, a: f32, out: &mut Vec<Quad>) {
+        if a <= 0.0 {
+            return;
+        }
+        // the window (F1104 == 0, page mode): image slot WINDOWS[F1105] at its origin + the F1106 / F1107
+        // offsets + the MSQK offset, natively sized (0.333 x 0.4148 units per 1920x1080 pixel). Types 0..2
+        // cover the screen at the page alpha * config word 0 (255); type 0 = txtwindow01 (alpha 102/255 in
+        // the middle, falling off to the left and right edges). The bubbles draw at 0.78431 * the page alpha.
+        // F822 != 1 draws image slots 10 / 2 instead (sub_B6DE0), which nothing ever fills, so no window
+        // shows there (trainscene.mov)
+        let (ox, oy) = self.msg_offset();
+        // sub_391A0 draws the window into layer 29 and the text / icon into layer 30, then composites both
+        // (sub_B06C0 -> sub_9FAD0) at window alpha * 2 * max(content - 0.5, 0): CLO4 fades the frame too
+        let content = 1.0 - self.page.dim;
+        let layer = a * (2.0 * (content - 0.5)).clamp(0.0, 1.0);
+        if self.page_mode() && self.var("F1104") == 0 {
+            let w = self.window_type().and_then(|t| Some((t, self.windows().get(t)?, self.window_image(t)?)));
+            if let Some((t, &(_, wx, wy), (slot, sx, sy))) = w
+                && let Some(tex) = self.disp.get(usize::from(slot - DISP_SLOT0))
+            {
+                let (dx, dy) = self.window_offset();
+                let alpha = if t > 2 { 0.78431 } else { 1.0 } * a * layer;
+                let size = tex.texture.size();
+                let rect = [(wx + dx) * 1.5 + ox, (wy + dy) * 1.5 + oy, size.width as f32 * sx, size.height as f32 * sy];
+                out.push(Quad::rect(tex.clone(), rect, [1.0, 1.0, 1.0, alpha]));
+            }
+            // F1111 >= 3: a second bubble at its origin + the F1112 / F1113 offsets, also at 0.78431 * alpha
+            if let Some(t) = self.second_bubble()
+                && let Some((slot, sx, sy)) = self.window_image(t)
+                && let Some(tex) = self.disp.get(usize::from(slot - DISP_SLOT0))
+            {
+                let at = |t: &[f32], w: &str| usize::try_from(self.var(w)).ok().and_then(|i| t.get(i)).copied().unwrap_or(0.0);
+                let (_, wx, wy) = self.windows()[t];
+                let (dx, dy) = (at(&WINDOW_DX, "F1112"), at(&WINDOW_DY, "F1113"));
+                let size = tex.texture.size();
+                let rect = [(wx + dx) * 1.5 + ox, (wy + dy) * 1.5 + oy, size.width as f32 * sx, size.height as f32 * sy];
+                out.push(Quad::rect(tex.clone(), rect, [1.0, 1.0, 1.0, 0.78431 * a * layer]));
+            }
         }
     }
 
     fn ui_quads(&mut self, r: &Renderer) -> Vec<Quad> {
         let mut out = Vec::new();
+        // the overseas sub_391A0 returns at once while the system menu shows (sub_4EC00)
+        if self.assets.build == Build::Overseas && self.system_menu_shown {
+            return out;
+        }
         let a = if self.hide_text { 0.0 } else { self.page.alpha };
         if a > 0.0 {
-            // the window (F1104 == 0, page mode): image slot WINDOWS[F1105] at its origin + the F1106 / F1107
-            // offsets + the MSQK offset, natively sized (0.333 x 0.4148 units per 1920x1080 pixel). Types 0..2
-            // cover the screen at the page alpha * config word 0 (255); type 0 = txtwindow01 (alpha 102/255 in
-            // the middle, falling off to the left and right edges). The bubbles draw at 0.78431 * the page alpha.
-            // F822 != 1 draws image slots 10 / 2 instead (sub_B6DE0), which nothing ever fills, so no window
-            // shows there (trainscene.mov)
-            let (ox, oy) = (
-                self.msg_quake.offset.0 * CANVAS_W as f32 / 640.0,
-                self.msg_quake.offset.1 * CANVAS_H as f32 / 448.0,
-            );
-            // sub_391A0 draws the window into layer 29 and the text / icon into layer 30, then composites both
-            // (sub_B06C0 -> sub_9FAD0) at window alpha * 2 * max(content - 0.5, 0): CLO4 fades the frame too
             let content = 1.0 - self.page.dim;
             let layer = a * (2.0 * (content - 0.5)).clamp(0.0, 1.0);
-            if self.page_mode() && self.var("F1104") == 0 {
-                let w = self.window_type().and_then(|t| Some((t, WINDOWS.get(t)?)));
-                if let Some((t, &(slot, wx, wy))) = w
-                    && let Some(tex) = self.disp.get(usize::from(slot - DISP_SLOT0))
-                {
-                    let (dx, dy) = self.window_offset();
-                    let alpha = if t > 2 { 0.78431 } else { 1.0 } * a * layer;
-                    let size = tex.texture.size();
-                    let rect = [(wx + dx) * 1.5 + ox, (wy + dy) * 1.5 + oy, size.width as f32, size.height as f32];
-                    out.push(Quad::rect(tex.clone(), rect, [1.0, 1.0, 1.0, alpha]));
-                }
-                // F1111 >= 3: a second bubble at its origin + the F1112 / F1113 offsets, also at 0.78431 * alpha
-                if let Some(t) = self.second_bubble()
-                    && let Some(tex) = self.disp.get(usize::from(WINDOWS[t].0 - DISP_SLOT0))
-                {
-                    let at = |t: &[f32], w: &str| usize::try_from(self.var(w)).ok().and_then(|i| t.get(i)).copied().unwrap_or(0.0);
-                    let (_, wx, wy) = WINDOWS[t];
-                    let (dx, dy) = (at(&WINDOW_DX, "F1112"), at(&WINDOW_DY, "F1113"));
-                    let size = tex.texture.size();
-                    let rect = [(wx + dx) * 1.5 + ox, (wy + dy) * 1.5 + oy, size.width as f32, size.height as f32];
-                    out.push(Quad::rect(tex.clone(), rect, [1.0, 1.0, 1.0, 0.78431 * a * layer]));
-                }
-            }
+            self.window_quads(a, &mut out);
+            let (ox, oy) = self.msg_offset();
             // sub_391A0 composites the window (target 29), then draws the choice (sub_84E50), then composites
             // the text (target 30): the page text stays above the choice backdrop
             self.choice_quads(r, &mut out, a);
@@ -3382,6 +3823,7 @@ impl Game {
                 })
                 .collect();
             let mut m = 0;
+            let mut bars = Vec::new();
             for (ci, pc) in self.page.chars.iter().enumerate() {
                 while m + 1 < msgs.len() && msgs[m + 1].0 <= ci {
                     m += 1;
@@ -3389,6 +3831,11 @@ impl Game {
                 let fade = fades.get(m).copied().unwrap_or(1.0);
                 let (sx, sy) = shift.filter(|_| ci >= cur).unwrap_or((0.0, 0.0));
                 let pc = &text::PlacedChar { x: pc.x + ox + sx, baseline: pc.baseline + oy + sy, ..*pc };
+                // sub_C6A58: the bar shows (int) revealed - its first character's index cells
+                if pc.bar.is_some() && !self.rewinding {
+                    let count = (revealed.floor() - pc.order as f32).max(0.0) as usize;
+                    bars.push((*pc, count, text_a * fade));
+                }
                 let mut vis = (revealed - pc.order as f32).clamp(0.0, 1.0);
                 if !self.settings.text_fade_in && vis > 0.0 {
                     vis = 1.0;
@@ -3400,13 +3847,19 @@ impl Game {
                 let alpha = vis * text_a * fade;
                 Self::rimmed_glyph(font, r, &mut out, pc, alpha);
             }
+            // the message text is edged (+101003); the bar takes the slot alpha, not the glyph fade-in
+            for (pc, count, alpha) in bars {
+                out.extend(self.bar_quad(&pc, Some(count), [1.0, 1.0, 1.0, alpha], true));
+            }
             // (sub_38EC0 draws nothing while a rewind runs)
-            if self.wait == Wait::Click && revealed as usize >= self.page.order && !self.rewinding {
+            // (the overseas sub_38EC0 also draws nothing in auto mode, word_1916DEC bit 0)
+            let auto_hidden = self.assets.build == Build::Overseas && self.auto;
+            if self.wait == Wait::Click && revealed as usize >= self.page.order && !self.rewinding && !auto_hidden {
                 // sub_38EC0 at the pen + (2, 3.5) units for the F799 line icon (slot 54, lineBreak_a), (2, 5.5)
                 // for the page icon (slot 55, pageBreak_a, at half alpha); F822 != 1 always the page icon at
                 // (2, 6.5). Window types 3..32 draw slot 56 (pageBreak_ciel_a, 59 frames of 43x46) at (4, 4).
                 // 30 frames a second, 0.36 x 0.45 units per texture pixel.
-                let bubble = self.page_mode() && matches!(self.window_type(), Some(3..=32));
+                let bubble = self.page_mode() && self.window_type().is_some_and(|t| self.is_bubble(t));
                 let page_icon = self.wnty == 1 || !self.page_mode();
                 let (slot, frames, (fw, fh), alpha, (dx, dy)) = if bubble {
                     (56, 59, (43.0, 46.0), 1.0, (4.0, 4.0))
@@ -3423,6 +3876,9 @@ impl Game {
                 let (lay, _) = self.text_layout();
                 let (px, py) = self.page.pen;
                 let px = if px > lay.left { px - lay.spacing } else { px };
+                // The overseas text slot (sub_C5FB4, English text: slot +101009) stores the writer's cursor
+                // plus half the glyph cell (slot +776, the 41.04 px em) as the cursor
+                let px = if self.assets.build == Build::Overseas && text::english() { px + lay.size * 0.5 } else { px };
                 let (ux, uy) = ((px / UX).trunc(), ((py - lay.ascent) / UY).trunc());
                 let (sx, sy) = shift.unwrap_or((0.0, 0.0));
                 let (x, y) = ((ux + dx) * UX + sx, (uy + dy) * UY + sy);
@@ -3454,6 +3910,52 @@ impl Game {
         }
     }
 
+    /// The layers into the stage target, through the layer group surfaces where stage::Draw says so.
+    fn render_stage(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
+        use crate::stage::Draw;
+        let draws = self.stage.draws(&r.white);
+        let mut run: Vec<Quad> = Vec::new();
+        let mut clear = Some([0.0, 0.0, 0.0, 1.0]);
+        for d in draws {
+            let quad = match d {
+                Draw::Stage(q) => {
+                    run.push(q);
+                    continue;
+                }
+                Draw::Composite { blend, alpha } => {
+                    // drawn now: the scratch target is reused by the next composite
+                    r.draw(enc, &self.stage_rt, clear.take(), &std::mem::take(&mut run));
+                    let [px, mask, tmp] = self.group_targets(r, enc);
+                    // exalpha into target 3: the pixel surface's rgb, its alpha times the mask's
+                    r.copy_target(enc, px, tmp);
+                    let full = [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32];
+                    let m = Quad { blend: Blend::MaskAlpha, ..Quad::rect(mask.tex.clone(), full, [1.0; 4]) };
+                    r.draw(enc, tmp, None, &[m]);
+                    run.push(Quad { blend, ..Quad::rect(tmp.tex.clone(), full, [1.0, 1.0, 1.0, alpha]) });
+                    continue;
+                }
+                Draw::Pixel { quad, clear } => (0, quad, clear),
+                Draw::Mask { quad, clear } => (1, quad, clear),
+            };
+            r.draw(enc, &self.stage_rt, clear.take(), &std::mem::take(&mut run));
+            let (k, q, c) = quad;
+            let t = &self.group_targets(r, enc)[k];
+            r.draw(enc, t, c.then_some([0.0; 4]), &[q]);
+        }
+        r.draw(enc, &self.stage_rt, clear, &run);
+    }
+
+    fn group_targets(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) -> &[RenderTarget; 3] {
+        if self.group_rt.is_none() {
+            let t = ["group pixel", "group mask", "group composite"].map(|n| r.create_target(CANVAS_W, CANVAS_H, n));
+            for rt in &t {
+                r.draw(enc, rt, Some([0.0; 4]), &[]);
+            }
+            self.group_rt = Some(t);
+        }
+        self.group_rt.as_ref().unwrap()
+    }
+
     pub fn render(&mut self, r: &mut Renderer, overlay: &mut dyn FnMut(&mut Self, &Renderer, &mut Vec<Quad>)) {
         let mut enc = r.encoder();
         self.render_previews(r, &mut enc);
@@ -3473,8 +3975,7 @@ impl Game {
             self.stage.noise_rt = Some(rt.tex.clone());
         }
         self.render_choice_glow(r, &mut enc);
-        let quads = self.stage.quads(&r.white);
-        r.draw(&mut enc, &self.stage_rt, Some([0.0, 0.0, 0.0, 1.0]), &quads);
+        self.render_stage(r, &mut enc);
         match &self.trans {
             Some(t) => {
                 let p = (t.t / t.dur).clamp(0.0, 1.0);
@@ -3504,14 +4005,45 @@ impl Game {
                 r.draw(&mut enc, &self.canvas, None, &quads);
             }
         }
+        if self.menu_blur.is_some() && !self.menu_captured {
+            // sub_A46F0 copies target 0 in the frame the blur starts, before the composites that frame queued:
+            // sub_391A0 draws the window and text into layers 29 / 30 and composites them later (sub_B06C0 ->
+            // sub_9FAD0's list), but sub_84E50 draws a choice's backdrop straight into target 0. So the capture is
+            // the scene with the choice backdrop and no window or text (Switch EN: the system menu over a page
+            // mean abs 1.41 without the window against 28.6 with it; over the first choice 1.44 with the
+            // backdrop alone, 6.43 with the window instead; the backlog's 0.75 black leaves 0.417 =
+            // 0.25 / (1 - 102/255) of the windowed page)
+            let a = if self.touch_hidden { 0.0 } else { self.page.alpha };
+            if let Some(q) = self.choice_backdrop(r, a) {
+                r.draw(&mut enc, &self.canvas, None, &[q]);
+            }
+        }
         match self.menu_blur {
             Some(a) => {
                 let rt = self.menu_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "menu blur"));
                 if !self.menu_captured {
-                    // sub_A0A90(.., 2.25): sigma 2.25 taps spaced 1.75 px (of 1920)
-                    let step = 1.75 * CANVAS_W as f32 / 1920.0;
-                    r.blur(&mut enc, &self.canvas.tex, &self.blur_rt, [step, 0.0], 2.25);
-                    r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25);
+                    if self.assets.build == knife_core::exe::Build::Overseas {
+                        // sub_9EC50 (its sigma argument unused): the capture scaled to the half-size "filter
+                        // Defocus" buffer, then sub_9CCD0(1.25)'s meshes, 2 ceil(3.75) + 1 = 9 quads offset
+                        // sigma sqrt(2 pi) k / 1920 (/ 1080) in UV, each at its weight, horizontally and then
+                        // vertically (shader 55, through the backbuffer and copied back), then scaled up 2x
+                        let (hw, hh) = (CANVAS_W / 2, CANVAS_H / 2);
+                        let [a, b] = self.menu_half.get_or_insert_with(|| {
+                            [r.create_target(hw, hh, "filter defocus"), r.create_target(hw, hh, "defocus pass")]
+                        });
+                        let full = Quad::rect(self.canvas.tex.clone(), [0.0, 0.0, hw as f32, hh as f32], [1.0; 4]);
+                        r.draw(&mut enc, a, Some([0.0, 0.0, 0.0, 1.0]), &[full]);
+                        let step = 1.25 * (2.0 * std::f32::consts::PI).sqrt() * hw as f32 / 1920.0;
+                        r.blur(&mut enc, &a.tex, b, [step, 0.0], 1.25);
+                        r.blur(&mut enc, &b.tex, a, [0.0, step], 1.25);
+                        let up = Quad::rect(a.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
+                        r.draw(&mut enc, rt, Some([0.0, 0.0, 0.0, 1.0]), &[up]);
+                    } else {
+                        // sub_A0A90(.., 2.25): sigma 2.25 taps spaced 1.75 px (of 1920)
+                        let step = 1.75 * CANVAS_W as f32 / 1920.0;
+                        r.blur(&mut enc, &self.canvas.tex, &self.blur_rt, [step, 0.0], 2.25);
+                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25);
+                    }
                     self.menu_captured = true;
                 }
                 let q = Quad::rect(rt.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, a.min(1.0)]);
@@ -3528,6 +4060,17 @@ impl Game {
         overlay(self, r, &mut ui);
         if !ui.is_empty() {
             r.draw(&mut enc, &self.canvas, None, &ui);
+        }
+        if let Some(f) = &mut self.freeze {
+            let rt = self.freeze_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "screen capture"));
+            if f.capture {
+                // sub_A2550 takes the frame being finished
+                r.copy_target(&mut enc, &self.canvas, rt);
+                f.capture = false;
+            } else {
+                let q = Quad::rect(rt.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, f.alpha.clamp(0.0, 1.0)]);
+                r.draw(&mut enc, &self.canvas, None, &[q]);
+            }
         }
         r.present(enc, &self.canvas);
     }
@@ -3584,7 +4127,7 @@ impl Game {
                     noise: l.noise,
                     // the restore takes the blend from `stbr` when one is set (backdrop blends always have one)
                     blend: match l.blend {
-                        Blend::Alpha | Blend::Ps(_) => 0,
+                        Blend::Alpha | Blend::Ps(_) | Blend::Footprint | Blend::MaskAlpha => 0,
                         Blend::Add => 1,
                         Blend::Sub => 2,
                         Blend::Multiply => 3,
@@ -3624,16 +4167,7 @@ impl Game {
             .page
             .texts
             .last()
-            .map(|t| {
-                text::parse_markup(t)
-                    .into_iter()
-                    .filter_map(|r| match r {
-                        text::Run::Text(t) => Some(t),
-                        text::Run::Ruby { base, .. } => Some(base),
-                        text::Run::Newline => None,
-                    })
-                    .collect::<String>()
-            })
+            .map(|t| text::note_text(&resolve_refs(&self.assets, t)))
             .unwrap_or_default();
         SaveData {
             version: 1,
@@ -3680,7 +4214,7 @@ impl Game {
         let mut v = [0.0; crate::motion::FIELDS];
         let Some(l) = self.stage.layers.get(li).and_then(|l| l.as_ref()) else { return v };
         let centre = match &l.source {
-            Source::Image(img) => [img.center_x, img.center_y],
+            Source::Image(img) => img.anchor(),
             Source::Color(_) => [0.0; 2],
         };
         let piv = l.pivot.unwrap_or(centre);
@@ -3732,7 +4266,7 @@ impl Game {
         if f.pivot.iter().any(Option::is_some) {
             let (k, (dx, dy)) = pivot_info.unwrap_or((1.0, (0.0, 0.0)));
             let centre = match &l.source {
-                Source::Image(img) => [img.center_x, img.center_y],
+                Source::Image(img) => img.anchor(),
                 Source::Color(_) => [0.0; 2],
             };
             let mut piv = l.pivot.unwrap_or(centre);
@@ -3824,11 +4358,16 @@ impl Game {
                 let delta = self.variant_delta(&name);
                 let old = self.variant_delta(&cur);
                 let l = self.stage.layers[li].as_mut().unwrap();
-                if let Some(p) = &mut l.pivot {
-                    p[0] += delta.0 - old.0;
-                    p[1] += delta.1 - old.1;
+                // sub_97B80 sets the render pivot and shift from the new image's exact centre (render floats 25 /
+                // 26 and 18 / 19), not the whole-unit stage anchor
+                match &mut l.pivot {
+                    Some(p) => {
+                        p[0] += delta.0 - old.0;
+                        p[1] += delta.1 - old.1;
+                    }
+                    None => l.pivot = Some([img.center_x, img.center_y]),
                 }
-                l.shift = None;
+                l.shift = Some([-img.center_x, -img.center_y]);
                 l.source = Source::Image(img);
                 l.name = name;
             }
@@ -3975,15 +4514,58 @@ impl Game {
         Some(l)
     }
 
-    /// The preview of save slot `slot` showing `layers`, or None until `render` has drawn it.
-    pub fn preview(&mut self, slot: usize, layers: &[Option<crate::save::LayerSave>]) -> Option<TexRef> {
+    /// The preview of save slot `slot` showing record `d`, or None until `render` has drawn it.
+    pub fn preview(&mut self, slot: usize, d: &crate::save::SaveData) -> Option<TexRef> {
         if let Some(t) = self.previews.get(&slot) {
             return Some(t.clone());
         }
-        if !self.preview_queue.iter().any(|(s, _)| *s == slot) {
-            self.preview_queue.push((slot, layers.to_vec()));
+        if !self.preview_queue.iter().any(|(s, ..)| *s == slot) {
+            let pic = self.preview_picture(d);
+            self.preview_queue.push((slot, d.layers.to_vec(), pic));
         }
         None
+    }
+
+    /// Overseas sub_86840 (from sub_884F0): a record of one of these scenes whose F1122 (the PGST id, read
+    /// through sub_55300) is below 1 or the scene's value shows the picture alone instead of its stage.
+    fn preview_picture(&self, d: &crate::save::SaveData) -> Option<String> {
+        if self.assets.build != knife_core::exe::Build::Overseas {
+            return None;
+        }
+        let (n, want) = match d.scene {
+            4 => (0, 10000),
+            35 => (1, 10000),
+            60 => (2, 10000),
+            81 | 109 => (3, 10000),
+            116 => (4, 10000),
+            157 => (5, 10015),
+            169 => (6, 10000),
+            183 => (7, 10000),
+            197 => (8, 10000),
+            218 => (9, 10000),
+            239 => (10, 10000),
+            266 => (11, 10000),
+            281 => (12, 10000),
+            298 => (13, 10000),
+            323 => (14, 10000),
+            348 => (15, 10000),
+            322 => (16, 10029),
+            376 => (17, 10000),
+            385 => (18, 10000),
+            391 => (19, 10000),
+            398 => (20, 10000),
+            416 => (21, 10000),
+            424 => (22, 10000),
+            454 => (23, 10000),
+            490 => (24, 10000),
+            493 => (25, 10000),
+            494 => (26, 10000),
+            _ => return None,
+        };
+        let pgst = d.vars.iter().find(|(k, _)| k == "F1122").map_or(0, |v| v.1);
+        // sub_62110 (sub_56D40 on the image table): an index below 1 keeps the stage
+        let name = format!("IMG60{n:02}");
+        (pgst < 1 || pgst == want).then_some(name).filter(|n| self.assets.image_index_of(n).is_some_and(|i| i >= 1))
     }
 
     /// Forget the previews (of one slot, or all) after their records changed.
@@ -3991,7 +4573,7 @@ impl Game {
         match slot {
             Some(s) => {
                 self.previews.remove(&s);
-                self.preview_queue.retain(|(q, _)| *q != s);
+                self.preview_queue.retain(|(q, ..)| *q != s);
             }
             None => {
                 self.previews.clear();
@@ -4012,28 +4594,34 @@ impl Game {
             return;
         }
         let mut ready = Vec::new();
-        for (slot, mut layers) in std::mem::take(&mut self.preview_queue) {
+        for (slot, mut layers, pic) in std::mem::take(&mut self.preview_queue) {
             // the previews draw the thumbnail copies of the art (sub_895A0)
             for ls in layers.iter_mut().flatten() {
                 if let Some(name) = ls.image.as_mut().filter(|n| !n.starts_with(crate::assets::THUMB)) {
                     *name = self.assets.thumb_name(name);
                 }
             }
+            let pic = pic.map(|p| self.assets.thumb_name(&p));
             let mut waiting = false;
-            for ls in layers.iter().flatten() {
-                let Some(name) = &ls.image else { continue };
-                if self.assets.image_cached(name, ls.bake()) {
+            let none = crate::grade::Bake::new(0, 1.0, 1.0);
+            let wanted = layers.iter().flatten().filter_map(|ls| ls.image.as_ref().map(|n| (n, ls.bake())));
+            let wanted: Vec<(&String, crate::grade::Bake)> = match &pic {
+                Some(p) => vec![(p, none)],
+                None => wanted.collect(),
+            };
+            for (name, bake) in wanted {
+                if self.assets.image_cached(name, bake) {
                     continue;
                 }
                 waiting = true;
-                if self.preview_decoding.insert(crate::assets::Assets::image_key(name, ls.bake()).2) {
-                    self.assets.decode_async(name, ls.bake(), self.preview_decoded.0.clone());
+                if self.preview_decoding.insert(crate::assets::Assets::image_key(name, bake).2) {
+                    self.assets.decode_async(name, bake, self.preview_decoded.0.clone());
                 }
             }
             if waiting {
-                self.preview_queue.push((slot, layers));
+                self.preview_queue.push((slot, layers, pic));
             } else {
-                ready.push((slot, layers));
+                ready.push((slot, layers, pic));
             }
         }
         if ready.is_empty() {
@@ -4042,7 +4630,38 @@ impl Game {
         // the "thumbnail surface" sub_89AD0 draws into (sub_A5C10)
         let (tw, th) = PREVIEW_TARGET;
         let rt = self.preview_rt.get_or_insert_with(|| r.create_target(tw, th, "preview")).tex.clone();
-        for (slot, layers) in ready {
+        for (slot, layers, pic) in ready {
+            let scale = tw as f32 / CANVAS_W as f32;
+            let quads: Vec<Quad> = if let Some(p) = pic {
+                // the one layer sub_884F0 then sets up: the picture at 0, 0, zoom 2 / 3, white, no parent, its
+                // ImageInfo centre (+124 / +128) 0 so the anchor is the top left. sub_89AD0 draws a texture at
+                // its full size (the 1/6 thumbnail / 0.16667) times 1.5 (stage art is defined at half its pixels
+                // in 640-wide units, drawn 3x) times the zoom: the 1920x1080 picture strip fills the surface
+                let none = crate::grade::Bake::new(0, 1.0, 1.0);
+                match self.assets.image_graded(r, &p, none) {
+                    Some(img) => {
+                        let k = 6.0 * 1.5 * 2.0 / 3.0;
+                        let (w, h) = (img.tex.width as f32 * k, img.tex.height as f32 * k);
+                        vec![Quad::rect(img.tex.clone(), [0.0, 0.0, w, h], [1.0; 4]).scaled(scale)]
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                self.preview_stage_quads(r, &layers).into_iter().map(|q| q.scaled(scale)).collect()
+            };
+            let full = RenderTarget { tex: rt.clone() };
+            r.draw(enc, &full, Some([0.0, 0.0, 0.0, 1.0]), &quads);
+            // sub_4F240 draws the target bilinearly into the 248x140 slot picture (82.7 x 57.9 of 640x448)
+            let (pw, ph) = PREVIEW_SIZE;
+            let out = r.create_target(pw, ph, "preview");
+            r.draw(enc, &out, Some([0.0, 0.0, 0.0, 1.0]), &[Quad::rect(rt.clone(), [0.0, 0.0, pw as f32, ph as f32], [1.0; 4])]);
+            self.previews.insert(slot, out.tex);
+        }
+    }
+
+    /// The record's stage as sub_884F0 keeps it, in canvas units.
+    fn preview_stage_quads(&mut self, r: &Renderer, layers: &[Option<crate::save::LayerSave>]) -> Vec<Quad> {
+        {
             let mut stage = Stage::new();
             // sub_884F0 keeps a layer with an image, alpha and priority >= 1, a clip that is unset or has a
             // size, no visible parent with a broken clip, and no STNS grain
@@ -4060,15 +4679,7 @@ impl Game {
                     stage.set(i as i32, l);
                 }
             }
-            let scale = tw as f32 / CANVAS_W as f32;
-            let quads: Vec<Quad> = stage.quads(&r.white).into_iter().map(|q| q.scaled(scale)).collect();
-            let full = RenderTarget { tex: rt.clone() };
-            r.draw(enc, &full, Some([0.0, 0.0, 0.0, 1.0]), &quads);
-            // sub_4F240 draws the target bilinearly into the 248x140 slot picture (82.7 x 57.9 of 640x448)
-            let (pw, ph) = PREVIEW_SIZE;
-            let out = r.create_target(pw, ph, "preview");
-            r.draw(enc, &out, Some([0.0, 0.0, 0.0, 1.0]), &[Quad::rect(rt.clone(), [0.0, 0.0, pw as f32, ph as f32], [1.0; 4])]);
-            self.previews.insert(slot, out.tex);
+            stage.quads(&r.white)
         }
     }
 
@@ -4174,8 +4785,7 @@ impl Game {
         }
         // sub_5BAF0 case 7: an ATSV(1) entry shows its message text again (sub_5AFC0)
         if d.kind == 7 && !d.text.is_empty() {
-            let (t, _) = message_end(&self.resolve_text(&d.text));
-            self.show_message(&t, false);
+            self.show_message(&message_end(&d.text).0, false);
         }
         self.page.revealed = self.page.order as f32;
         for m in &mut self.page.msgs {
@@ -4258,6 +4868,7 @@ impl Game {
         self.node_seq = 0;
         self.seek_node = false;
         self.seek_ended = false;
+        self.seek_defer = false;
         self.ring_restored = false;
         self.seek_audio = None;
         self.speed = 1;
@@ -4532,6 +5143,26 @@ pub fn set_bit(bits: &mut Vec<u64>, i: usize) -> bool {
     was
 }
 
+/// sub_53CF0: `$NNNNNN` references a script_text line of the game language, anywhere in the text (the QA
+/// scenes join two with `^`, a line break: `$042766^$042767`); scripts have no other `$`, so resolved text
+/// passes through unchanged.
+fn resolve_refs(assets: &Assets, s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 1..];
+        let n = tail.bytes().take_while(u8::is_ascii_digit).count();
+        match tail[..n].parse::<usize>() {
+            Ok(i) => out.push_str(assets.line(i)),
+            Err(_) => out.push('$'),
+        }
+        rest = &tail[n..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// sub_6E0D0 / sub_6E950: the raw message text in AE0910 (768 bytes): `base` followed by `raw` up to its end
 /// code, and the code (`e` / `n`).
 fn raw_message(raw: &str, base: &str) -> (String, Option<u8>) {
@@ -4564,16 +5195,14 @@ fn entry_text(t: &str) -> String {
 }
 
 /// A message's text up to its end code (sub_6E0D0 / sub_6E950 stop copying at `@e` or `@n`) and whether the
-/// script then waits for a click: only messages without an end code do (flag 0x400). `@n` / `@e` go on at
-/// once; an `@k` before the code is the click wait of the message itself.
+/// script then waits for a click: only messages without an end code do (flag 0x400). `@n` / `@e` go on once
+/// their text is out (and an `@e` message's voice has ended, `Wait::Message`); an `@k` before the code is no
+/// wait (the slot text skips it, sub_BDC2C) and only groups the message's read fade (sub_391A0).
 fn message_end(text: &str) -> (String, bool) {
     let bytes = text.as_bytes();
     let end = (0..bytes.len().saturating_sub(1)).find(|&i| bytes[i] == b'@' && matches!(bytes[i + 1], b'e' | b'n'));
     match end {
-        Some(i) => {
-            let t = &text[..i];
-            (t.to_string(), t.trim_end().ends_with("@k"))
-        }
+        Some(i) => (text[..i].to_string(), false),
         None => (text.to_string(), true),
     }
 }

@@ -12,8 +12,15 @@ CARGO_INCREMENTAL=0 cargo build --release -p knife
 The tables knife needs from the game executable are compiled in (`knife/data/exe_tables.bin`, build
 f4b3318d561e0345). `kdu exe-tables` regenerates them from `switch_exefs/uncompressed_main`.
 
+The overseas release (English and Chinese text beside the Japanese) runs from its own romfs, e.g.
+`./target/release/knife -a switch_romfs_en -l en`: knife tells the two apart by the data and uses that build's
+tables (`knife/data/exe_tables_overseas.bin`, build d10d239aade1d526, from `switch_exefs_eng/uncompressed_main`).
+`-l` / `--language ja|en|zc|zt` picks the language like the console language and the config's language buttons do
+(by default the config's setting; a new save takes the system language). The Japanese release has Japanese only.
+
 `build/Tsukihime.command` starts the copied build with normal saves. `build/Tsukihime (Unlocked).command` starts it
-with everything unlocked (see `tools/unlocked_save.py`). `-s` / `--save-file PATH` picks the save file (the Switch's
+with everything unlocked (see `tools/unlocked_save.py`). `build/Tsukihime Overseas.command` and `build/Tsukihime Overseas
+(Unlocked).command` do the same on `switch_romfs_en`, with their own save folders. `-s` / `--save-file PATH` picks the save file (the Switch's
 `savedata000` format; by default `knife/savedata000` in the OS application data directory), `-a` / `--assets-dir`
 the game data (by default `assets` next to the executable, or `Contents/Resources/assets` inside a macOS app
 bundle).

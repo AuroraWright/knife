@@ -385,15 +385,44 @@ pub struct SaveFile {
     pub buf: Vec<u8>,
 }
 
+/// sub_2DE00's language of the console (`assets::system_language`), which sub_4EA30 writes into a negative
+/// config language word.
+static SYSTEM_LANGUAGE: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(0);
+
+pub fn set_system_language(language: i16) {
+    SYSTEM_LANGUAGE.store(language, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `--language`: the config language word every load of the file starts with (-1: the file's own).
+static LANGUAGE_OVERRIDE: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(-1);
+
+pub fn set_language_override(language: i16) {
+    LANGUAGE_OVERRIDE.store(language, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn system_language() -> i16 {
+    SYSTEM_LANGUAGE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl SaveFile {
     /// An empty file: no records, default config, no CONTINUE record.
     pub fn new() -> Self {
         let mut buf = vec![0u8; FILE_SIZE];
         buf[SYS_CONFIG..SYS_CONFIG + CONFIG_SIZE].copy_from_slice(&CONFIG_DEFAULTS);
         put_i16(&mut buf, 2, 1);
-        // sub_4EA30 fills a negative language word from the system language (sub_2DE00: 0 Japanese)
-        put_i16(&mut buf, SYS_CONFIG + cfg::LANGUAGE, 0);
+        // sub_4EA30 fills a negative language word from the system language (sub_2DE00)
+        put_i16(&mut buf, SYS_CONFIG + cfg::LANGUAGE, system_language());
         Self { buf }
+    }
+
+    /// The config language word (sub_2DE70 resolves it, `Assets::resolve_language`).
+    pub fn language(&self) -> i16 {
+        get_i16(&self.buf, SYS_CONFIG + cfg::LANGUAGE)
+    }
+
+    /// Set the config language word (the overseas config's language buttons, sub_2D910 state 10).
+    pub fn set_language(&mut self, word: i16) {
+        put_i16(&mut self.buf, SYS_CONFIG + cfg::LANGUAGE, word);
     }
 
     pub fn path() -> PathBuf {
@@ -412,7 +441,7 @@ impl SaveFile {
             f.buf[..REC_BASE].copy_from_slice(&fresh.buf[..REC_BASE]);
         }
         if get_i16(&f.buf, SYS_CONFIG + cfg::LANGUAGE) < 0 {
-            put_i16(&mut f.buf, SYS_CONFIG + cfg::LANGUAGE, 0);
+            put_i16(&mut f.buf, SYS_CONFIG + cfg::LANGUAGE, system_language());
         }
         Ok(f)
     }
@@ -420,13 +449,19 @@ impl SaveFile {
     /// The save file, or an empty file when there is none (or it is unreadable).
     pub fn load() -> Self {
         let path = Self::path();
-        if !path.exists() {
-            return Self::new();
-        }
-        Self::load_from(&path).unwrap_or_else(|e| {
-            tracing::warn!("{e:#}");
+        let mut f = if path.exists() {
+            Self::load_from(&path).unwrap_or_else(|e| {
+                tracing::warn!("{e:#}");
+                Self::new()
+            })
+        } else {
             Self::new()
-        })
+        };
+        let language = LANGUAGE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if language >= 0 {
+            f.set_language(language);
+        }
+        f
     }
 
     pub fn store(&self) -> Result<()> {
@@ -459,6 +494,14 @@ impl SaveFile {
     pub fn set_record(&mut self, n: usize, rec: &[u8]) {
         let r = Self::rec_range(n);
         self.buf[r].copy_from_slice(&rec[..REC_SIZE]);
+    }
+
+    /// sub_50FC0 state 23 (overseas): a deleted record's magic, used word and date (u32 at +0x7138 and
+    /// +0x713B) are zeroed; the rest stays.
+    pub fn delete_record(&mut self, n: usize) {
+        let r = Self::rec_range(n);
+        self.buf[r.start..r.start + 4].fill(0);
+        self.buf[r.start + DATE_AT..r.start + DATE_AT + 7].fill(0);
     }
 
     /// sub_52AA0: records 100..137 move up one (138 drops out) to make room for a new auto save at 100.

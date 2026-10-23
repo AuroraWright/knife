@@ -5,7 +5,8 @@
 
 use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, Renderer, TexRef};
 
-use super::{ASCENT, Game, LAYOUT, TOP_BASELINE, UX, UY, Wait};
+use super::{Game, UX, UY, Wait, msg_layout};
+use crate::text::Layout;
 use crate::text::{self, PlacedChar};
 
 #[derive(Clone, Debug)]
@@ -74,7 +75,7 @@ impl Choice {
             flash: 0.0,
             placed: Vec::new(),
             reveal: vec![0.0; n],
-            top: TOP_BASELINE,
+            top: choice_top(),
             glow_dirty: true,
         }
     }
@@ -94,6 +95,23 @@ impl Choice {
     }
 }
 
+/// sub_84E50: the options at x 88 units (English 32, the overseas build's v4), each in a text slot 466 units
+/// wide (English 566: sub_84E50 / sub_83B20 sub_AC7D0(slot, 2, ..)), with the message text style.
+fn choice_x() -> f32 {
+    if crate::text::english() { 32.0 } else { 88.0 }
+}
+
+fn choice_layout() -> Layout {
+    let w = if crate::text::english() { 566.0 } else { 466.0 };
+    Layout { left: choice_x() * UX, right: (choice_x() + w) * UX, ..msg_layout() }
+}
+
+/// The first option's baseline on an empty page (sub_38D20 gives no pen): its box at 63.881 units (English
+/// 54.178).
+fn choice_top() -> f32 {
+    (if crate::text::english() { 54.178 } else { 63.881 }) * UY + msg_layout().ascent
+}
+
 impl Game {
     /// A SYSMES line (the table is read once).
     fn sysmes_line(&mut self, i: usize) -> String {
@@ -101,10 +119,16 @@ impl Game {
         self.sysmes.get_or_insert_with(|| assets.sysmes()).get(i).cloned().unwrap_or_default()
     }
 
-    /// SELR: one option. The text gets the "N．" prefix SYSMES[1433 + (n + 1) % 10].
+    /// SELR: one option. The text gets the "N．" prefix SYSMES[1433 + (n + 1) % 10]; the overseas build
+    /// (EN 0x766b0, case 0x454C52) writes the script text reference "$0439xx" instead, line 43960 + n (43959
+    /// from the tenth on): "１．" in Japanese, "1. " (with a space) in the other languages.
     pub(super) fn cmd_selr(&mut self, value: i32, text: &str, disabled: bool) {
         let n = self.sel_opts.len();
-        let prefix = self.sysmes_line(1433 + (n + 1) % 10);
+        let prefix = if self.assets.build == knife_core::exe::Build::Overseas {
+            format!("${:06}", if n >= 9 { 43959 } else { 43960 + n })
+        } else {
+            self.sysmes_line(1433 + (n + 1) % 10)
+        };
         self.sel_opts.push(ChoiceOpt { value, text: format!("{prefix}{text}"), disabled });
     }
 
@@ -126,8 +150,13 @@ impl Game {
         }
         if kind == ChoiceKind::Page {
             // SELD writes every option to the message history as a type 12 entry (the backlog lists them)
+            // each option's record keeps F(847 + its index on the page) (`Page::extras`)
+            let at = self.page.texts.len() + self.page.choice_texts.len();
+            let extras: Vec<i32> = (0..opts.len()).map(|j| self.var(&format!("F{}", 847 + at + j))).collect();
+            self.page.choice_extras.extend(extras);
             self.page.choice_texts.extend(opts.iter().map(|o| o.text.clone()));
-            crate::text_stream::choices(opts.iter().map(|o| o.text.as_str()));
+            let shown: Vec<String> = opts.iter().map(|o| self.resolve_text(&o.text)).collect();
+            crate::text_stream::choices(shown.iter().map(String::as_str));
         } else {
             // sub_83B20: the message text goes (sub_53AB0(1)), F823 = 0, F1103 = 1
             self.page.visible = false;
@@ -151,26 +180,48 @@ impl Game {
         if c.kind == ChoiceKind::Page {
             // sub_84E50: the line after the page pen (dword_AFEC7C, from sub_391A0), one more when the page
             // has messages (F823 >= 1); each option one line pitch below the last
-            let mut y = if self.page.chars.is_empty() { TOP_BASELINE } else { self.page.pen.1 + LAYOUT.line_height };
+            let lay = choice_layout();
+            let mut y = if self.page.chars.is_empty() { choice_top() } else { self.page.pen.1 + lay.line_height };
             if self.var("F823") >= 1 {
-                y += LAYOUT.line_height;
+                y += lay.line_height;
             }
             c.top = y;
-            c.placed = c
-                .opts
-                .iter()
-                .enumerate()
-                .map(|(i, o)| {
-                    let mut placed = Vec::new();
-                    let runs = text::parse_markup(&o.text);
-                    let base = y + i as f32 * LAYOUT.line_height;
-                    text::layout(&self.font, &LAYOUT, &runs, LAYOUT.left, base, 0, &mut placed);
-                    placed
-                })
-                .collect();
+            self.place_choice(&mut c);
         }
         self.choice = Some(c);
         self.wait = Wait::Choice;
+    }
+
+    /// Lay out the options of a page choice from its top (text slots 20+, sub_84E50; the overseas sub_7D0C0
+    /// lays them out again in the new language after a language change).
+    fn place_choice(&self, c: &mut Choice) {
+        let lay = choice_layout();
+        c.placed = c
+            .opts
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mut placed = Vec::new();
+                let runs = text::parse_markup(&self.resolve_text(&o.text));
+                let base = c.top + i as f32 * lay.line_height;
+                text::layout(&self.font, &lay, &runs, lay.left, base, 0, &mut placed);
+                placed
+            })
+            .collect();
+    }
+
+    /// sub_7D0C0: the shown page choice laid out again (after a language change); revealed options stay
+    /// revealed.
+    pub(super) fn relayout_choice(&mut self) {
+        let Some(mut c) = self.choice.take() else { return };
+        if c.kind == ChoiceKind::Page {
+            let full: Vec<bool> = c.placed.iter().zip(&c.reveal).map(|(p, &r)| r >= p.len() as f32).collect();
+            self.place_choice(&mut c);
+            for ((r, p), full) in c.reveal.iter_mut().zip(&c.placed).zip(full) {
+                *r = if full { p.len() as f32 } else { r.min(p.len() as f32) };
+            }
+        }
+        self.choice = Some(c);
     }
 
     pub fn in_choice(&self) -> bool {
@@ -288,12 +339,13 @@ impl Game {
     /// Option rows (focus objects 217 + i at (88, y)) / the dialog buttons, in canvas pixels.
     fn choice_rects(&self) -> Vec<[f32; 4]> {
         let Some(c) = &self.choice else { return Vec::new() };
+        let lay = choice_layout();
         match c.kind {
             ChoiceKind::Page => (0..c.opts.len())
                 .map(|i| {
-                    let top = c.top + i as f32 * LAYOUT.line_height - ASCENT;
-                    let w = c.placed[i].last().map_or(0.0, |p| p.x + p.width() - LAYOUT.left);
-                    [LAYOUT.left, top, w, LAYOUT.line_height]
+                    let top = c.top + i as f32 * lay.line_height - lay.ascent;
+                    let w = c.placed[i].last().map_or(0.0, |p| p.x + p.width() - lay.left);
+                    [lay.left, top, w, lay.line_height]
                 })
                 .collect(),
             _ => DIALOG_BUTTONS.iter().map(|&(x, _)| [x * UX, DIALOG_BUTTON_Y * UY, 216.0, 56.0]).collect(),
@@ -416,6 +468,7 @@ impl Game {
     /// Texture 5: the option texts (text slots 160+, rows of 64 px) gaussian-blurred (sub_A0A90(.., 2.0)).
     /// Drawn here at the options' own canvas positions; the glow takes each option's band.
     pub(super) fn render_choice_glow(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
+        let (lay, band) = (choice_layout(), self.glow_band());
         let Some(c) = &mut self.choice else { return };
         if c.kind != ChoiceKind::Page || !c.glow_dirty {
             return;
@@ -426,10 +479,15 @@ impl Game {
         // glyph edge on (sub_A7790 -> sub_C1060 / sub_C1074) and @c9 makes the edge colour dword_34DCB0[3] =
         // white (sub_BDC2C: @c1..5 fill colours dword_3C99D2, @c6..9 edge colours), 0x1000 shows it at once.
         // So the glow source is the glyph and its edge, all white; the edge is the message text's rim.
-        for p in c.placed.iter().flatten() {
-            for (dx, dy) in [(0.0, 0.0), (-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0), (-1.5, -1.5), (1.5, -1.5), (-1.5, 1.5), (1.5, 1.5)] {
-                if let Some(q) = self.font.placed_quad(r, p, dx, dy, [1.0; 4]) {
-                    quads.push(q);
+        // Each option has its own row of the texture (slot 160 + n at y 8 + n * band), so a row's glow never
+        // takes in the next option's.
+        for (i, opt) in c.placed.iter().enumerate() {
+            let row = i as f32 * band - Self::glow_row_top(c.top, i, &lay);
+            for p in opt {
+                for (dx, dy) in [(0.0, 0.0), (-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0), (-1.5, -1.5), (1.5, -1.5), (-1.5, 1.5), (1.5, 1.5)] {
+                    if let Some(q) = self.font.placed_quad(r, p, dx, dy + row, [1.0; 4]) {
+                        quads.push(q);
+                    }
                 }
             }
         }
@@ -442,16 +500,21 @@ impl Game {
         r.blur(enc, &self.blur_rt.tex, glow, [0.0, step], 2.0);
     }
 
-    /// sub_84E50 (640x448 units): the backdrop, the option texts, the focus glow / underline / sparkle and the
-    /// pick's ring, flash and lens flare (effect 30 = additive).
-    pub(super) fn choice_quads(&mut self, r: &Renderer, out: &mut Vec<Quad>, page_alpha: f32) {
-        let Some(c) = &self.choice else { return };
-        if c.kind != ChoiceKind::Page {
-            return;
-        }
+    /// The glow texture's rows: 64 px, 160 in the overseas build (room for two-line options).
+    fn glow_band(&self) -> f32 {
+        if self.assets.build == knife_core::exe::Build::Overseas { 160.0 } else { 64.0 }
+    }
+
+    /// Canvas y where option `i`'s glow row is drawn: the texture 5 row at y - 3.3185 (the text sits 8 px into
+    /// its row).
+    fn glow_row_top(first: f32, i: usize, lay: &Layout) -> f32 {
+        first + i as f32 * lay.line_height - lay.ascent - 3.3185 * UY
+    }
+
+    /// SELECT_PARTS_JA (texture ids 142..147 = entries 0..5: altermenu_flash, lensflare, underline, ring,
+    /// sparkle, bg), loaded on first use.
+    fn select_parts(&mut self, r: &Renderer) -> Vec<TexRef> {
         if self.select_parts.is_none() {
-            // texture ids 142..147 = SELECT_PARTS_JA 0..5: altermenu_flash, lensflare, underline, ring,
-            // sparkle, bg
             self.select_parts = Some(match self.assets.ui_textures(r, "SELECT_PARTS_JA") {
                 Ok(t) => t.into_iter().map(|(_, t)| t).collect(),
                 Err(e) => {
@@ -460,7 +523,29 @@ impl Game {
                 }
             });
         }
-        let parts = self.select_parts.clone().unwrap_or_default();
+        self.select_parts.clone().unwrap_or_default()
+    }
+
+    /// The page choice's backdrop: texture 147 over the screen (scale 1/3 x 0.41481 of 640x448 = native
+    /// pixels) at the choice alpha x `page_alpha` (sub_84E50 draws it straight into target 0, unlike the
+    /// window and text that sub_391A0 composites later, so a menu blur capture keeps it).
+    pub(super) fn choice_backdrop(&mut self, r: &Renderer, page_alpha: f32) -> Option<Quad> {
+        let alpha = self.choice.as_ref().filter(|c| c.kind == ChoiceKind::Page)?.alpha;
+        let t = self.select_parts(r).get(5).cloned()?;
+        let uv = t.uv_max();
+        let rect = [0.0, 0.0, t.width as f32, t.height as f32];
+        Some(Quad::rect(t, rect, [1.0, 1.0, 1.0, alpha * page_alpha]).with_uv_rect(0.0, 0.0, uv[0], uv[1]))
+    }
+
+    /// sub_84E50 (640x448 units): the backdrop, the option texts, the focus glow / underline / sparkle and the
+    /// pick's ring, flash and lens flare (effect 30 = additive).
+    pub(super) fn choice_quads(&mut self, r: &Renderer, out: &mut Vec<Quad>, page_alpha: f32) {
+        let Some(c) = &self.choice else { return };
+        if c.kind != ChoiceKind::Page {
+            return;
+        }
+        let parts = self.select_parts(r);
+        let backdrop = self.choice_backdrop(r, page_alpha);
         let Some(c) = &self.choice else { return };
         let tex = |i: usize| parts.get(i).cloned();
         let size = |t: &TexRef| (t.width as f32, t.height as f32);
@@ -473,18 +558,21 @@ impl Game {
             q.blend = Blend::Add;
             q
         };
-        let a = c.alpha;
-        // texture 147 over the screen (scale 1/3 x 0.41481 of 640x448 = native pixels)
-        if let Some(t) = tex(5) {
-            out.push(rect(&t, 0.0, 0.0, 1.0, 1.0, [1.0, 1.0, 1.0, a]));
-        }
-        let pitch = LAYOUT.line_height;
+        // v6 = (1 - sub_4E9F0) * AE0A28 * a1: the caller's alpha (sub_391A0: the text window's) scales the
+        // backdrop, glow, underline, sparkle and the pick's ring / flash / flare
+        let a = c.alpha * page_alpha;
+        out.extend(backdrop);
+        let lay = choice_layout();
+        let pitch = lay.line_height;
+        let x = choice_x();
+        let band = self.glow_band();
         for i in 0..c.opts.len() {
             let base = c.top + i as f32 * pitch;
-            let top = base - ASCENT;
+            let top = base - lay.ascent;
             // in state 4 only the picked option keeps its text
             if c.state != 4 || c.hover == Some(i) {
                 let shown = c.reveal[i];
+                let first = out.len();
                 for p in &c.placed[i] {
                     let mut vis = (shown - p.order as f32).clamp(0.0, 1.0);
                     if !self.settings.text_fade_in && vis > 0.0 {
@@ -492,6 +580,14 @@ impl Game {
                     }
                     if vis > 0.0 {
                         Self::rimmed_glyph(&mut self.font, r, out, p, vis * page_alpha);
+                    }
+                }
+                // sub_A8CB0(20 + n, n == cursor) sets the slot's +100964, the blend state its glyphs draw with
+                // (jp_C6A58): the cursor's option adds (state 1, SrcAlpha / One), so its black edge leaves the
+                // backdrop as it is and the white fill brightens it
+                if c.hover == Some(i) {
+                    for q in &mut out[first..] {
+                        q.blend = Blend::Add;
                     }
                 }
             }
@@ -504,28 +600,28 @@ impl Game {
             if ga > 0.0
                 && let Some(g) = &self.choice_glow
             {
-                // the texture 5 row (64 px) at (82.667, y - 3.3185): the text sits 16 / 8 px into its row
+                // the texture 5 row at (x - 5.3333, y - 3.3185): the text sits 16 / 8 px into its row
                 let red = if c.state == 4 { 0.75294 } else { 0.43922 };
-                let (x0, y0) = (82.667 * UX, top - 3.3185 * UY);
-                let (u0, v0) = (x0 / CANVAS_W as f32, y0 / CANVAS_H as f32);
-                let q = Quad::rect(g.tex.clone(), [x0, y0, CANVAS_W as f32 - x0, 64.0], [red, 1.0, 1.0, ga])
-                    .with_uv_rect(u0, v0, 1.0, (y0 + 64.0) / CANVAS_H as f32);
+                let (x0, y0) = ((x - 5.3333) * UX, Self::glow_row_top(c.top, i, &lay));
+                let (u0, v0) = (x0 / CANVAS_W as f32, i as f32 * band / CANVAS_H as f32);
+                let q = Quad::rect(g.tex.clone(), [x0, y0, CANVAS_W as f32 - x0, band], [red, 1.0, 1.0, ga])
+                    .with_uv_rect(u0, v0, 1.0, v0 + band / CANVAS_H as f32);
                 out.push(add(q));
             }
             if focus {
-                // texture 144 underline at (71.333, y + 11.615), x scale (t * 0.9 + 0.1) / 3
+                // texture 144 underline at (x - 16.333, y + 11.615), x scale (t * 0.9 + 0.1) / 3
                 if let Some(u) = tex(2) {
-                    out.push(add(rect(&u, 71.333 * UX, top + 11.615 * UY, c.hover_t * 0.9 + 0.1, 1.0, [1.0, 1.0, 1.0, ga])));
+                    out.push(add(rect(&u, (x - 16.333) * UX, top + 11.615 * UY, c.hover_t * 0.9 + 0.1, 1.0, [1.0, 1.0, 1.0, ga])));
                 }
-                // texture 146 sparkle at (-65.52, y - 30.696), pulsing
+                // texture 146 sparkle at (x - 153.33, y - 30.696), pulsing
                 if let Some(s) = tex(4) {
-                    out.push(add(rect(&s, -65.52 * UX, top - 30.696 * UY, 1.0, 1.0, [1.0, 1.0, 1.0, a * c.pulse])));
+                    out.push(add(rect(&s, (x - 153.33) * UX, top - 30.696 * UY, 1.0, 1.0, [1.0, 1.0, 1.0, a * c.pulse])));
                 }
             }
         }
         if c.state == 4 {
             let picked = c.hover.unwrap_or(0) as f32;
-            let first = c.top - ASCENT;
+            let first = c.top - lay.ascent;
             let v47 = 1.0 - (c.flash.max(0.0) * std::f32::consts::FRAC_PI_2).sin();
             // texture 145 ring centred at (86, y0 + 24.474 + pitch * picked), scale v47 * 1.4 + 0.1, turning
             // once as v47 runs 0 -> 1 (sub_B0480(v47 * 65535))

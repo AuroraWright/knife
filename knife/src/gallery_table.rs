@@ -466,6 +466,28 @@ pub const CG_GROUPS: &[(u32, &[CgEntry])] = &[
     (0, &[("IMG2581", false, 951, 1920, 1080), ("IMG4026", false, 1811, 1920, 1080)]),
 ];
 
+/// Source rect origins (entry +12 / +16) of the CGs that show part of their image (sub_BE84 -> sub_251A4);
+/// the others start at (0, 0). The same in both builds.
+pub const CG_ORIGINS: &[(&str, u16, u16)] = &[
+    ("IMG2303", 900, 516), ("IMG1888", 0, 498), ("IMG1889", 0, 498), ("IMG1411", 841, 1300), ("IMG3707", 1723, 2040),
+    ("IMG4067", 0, 276), ("IMG4068", 0, 276), ("IMG4112", 742, 0), ("IMG4113", 742, 0), ("IMG4114", 742, 0),
+    ("IMG4115", 742, 0), ("IMG4117", 742, 0), ("IMG4118", 742, 0), ("IMG4028", 3357, 0), ("IMG4029", 882, 0),
+    ("IMG0315", 297, 300), ("IMG1879", 93, 0), ("IMG2034", 243, 0), ("IMG2036", 243, 0),
+];
+
+/// Overseas: the CGs whose image stacks one strip per language (off_332BF0's lists, sub_BE84: the source rect
+/// moves down by its height times the language).
+pub const CG_LANGUAGE_STRIPS: &[&str] =
+    &["IMG1736", "IMG1737", "IMG3819", "IMG3821", "IMG1699", "IMG1700", "IMG1701", "IMG3822", "IMG1702", "IMG2581", "IMG4026"];
+
+/// Overseas groups that differ (off_32E248): IMG3999 at 3130 x 1266, IMG4193 added to group 285, and group 327
+/// without IMG0568 / IMG0573 / IMG3415 / IMG3404 / IMG3408 / IMG3416.
+pub const CG_GROUPS_OVERSEAS: &[(usize, &[CgEntry])] = &[
+    (222, &[("IMG3996", true, 1781, 3130, 1266), ("IMG3997", true, 1782, 3130, 1266), ("IMG3998", true, 1783, 3130, 1266), ("IMG3999", true, 1784, 3130, 1266), ("IMG4000", true, 1785, 3130, 1266), ("IMG4001", true, 1786, 3130, 1266), ("IMG4002", true, 1787, 3130, 1266)]),
+    (285, &[("IMG0400", false, 250, 5760, 3240), ("IMG3262", true, 1194, 5760, 3240), ("IMG0401", false, 251, 5760, 3240), ("IMG3260", true, 1192, 5760, 3240), ("IMG4193", true, 1978, 5760, 3240), ("IMG3261", true, 1193, 5760, 3240)]),
+    (327, &[("IMG3400", true, 1262, 4468, 2514), ("IMG0570", false, 336, 4468, 2514), ("IMG3411", true, 1267, 4468, 2514), ("IMG3419", true, 1271, 4468, 2514), ("IMG3401", true, 1263, 4468, 2514), ("IMG3406", true, 1265, 4468, 2514), ("IMG3412", true, 1268, 4468, 2514), ("IMG3420", true, 1272, 4468, 2514)]),
+];
+
 /// Gallery-only image -> script images whose display unlocks it (sub_51E0).
 pub const CG_ALIASES: &[(&str, &[&str])] = &[
     ("IMG3954", &["SIE_A_63_00_N00"]),

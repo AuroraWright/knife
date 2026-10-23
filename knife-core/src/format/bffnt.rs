@@ -19,10 +19,11 @@ pub struct Glyph {
 
 #[derive(Debug, Clone)]
 pub struct Font {
-    /// FINF: line height, ascent and the default advance
+    /// FINF: line height, ascent, the default advance and the line feed
     pub height: u8,
     pub ascent: u8,
     pub width: u8,
+    pub line_feed: u16,
     /// TGLP: cell size and the baseline from the cell top
     pub cell_w: u8,
     pub cell_h: u8,
@@ -56,6 +57,7 @@ impl Font {
         }
         let f = header + 8;
         let (height, width, ascent) = (d[f + 1], d[f + 2], d[f + 3]);
+        let line_feed = u16_at(d, f + 4)?;
         // section offsets point past each section's 8-byte header
         let tglp = u32_at(d, f + 12)? as usize;
         let mut cwdh = u32_at(d, f + 16)? as usize;
@@ -122,6 +124,6 @@ impl Font {
             }
             cmap = u32_at(d, cmap + 12)? as usize;
         }
-        Ok(Self { height, ascent, width, cell_w, cell_h, baseline, sheet, glyphs })
+        Ok(Self { height, ascent, width, line_feed, cell_w, cell_h, baseline, sheet, glyphs })
     }
 }

@@ -2,4 +2,5 @@
 
 pub mod exe;
 pub mod format;
+pub mod linebreak;
 pub mod vm;

@@ -46,10 +46,17 @@ struct Cli {
     /// Contents/Resources/assets).
     #[arg(short, long)]
     assets_dir: Option<PathBuf>,
+    /// Play in this language: ja, en, zc (Simplified Chinese) or zt (Traditional Chinese). It stands in for the
+    /// console language and replaces the config's language setting, as the overseas config's language
+    /// buttons do. The Japanese data has Japanese only.
+    ///
+    /// Defaults to the config's setting; a new save takes the system language.
+    #[arg(short, long, value_parser = parse_language)]
+    language: Option<i16>,
     /// Read and write saves in this file (the Switch's savedata000 format).
     ///
-    /// Defaults to "knife/savedata000" in the OS application data directory
-    /// (e.g. ~/Library/Application Support on macOS, %APPDATA% on Windows).
+    /// Defaults to "knife/savedata000" ("knife/overseas/savedata000" for the overseas data) in the OS
+    /// application data directory (e.g. ~/Library/Application Support on macOS, %APPDATA% on Windows).
     #[arg(short, long)]
     save_file: Option<PathBuf>,
     /// Serve displayed text over WebSocket at HOST:PORT (e.g. 127.0.0.1:6677)
@@ -88,15 +95,19 @@ struct Cli {
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     skip: bool,
-    /// Debug: save to slot 99 after this many ms
+    /// Debug: save to --save-slot after this many ms
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     save_at: Option<u32>,
-    /// Debug: skip (as --skip) to this command index of the start scene, then save to slot 99 at the first
-    /// message there and exit
+    /// Debug: skip (as --skip) to this command index of the start scene, then save to --save-slot at the
+    /// first message there and exit
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     save_pc: Option<usize>,
+    /// Debug: the slot --save-at and --save-pc write (0-based; 99 is past the listed slots)
+    #[cfg_attr(feature = "debug", arg(long, default_value_t = 99))]
+    #[cfg_attr(not(feature = "debug"), arg(skip))]
+    save_slot: usize,
     /// Debug: load this slot at startup
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
@@ -203,6 +214,10 @@ struct App {
     wasd: [bool; 4],
     /// K / L held: the right stick up / down at full tilt
     kl: [bool; 2],
+    /// --keys given: the real pointer is ignored, so a scripted run does not follow the mouse over its window
+    scripted: bool,
+    /// The game language the window title was last set for (`Assets::title`)
+    title_language: Option<usize>,
 }
 
 /// A 1920x1080 window, shrunk to 90% of the monitor (or its work area) at 16:9 when it does not fit, centred.
@@ -246,7 +261,7 @@ fn work_area(
 impl App {
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let mut attrs = Window::default_attributes()
-            .with_title("月姫 -A piece of blue glass moon-")
+            .with_title(assets::TITLE)
             .with_inner_size(winit::dpi::LogicalSize::new(1920.0, 1080.0));
         #[cfg(windows)]
         let mut centering_area = None;
@@ -282,33 +297,21 @@ impl App {
         window.focus_window();
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
-        let nso = assets::exe_tables()?;
         let assets_dir = self.cli.assets_dir();
-        let assets = assets::Assets::open(&assets_dir, &nso)?;
+        let nso = assets::exe_tables(assets::detect_build(&assets_dir))?;
+        let language = savedata::SaveFile::load().language();
+        let assets = assets::Assets::open(&assets_dir, &nso, language)?;
         match assets.soft_lut_rows() {
             Ok(rows) => renderer.set_soft_lut(&rows),
             Err(e) => tracing::warn!("clip inset mask: {e:#}"),
         }
         let motions = motion::MotionTable::load(&nso)?;
-        let font_data = std::fs::read(assets_dir.join("ja/TT_TsukuMin-D.ttf")).context("reading font")?;
-        let mut font = text::FontAtlas::new(&renderer, font_data)?;
-        match std::fs::read(assets_dir.join("exfont_nx01.bffnt")) {
-            Ok(d) => font.load_exfont(&renderer, &d).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}")),
-            Err(e) => tracing::warn!("exfont: {e}"),
-        }
+        // sub_AB0F0: the story font is the first file of the language folder, the bubble font of `<folder>3`
+        let (font, bubble_font) = game::Game::load_fonts(&assets, &renderer)?;
         let mut game = game::Game::new(assets, motions, font, &renderer);
-        // the QA bubble text font (Game::msg_font), with the same exfont runs
-        match std::fs::read(assets_dir.join("ja3/FOT-SeuratPro-M.otf")) {
-            Ok(d) => match text::FontAtlas::new(&renderer, d) {
-                Ok(mut f) => {
-                    if let Ok(ex) = std::fs::read(assets_dir.join("exfont_nx01.bffnt")) {
-                        f.load_exfont(&renderer, &ex).unwrap_or_else(|e| tracing::warn!("exfont: {e:#}"));
-                    }
-                    game.set_bubble_font(f);
-                }
-                Err(e) => tracing::warn!("ja3 font: {e:#}"),
-            },
-            Err(e) => tracing::warn!("ja3 font: {e}"),
+        // the QA bubble text font (Game::msg_font)
+        if let Some(f) = bubble_font {
+            game.set_bubble_font(f);
         }
         let start = match &self.cli.scene {
             Some(s) => s
@@ -383,6 +386,13 @@ impl App {
         let (Some(r), Some(g), Some(ui)) = (self.renderer.as_mut(), self.game.as_mut(), self.ui.as_mut()) else {
             return;
         };
+        // the window title follows the game language (startup, the config's language buttons)
+        if self.title_language != Some(g.assets.language()) {
+            self.title_language = Some(g.assets.language());
+            if let Some(w) = &self.window {
+                w.set_title(g.assets.title());
+            }
+        }
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32() * 1000.0;
         self.last = now;
@@ -397,15 +407,14 @@ impl App {
         if self.cli.hold_skip {
             g.set_skip(ui.in_game());
         }
-        // --save-pc keeps skipping past what stops a skip on the way (a TOMP movie)
-        if let Some(pc) = self.cli.save_pc
-            && g.current_pc() < pc
-        {
+        // --save-pc and --skip keep skipping past what stops a skip on the way (a TOMP movie, sub_6EF30)
+        if self.cli.skip || self.cli.save_pc.is_some_and(|pc| g.current_pc() < pc) {
             g.skip = true;
             g.skip_all = true;
         }
         g.update(r, dt.min(100.0));
         ui.update(g, r, dt);
+        g.system_menu_shown = ui.system_menu_shown();
         g.render(r, &mut |g, r, out| ui.draw(g, r, out));
         self.elapsed += dt;
         if let Some(pc) = self.cli.save_pc
@@ -413,7 +422,7 @@ impl App {
         {
             g.skip = false;
             g.skip_all = false;
-            if ui.debug_save(g, r, 99) {
+            if ui.debug_save(g, r, self.cli.save_slot) {
                 self.cli.save_pc = None;
                 self.cli.exit_after = Some(0);
             }
@@ -422,7 +431,7 @@ impl App {
             && self.elapsed >= t as f32
         {
             tracing::debug!("save_at: wait {:?}", g.wait);
-            if ui.debug_save(g, r, 99) {
+            if ui.debug_save(g, r, self.cli.save_slot) {
                 self.cli.save_at = None;
             }
         }
@@ -548,6 +557,7 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             }
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } if self.scripted => {}
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 let (x, y) = self.to_canvas(position.x, position.y);
@@ -664,6 +674,17 @@ impl ApplicationHandler for App {
     }
 }
 
+/// `--language`: the folder names of the overseas data's languages (sub_2DE70's order).
+fn parse_language(s: &str) -> Result<i16, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "ja" | "jp" | "japanese" => Ok(0),
+        "en" | "english" => Ok(1),
+        "zc" | "zh-hans" | "zh-cn" => Ok(2),
+        "zt" | "zh-hant" | "zh-tw" => Ok(3),
+        _ => Err("expected ja, en, zc or zt".into()),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -671,8 +692,11 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    if let Some(f) = &cli.save_file {
-        save::set_file(f.clone());
+    let build = assets::detect_build(&cli.assets_dir());
+    save::set_file(cli.save_file.clone().unwrap_or_else(|| save::default_file(build)));
+    savedata::set_system_language(cli.language.unwrap_or_else(|| assets::system_language(build)));
+    if let Some(language) = cli.language {
+        savedata::set_language_override(language);
     }
     // a busy port must not keep the game from starting
     if let Some(address) = &cli.text_websocket
@@ -683,6 +707,7 @@ fn main() -> Result<()> {
     let shot_from = cli.shot_from as f32;
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
+    let scripted = !cli.keys.is_empty();
     let mut app = App {
         cli,
         window: None,
@@ -697,6 +722,8 @@ fn main() -> Result<()> {
         gamepads: gamepad::Gamepads::new(),
         wasd: [false; 4],
         kl: [false; 2],
+        scripted,
+        title_language: None,
     };
     el.run_app(&mut app)?;
     Ok(())

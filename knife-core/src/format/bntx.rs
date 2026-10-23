@@ -60,6 +60,8 @@ pub struct Texture {
     pub format: TexFormat,
     pub width: u32,
     pub height: u32,
+    /// Mip levels stored in the file (BRTI +0x16); only mip 0 is kept
+    pub mips: u16,
     /// Linear (deswizzled) mip-0 data in the texture's native block format.
     pub data: Vec<u8>,
 }
@@ -124,6 +126,7 @@ pub fn parse(data: &[u8]) -> Result<Vec<Texture>> {
             format,
             width,
             height,
+            mips: u16_at(data, brti + 0x16),
             data: linear,
         });
     }

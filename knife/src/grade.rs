@@ -175,6 +175,11 @@ pub struct Bake {
     pub grade: i32,
     pub bright: f32,
     pub contrast: f32,
+    /// pre_alter samples its source as linear and starts with pow(x, 1 / 2.2), so a source decoded through an
+    /// sRGB view ("Jpeg Tex", sub_E0CD8 format 0 -> 2822 R8G8B8A8 sRGB) bakes to pow(srgb_decode(x), 1 / 2.2),
+    /// which the output curve maps back to x: the gallery CG viewer picture shows the image's own values
+    /// (0.85 mean abs against Astris; through the curve 4.8). Story layers come out without it.
+    pub linear: bool,
 }
 
 impl Default for Bake {
@@ -184,15 +189,15 @@ impl Default for Bake {
 }
 
 impl Bake {
-    pub const NONE: Self = Self { grade: 0, bright: 1.0, contrast: 1.0 };
+    pub const NONE: Self = Self { grade: 0, bright: 1.0, contrast: 1.0, linear: false };
 
     /// The bake for an STEC mode and SNX factors (modes without a grade bake no grade).
     pub fn new(stec: i32, bright: f32, contrast: f32) -> Self {
-        Self { grade: if is_grade(stec) { stec } else { 0 }, bright, contrast }
+        Self { grade: if is_grade(stec) { stec } else { 0 }, bright, contrast, linear: false }
     }
 
     pub fn is_none(&self) -> bool {
-        self.grade == 0 && !self.tones()
+        self.grade == 0 && !self.tones() && !self.linear
     }
 
     fn tones(&self) -> bool {
@@ -201,15 +206,34 @@ impl Bake {
 
     /// Cache key suffix (empty for no bake).
     pub fn key(&self) -> String {
-        match (self.grade, self.tones()) {
+        let k = match (self.grade, self.tones()) {
             (0, false) => String::new(),
             (g, false) => format!("#{g}"),
             (g, true) => format!("#{g}#{}#{}", self.bright.to_bits(), self.contrast.to_bits()),
-        }
+        };
+        if self.linear { k + "#lin" } else { k }
     }
 
     /// Apply to RGBA8 pixels in place (alpha untouched).
     pub fn apply(&self, px: &mut [u8]) {
+        if self.linear {
+            let lut: Vec<u8> = (0..=255u8)
+                .map(|x| {
+                    let s = f32::from(x) / 255.0;
+                    let l = if s <= 0.040_45 {
+                        s / 12.92
+                    } else {
+                        ((s + 0.055) / 1.055).powf(2.4)
+                    };
+                    (l.powf(1.0 / 2.2) * 255.0).round() as u8
+                })
+                .collect();
+            for q in px.as_chunks_mut::<4>().0 {
+                for c in 0..3 {
+                    q[c] = lut[usize::from(q[c])];
+                }
+            }
+        }
         if self.grade != 0 {
             apply(self.grade, px);
         }
@@ -328,6 +352,22 @@ mod tests {
             apply(mode, &mut a);
             reference(mode, &mut b);
             assert!(a == b, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn linear_bake_undoes_output_curve() {
+        let mut px: Vec<u8> = (0..=255u8).flat_map(|x| [x, x, x, 255]).collect();
+        Bake {
+            linear: true,
+            ..Bake::NONE
+        }
+        .apply(&mut px);
+        // dark values lift (4 -> 12), and the screen shows the file value again within a step
+        assert_eq!(px[4 * 4], 12);
+        for x in 0..=255u8 {
+            let shown = knife_render::output_level(px[usize::from(x) * 4]);
+            assert!(shown.abs_diff(x) <= 1, "{x} -> {shown}");
         }
     }
 }

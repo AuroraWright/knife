@@ -3,6 +3,8 @@
 
 Astris must have focus to take input (the commands activate it). Needs `tools/emu/dsu_server.py` running (Astris: Input = DSU Controller, 127.0.0.1:26760, slot 0) and the game
 window open. Captures are the game area of the window, scaled to 1920x1080.
+EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en, save copy switch_emu_save_en) instead
+of the Japanese one (the default, EMU_GAME=ja).
 
     emu.py press BTN [ms] | hold BTN | release BTN | stick L|R X Y | reset
     emu.py shot OUT.png
@@ -13,7 +15,7 @@ window open. Captures are the game area of the window, scaled to 1920x1080.
         is captured every --every ms (or as fast as a capture allows, 0.25-0.5 s) into build/emu/NAME/emu_NNNN.png,
         with each capture's real time in emu_times.txt
     emu.py knife NAME KEYS [--every MS] [--until MS] [knife args...]
-        the same keys through knife (--keys / --shots) on a copy of switch_emu_save, into knife_NNNN.png
+        the same keys through knife (--keys / --shots) on a copy of switch_emu_save(_en), into knife_NNNN.png
         (target/release/knife built with `--features debug`);
         with --title it boots like a normal start (--boot --skip-intro), so the title has its entry state
     emu.py rec NAME KEYS [--fps N] [--until MS]
@@ -46,11 +48,30 @@ OUT = os.path.join(ROOT, "build", "emu")
 WINLIST = os.path.join(OUT, "winlist")
 WINREC = os.path.join(OUT, "winrec")
 CLICK = os.path.join(OUT, "click")
-LIVE_SAVE = os.path.expanduser("~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/"
-                               "bis/user/save/0000000000000004")
-# the game's row in the Library list (window-relative pt)
-CLICK_GAME = (200, 110)
-GAME_TITLE = "月姫"
+SAVE_ROOT = os.path.expanduser("~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/"
+                              "bis/user/save")
+# EMU_GAME=ja (default) or en picks the build: (title id, window title prefix, Library row in window-relative pt,
+# the local save copy, knife's data). The Library lists the games by title: TSUKIHIME first, then 月姫.
+GAMES = {
+    "ja": (0x01001DC01486A000, "月姫", (200, 200), "switch_emu_save", "switch_romfs"),
+    "en": (0x010057A01E4D4000, "TSUKIHIME", (200, 110), "switch_emu_save_en", "switch_romfs_en"),
+}
+GAME = os.environ.get("EMU_GAME", "ja")
+if GAME not in GAMES:
+    raise SystemExit(f"EMU_GAME: {GAME}: expected one of {', '.join(GAMES)}")
+TITLE_ID, GAME_TITLE, CLICK_GAME, SAVE_COPY, ROMFS = GAMES[GAME]
+
+
+def live_save():
+    """The game's Ryujinx save directory: the one whose ExtraData0 starts with its title id (u64 LE)."""
+    for d in sorted(os.listdir(SAVE_ROOT)):
+        try:
+            with open(os.path.join(SAVE_ROOT, d, "ExtraData0"), "rb") as f:
+                if int.from_bytes(f.read(8), "little") == TITLE_ID:
+                    return os.path.join(SAVE_ROOT, d)
+        except OSError:
+            pass
+    raise SystemExit(f"no save directory for {TITLE_ID:016X} (start the game once)")
 
 
 def focus():
@@ -192,12 +213,23 @@ def touch(pts, ms):
 
 
 def astris_window(title):
-    out = subprocess.run([WINLIST, "Astris"], capture_output=True, text=True, check=True).stdout
+    """The window's top-left (pt) from System Events: CGWindow bounds go stale for a window on another Space."""
+    # one line per window, tab-separated: the title can hold commas (", General" while the game runs)
+    script = ('set o to ""\ntell application "System Events" to tell process "Astris"\n'
+              'repeat with w in every window\nset p to position of w\n'
+              'set o to o & (name of w) & tab & (item 1 of p) & tab & (item 2 of p) & linefeed\n'
+              'end repeat\nend tell\nreturn o')
+    out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True).stdout
     for line in out.splitlines():
-        wid, x, y, w, h, t = line.split("\t", 5)
-        if t.startswith(title):
-            return int(x), int(y)
+        v = line.split("\t")
+        if len(v) == 3 and v[0].startswith(title):
+            return int(v[1]), int(v[2])
     return None
+
+
+def game_running():
+    """Either build's game window (the Library window turns into the game's while it runs)."""
+    return any(astris_window(t) for _, t, *_ in GAMES.values())
 
 
 def restart(save):
@@ -206,7 +238,7 @@ def restart(save):
         subprocess.run(["swiftc", "-O", "-o", WINLIST, os.path.join(ROOT, "tools", "emu", "winlist.swift")], check=True)
     subprocess.run(["osascript", "-e", 'tell application id "V380-Ori.Astris" to activate'], check=False)
     time.sleep(1)
-    if astris_window(GAME_TITLE):
+    if game_running():
         subprocess.run(["osascript", "-e", 'tell application "System Events" to tell process "Astris" to click '
                         'menu item "Stop" of menu "Emulation" of menu bar 1'], check=True)
         time.sleep(4)
@@ -214,9 +246,14 @@ def restart(save):
     if not lib:
         raise SystemExit("no Astris Library window (is the game still running?)")
     if save:
-        for dst in (os.path.join(LIVE_SAVE, "0", "savedata000"), os.path.join(LIVE_SAVE, "1", "savedata000"),
-                    os.path.join(ROOT, "switch_emu_save", "savedata000")):
+        live = live_save()
+        os.makedirs(os.path.join(ROOT, SAVE_COPY), exist_ok=True)
+        for dst in (os.path.join(live, "0", "savedata000"), os.path.join(live, "1", "savedata000"),
+                    os.path.join(ROOT, SAVE_COPY, "savedata000")):
             shutil.copyfile(save, dst)
+    # the Stop leaves Astris without focus, and the list ignores a double-click then
+    subprocess.run(["osascript", "-e", 'tell application id "V380-Ori.Astris" to activate'], check=False)
+    time.sleep(1)
     click((lib[0] + CLICK_GAME[0], lib[1] + CLICK_GAME[1]), 2)
     time.sleep(33)
     window()
@@ -314,7 +351,7 @@ def knife(name, keys, every, until, extra):
     sv = os.path.join(OUT, "save")
     shutil.rmtree(sv, ignore_errors=True)
     os.makedirs(sv)
-    shutil.copyfile(os.path.join(ROOT, "switch_emu_save", "savedata000"), os.path.join(sv, "savedata.bin"))
+    shutil.copyfile(os.path.join(ROOT, SAVE_COPY, "savedata000"), os.path.join(sv, "savedata.bin"))
     shots = os.path.join(d, "knife_raw")
     shutil.rmtree(shots, ignore_errors=True)
     ev = parse_keys(keys)
@@ -323,7 +360,7 @@ def knife(name, keys, every, until, extra):
         extra = extra + [x for x in ("--boot", "--skip-intro") if x not in extra]
     kk = ",".join(f"{int(ms)}:{k}" for ms, k in ev if k != "wait")
     cmd = [os.path.join(ROOT, "target", "release", "knife"), "--shots", shots, "--shot-every", str(int(every)),
-           "--exit-after", str(int(until + every)), "--assets-dir", os.path.join(ROOT, "switch_romfs"), "--save-file", os.path.join(sv, "savedata.bin")] \
+           "--exit-after", str(int(until + every)), "--assets-dir", os.path.join(ROOT, ROMFS), "--save-file", os.path.join(sv, "savedata.bin")] \
         + (["--keys", kk] if kk else []) + extra
     subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:

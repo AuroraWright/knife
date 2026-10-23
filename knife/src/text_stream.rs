@@ -45,13 +45,14 @@ pub fn choices<'a>(options: impl IntoIterator<Item = &'a str>) {
     }
 }
 
-/// Displayed characters only: ruby readings and control codes are dropped, inline glyphs become their
-/// characters, `@n` / `@r` / `^` newlines, and surrounding blank lines are trimmed.
+/// Displayed characters only: ruby readings and control codes are dropped, inline glyph tags become Unicode
+/// look-alikes (`text::tag_symbol`) and bar tags the U+3000 the game puts under the bar, `@n` / `@r` / `^`
+/// newlines, and surrounding blank lines are trimmed.
 pub fn plain_text(text: &str) -> String {
     let mut output = String::new();
     for run in parse_markup(text) {
         match run {
-            Run::Text(s) => output.push_str(&s),
+            Run::Text(s) | Run::Bar { text: s, .. } => output.extend(s.chars().map(crate::text::tag_symbol)),
             Run::Ruby { base, .. } => output.push_str(&base),
             Run::Newline => output.push('\n'),
         }
@@ -158,7 +159,8 @@ mod tests {
     #[test]
     fn plain_text_drops_markup_and_ruby() {
         assert_eq!(plain_text("先ほど<前触|まえぶ>れもなく@k"), "先ほど前触れもなく");
-        assert_eq!(plain_text("@r一行目^二行目[ber00]@n"), "一行目\n二行目♥");
+        assert_eq!(plain_text("@r一行目^二行目[ber00][ber00]@n"), "一行目\n二行目\u{3000}\u{3000}");
+        assert_eq!(plain_text("friend.[heart] [x]"), "friend.♥ [x]");
         assert_eq!(plain_text("@c900赤い@c字"), "赤い字");
     }
 

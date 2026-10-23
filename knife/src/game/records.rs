@@ -205,14 +205,7 @@ impl Game {
         let raw = &p[sd::P_TEXT..sd::P_TEXT + 0x200];
         let raw = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
         let preview = if raw.starts_with('$') {
-            text::parse_markup(&self.resolve_text(&raw))
-                .into_iter()
-                .filter_map(|r| match r {
-                    text::Run::Text(t) => Some(t),
-                    text::Run::Ruby { base, .. } => Some(base),
-                    text::Run::Newline => None,
-                })
-                .collect()
+            text::note_text(&self.resolve_text(&raw))
         } else {
             String::new()
         };

@@ -17,6 +17,7 @@ glam = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 ab_glyph = "0.2.32"
+ttf-parser = "0.25.1"
 serde = { version = "1.0.229", features = ["derive"] }
 dirs = "7.0.0"
 parking_lot = "0.12.5"
@@ -24,6 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 mp4 = "0.14.0"
 symphonia = { version = "0.6.1", features = ["aac"], default-features = false }
 tungstenite = "0.30"
+sys-locale = "0.3.2"
 
 # Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows and GStreamer
 # elsewhere. An ffmpeg executable is the fallback.

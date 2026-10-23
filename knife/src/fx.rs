@@ -160,8 +160,22 @@ struct Dot {
 /// (unk_352ADC).
 const SHARDS: [[f32; 4]; 3] = [[0.0, 0.0, 33.0, 44.0], [64.0, 0.0, 96.0, 55.0], [128.0, 0.0, 157.0, 45.0]];
 const DOTS: [[f32; 4]; 3] = [[15.0, 20.0, 16.0, 21.0], [78.0, 26.0, 79.0, 27.0], [141.0, 21.0, 142.0, 22.0]];
-/// Both logo particle systems draw with a scissor of 680 px from the top (under the logo, above the menu).
-pub const LOGO_CLIP_Y: f32 = 680.0;
+/// Both logo particle systems draw with a scissor this far from the top (under the logo, above the menu):
+/// 680 px, English 519 (overseas flt_2374D4 by language).
+pub fn logo_clip_y() -> f32 {
+    if crate::text::language() == 1 { 519.0 } else { 680.0 }
+}
+
+/// The spawn areas under the logo by language (overseas sub_905B0 / sub_90D00: languages 1..3 from
+/// unk_2375E0 / unk_2375EC / unk_2375F8 and unk_237604 / unk_237610, the others the Japanese build's values):
+/// shards (centre y, width, height) centred on x 480, dots (width, bottom y).
+fn spawn_areas() -> ([f32; 3], [f32; 2]) {
+    match crate::text::language() {
+        1 => ([260.25, 675.0, 50.0], [675.0, 319.375]),
+        2 | 3 => ([334.5, 135.0, 75.0], [150.0, 395.375]),
+        _ => ([340.5, 135.0, 75.0], [150.0, 399.38]),
+    }
+}
 
 /// Rising, spinning crystal shards and twinkling dots under the title logo.
 pub struct LogoFx {
@@ -184,6 +198,7 @@ impl LogoFx {
     /// Advance by `frames` 60 Hz frames.
     pub fn update(&mut self, frames: f32) {
         let r = &mut self.rng;
+        let ([sy, sw, sh], [dw, dy]) = spawn_areas();
         // sub_905B0: one shard every 2 frames (120 slots)
         self.acc += frames;
         while self.acc >= 2.0 {
@@ -203,8 +218,8 @@ impl LogoFx {
                 alpha: r.f() * 0.5 + 0.5,
                 angle: (r.f() * 640.0).to_radians(),
                 spin: (r.f() * 2.5 + 0.5).to_radians(),
-                x: r.f() * 135.0 + 412.5,
-                y: r.f() * 75.0 + 303.0,
+                x: 480.0 - sw * 0.5 + sw * r.f(),
+                y: sy - sh * 0.5 + sh * r.f(),
             });
         }
         // sub_90D00: four dots per frame (200 slots)
@@ -217,8 +232,8 @@ impl LogoFx {
                 alpha: r.uniform(0.25, 1.0),
                 life: (r.f() * 42.0 + 18.0).floor(),
                 age: 0.0,
-                x: r.f() * 150.0 + 405.0,
-                y: r.f() * -215.25 + 399.38,
+                x: dw * -0.5 + 480.0 + dw * r.f(),
+                y: dy + r.f() * -215.25,
             });
         }
         for s in &mut self.shards {
