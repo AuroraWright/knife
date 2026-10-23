@@ -5,6 +5,7 @@ mod flow;
 mod flow_table;
 mod gallery;
 mod grade;
+mod ini;
 mod gallery_table;
 mod fx;
 mod game;
@@ -697,7 +698,8 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,wgpu=warn,naga=warn".into()),
         )
         .init();
-    let cli = Cli::parse();
+    // knife.ini fills the options the command line leaves out
+    let cli = Cli::parse_from(ini::merged_args());
     let build = assets::detect_build(&cli.assets_dir());
     save::set_file(cli.save_file.clone().unwrap_or_else(|| save::default_file(build)));
     savedata::set_system_language(cli.language.unwrap_or_else(|| assets::system_language(build)));

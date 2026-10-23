@@ -2358,6 +2358,8 @@ impl Ui {
                     // state 20 with node 485 read: start at START_SCRIPT (scene id 110)
                     self.intro = None;
                     self.press = false;
+                    // the same title state 20: its white goes on as the story's
+                    self.black_col = [1.0; 3];
                     self.act(game, r, Action::StartNew);
                     return;
                 }
@@ -4522,8 +4524,12 @@ impl Ui {
             Action::StartNew => {
                 self.black = 0.0;
                 self.black_speed = 0.0;
-                self.black_col = [0.0; 3];
                 game.reset();
+                // with node 485 read the title's full white goes on as the story's (sub_47B90(1.0))
+                if self.black_col == [1.0; 3] {
+                    game.white = 1.0;
+                }
+                self.black_col = [0.0; 3];
                 game.start_scene(0, None);
                 self.screen = Screen::Game;
                 self.stack.clear();
@@ -7116,6 +7122,10 @@ impl Ui {
                 let msg = self.sysmes.get(p.id).cloned().unwrap_or_default();
                 self.draw_dialog_text(game, r, out, &msg, 515.8, 4.0);
             }
+        }
+        // sub_48420: the story's white (effect 27, once)
+        if game.white > 0.0 {
+            out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [1.0, 1.0, 1.0, game.white.min(1.0)]));
         }
         if self.black > 0.0 && !self.black_under {
             let [cr, cg, cb] = self.black_col;

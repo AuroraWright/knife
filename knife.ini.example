@@ -1,0 +1,35 @@
+; Example knife.ini. Copy this file to "knife.ini" to use it.
+;
+; knife reads knife.ini from the folder that contains the executable. Inside a
+; macOS app bundle it also looks in Contents/Resources.
+;
+; Each line sets one command line option, using its long name without "--":
+;   option = value
+; Lines starting with ";" or "#" are comments, and an empty value means "not set".
+; On/off options take true or false. Relative paths are resolved from the
+; folder that contains this file.
+;
+; Options given on the actual command line always win.
+
+; Folder containing the game data (the extracted romfs plus the system font).
+; Defaults to "assets" next to the executable (inside a macOS app bundle, also
+; Contents/Resources/assets).
+assets-dir = assets
+
+; Language: ja, en, zc (Simplified Chinese) or zt (Traditional Chinese). The
+; Japanese release has Japanese only. Empty: the config's setting.
+language =
+
+; Save file (the Switch's savedata000 format). Defaults to knife/savedata000
+; (knife/overseas/savedata000 for the overseas release) in the system app data
+; folder (~/Library/Application Support on macOS, %APPDATA% on Windows).
+save-file =
+
+; Serve displayed text over WebSocket at HOST:PORT, e.g. 127.0.0.1:6677.
+text-websocket =
+
+; Leave out the TYPE-MOON logo movie and the notice before the title.
+skip-intro = false
+
+; Let every story movie be skipped, even unwatched ones the Switch plays through.
+skip-movies = false

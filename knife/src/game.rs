@@ -533,6 +533,10 @@ pub struct Game {
     pub touch_hidden: bool,
     /// the UI's system menu or its config is up (`Ui::system_menu_shown`, sub_4EC00)
     pub system_menu_shown: bool,
+    /// The story's screen white (qword_B34B18, drawn by sub_48420 over everything): the title sets it to 1 when
+    /// its NEW GAME white is full (sub_47B90(1.0)), and the story frame (sub_48AC0) drops it before the script
+    /// step once START_SCRIPT has jumped to another scene (word_6533A4 >= 1)
+    pub white: f32,
     /// script / effect steps per frame (sub_3FBD0 runs its effect steps this many times): the touch
     /// gesture and mode panel skip and rewind speeds, 1 normally
     pub speed: u32,
@@ -820,6 +824,7 @@ impl Game {
             hide_text: false,
             touch_hidden: false,
             system_menu_shown: false,
+            white: 0.0,
             speed: 1,
             history: Default::default(),
             save_point: None,
@@ -1085,6 +1090,9 @@ impl Game {
             && self.trans.as_ref().is_some_and(|t| t.hold)
         {
             self.trans = None;
+        }
+        if self.white > 0.0 && self.scene_index >= 1 {
+            self.white = 0.0;
         }
         self.sound.begin_frame(dt);
         for _ in 0..self.speed.max(1) {
@@ -5425,6 +5433,7 @@ impl Game {
 
     pub fn reset(&mut self) {
         self.menu_lock = true;
+        self.white = 0.0;
         self.resume_ms = 0.0;
         // sub_57240 clears the queued SE commands
         self.se_delayed.clear();

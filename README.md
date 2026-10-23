@@ -1,78 +1,89 @@
 # knife
 
-A Rust reimplementation of the Tsukihime -A piece of blue glass moon- Switch engine.
+A Rust reimplementation of the engine of Tsukihime -A piece of blue glass moon- for Nintendo Switch. It plays
+the game from the Switch release's data and aims to behave exactly like the original: it is heavily based on a
+decompilation of the original Switch executable, and its behaviour is checked against the Switch game running in
+an emulator.
 
-## Running
+![The title screen of the overseas release in knife](screenshot.png)
 
-```sh
-CARGO_INCREMENTAL=0 cargo build --release -p knife
-./target/release/knife -a switch_romfs   # the game data (romfs); -a defaults to assets/ next to the executable
-```
+Both releases are supported: the Japanese one and the overseas one (English, Simplified and Traditional
+Chinese besides Japanese).
 
-The tables knife needs from the game executable are compiled in (`knife/data/exe_tables.bin`, build
-f4b3318d561e0345). `kdu exe-tables` regenerates them from `switch_exefs/uncompressed_main`.
+knife is inspired by [shin](https://github.com/DCNick3/shin), DCNick3's reimplementation of the engine of
+the Switch visual novels by Entergram, and shares some of its code.
 
-The overseas release (English and Chinese text beside the Japanese) runs from its own romfs, e.g.
-`./target/release/knife -a switch_romfs_en -l en`: knife tells the two apart by the data and uses that build's
-tables (`knife/data/exe_tables_overseas.bin`, build d10d239aade1d526, from `switch_exefs_eng/uncompressed_main`).
-`-l` / `--language ja|en|zc|zt` picks the language like the console language and the config's language buttons do
-(by default the config's setting; a new save takes the system language). The Japanese release has Japanese only.
+## Game data
 
-`build/Tsukihime.command` starts the copied build with normal saves. `build/Tsukihime (Unlocked).command` starts it
-with everything unlocked (see `tools/unlocked_save.py`). `build/Tsukihime Overseas.command` and `build/Tsukihime Overseas
-(Unlocked).command` do the same on `switch_romfs_en`, with their own save folders. `-s` / `--save-file PATH` picks the save file (the Switch's
-`savedata000` format; by default `knife/savedata000` in the OS application data directory), `-a` / `--assets-dir`
-the game data (by default `assets` next to the executable, or `Contents/Resources/assets` inside a macOS app
-bundle).
+knife needs the game data from your own copy of the game:
 
-`-t` / `--text-websocket HOST:PORT` (e.g. `127.0.0.1:6677`) serves the displayed text over WebSocket for text
-hookers: every client receives each message as plain text (ruby readings and markup dropped) and each choice's
-options one per line; a client that connects late first gets the most recent text.
+1. Extract the romfs of the Switch release.
+2. Add the Switch's shared system font, which the menus and help lines use. Dump
+   `nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (system title 0100000000000811)
+   and copy it into the extracted romfs folder, for example:
 
-The menus, help lines and music list use the Switch's shared system font, which is not in the game data. Dump
-`nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (title 0100000000000811, the NCA of
-that title under an emulator's `bis/system/Contents/registered/`) and put it in the assets dir next to the game
-data (here `switch_romfs/`):
+   ```sh
+   hactoolnet -k prod.keys --romfsdir fontstandard <FontStandard>.nca
+   cp fontstandard/nintendo_udsg-r_std_003.bfttf <romfs folder>/
+   ```
+
+By default knife looks for this folder as `assets` next to the executable (inside a macOS app bundle, also
+`Contents/Resources/assets`).
+
+## Building and running
 
 ```sh
-hactoolnet -k prod.keys --romfsdir fontstandard <FontStandard>.nca
-cp fontstandard/nintendo_udsg-r_std_003.bfttf switch_romfs/
+cargo build --release -p knife
+./target/release/knife -a <romfs folder>
 ```
 
-`--skip-intro` leaves out the TYPE-MOON logo movie and the notice before the title; `--skip-movies` lets every
-story movie be skipped (the Switch plays an unwatched opening, prologue or ending through).
+Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the
+Media Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, plus the GStreamer
+development packages to build). An `ffmpeg` executable on the `PATH` is used as a fallback.
 
-Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the Media
-Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, and the GStreamer development
-packages to build). An `ffmpeg` executable on the `PATH` is the fallback.
+### Options
 
-## Saves
+| Option | |
+|---|---|
+| `-a`, `--assets-dir DIR` | the game data folder |
+| `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (overseas release only; by default the config's setting) |
+| `-s`, `--save-file PATH` | the save file (by default `knife/savedata000` in the system's app data folder, `knife/overseas/savedata000` for the overseas release) |
+| `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
+| `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
+| `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |
 
-knife uses the Switch game's save file, `savedata.bin` (0x3E7000 bytes: settings, unlocks, read text and 140
-save records), so a `savedata.bin` copied from a Switch loads as is, and the reverse also works. It is the only
-file in the save directory; flowchart jumps restart the node's scene as on the Switch. As on the Switch, save list
-thumbnails are drawn from each record's stage, and a save resumes at the start of its page. The format is documented in `knife/src/savedata.rs`
-and `re/NOTES.md`.
+With `--text-websocket`, every client receives each message as plain text and each choice's options one per
+line; a client that connects late first gets the most recent text.
+
+### knife.ini
+
+A `knife.ini` file next to the executable (or in `Contents/Resources` inside a macOS app bundle) can set any of
+the options above, one per line, using the long option name without `--`:
+
+```ini
+assets-dir = assets
+language = en
+text-websocket = 127.0.0.1:6677
+skip-intro = true
+```
+
+Lines starting with `;` or `#` are comments, an empty value leaves an option unset, on / off options take
+true or false, and relative paths are resolved from the folder containing `knife.ini`. Options given on the
+command line take precedence. See [`knife.ini.example`](knife.ini.example).
 
 ## Controls
 
-The keyboard stands in for the Switch controller, with the same key for the same button everywhere; each
-button then does what it does in the Switch game on that screen (the game's own map is Config → 操作説明,
-`conf_manual0_ja`). The left mouse button is the touch screen; the mouse wheel / trackpad tilts the left
-stick (scrolling lists, the flowchart and config, panning the CG viewer) and does nothing else; in the save
-list it scrolls the frames instead, a row per notch or per 1.5 save frame heights of trackpad travel, keeping
-the cursor on its save while that stays in view.
+The keyboard stands in for the Switch controller, and each button does what it does in the Switch game on that
+screen (the game's own map is in Config → 操作説明 / controls). The left mouse button is the touch screen; the
+mouse wheel or trackpad tilts the left stick.
 
-Game controllers work too (gilrs, as in shin; on macOS the GameController framework, which keeps
-working after another app has used the pad): every controller is the same Switch controller, button for
-button — A / B / X / Y as the controller labels them, Plus / Minus (Start / Back), L / R, ZL / ZR, the d-pad,
-both sticks and R3. As in the game, the right stick moves cursors like the d-pad while the left stick scrolls
-lists and pans the CG viewer. Held directions repeat like on the Switch (after 15 frames, then every 5).
+Game controllers work too: every controller acts as the Switch controller, button for button (A / B / X / Y as
+the controller labels them, Plus / Minus as Start / Back).
 
 | Key | Switch |
 |---|---|
 | Arrow keys | D-pad |
-| W / A / S / D | left stick (full tilt) |
+| W / A / S / D | left stick |
 | Enter | A (confirm, advance text) |
 | Escape | B (cancel, back) |
 | B | X |
@@ -90,35 +101,28 @@ lists and pans the CG viewer. Held directions repeat like on the Switch (after 1
 | Switch | Action |
 |---|---|
 | A | advance text; shows a hidden message window |
-| B | stop skip mode, else hide / show the message window |
+| B | stop skipping, else hide / show the message window |
 | X | backlog |
-| Y | system menu (not until the first message after a story start or a load) |
+| Y | system menu |
 | L | auto mode on / off |
-| R | skip mode on / off (stops at unread text unless the config allows skipping it) |
+| R | skip mode on / off |
 | ZL (hold) | rewind, faster the longer it is held |
 | ZR (hold) | fast forward, faster the longer it is held |
 | D-pad / right stick up | open the mode panel |
 | D-pad / right stick down | advance text, close the mode panel |
-| D-pad left / right, A | with the mode panel opened by button: pick a button, press it (rewind and skip act while A is held) |
-| D-pad up / down | move between choices (left / right on a No / Yes question) |
+| D-pad up / down | move between choices |
 
-Touch (left mouse button):
-
-| Gesture | Action |
+| Touch (mouse) | Action |
 |---|---|
 | tap | advance text |
-| drag left / right from the middle of the screen | stretch the arrow: rewind / fast forward, faster the further it stretches |
+| drag left / right from the middle | rewind / fast forward, faster the further it is dragged |
 | flick down from the top edge, or pointer at the top edge | open the mode panel |
 | flick up, or tap below the panel | close the mode panel |
-| flick right from the left edge | system menu |
+| flick right from the left edge, or right click | system menu |
 | flick left from the right edge | backlog |
-| pointer at the bottom edge | hide the message window (back when the pointer moves up) |
-| right click | system menu |
+| pointer at the bottom edge | hide the message window |
 
-The mode panel holds previous scene, rewind (hold), auto, skip (hold), next scene, Q.SAVE, Q.LOAD and voice
-replay. Next / previous scene darken the screen for 20 frames before the jump.
-
-During the staff roll only A (advance) and ZR (hold: fast forward at a fixed speed) work, as on the Switch.
+The mode panel holds previous scene, rewind, auto, skip, next scene, quick save, quick load and voice replay.
 
 ### Menus and gallery
 
@@ -127,24 +131,12 @@ During the staff roll only A (advance) and ZR (hold: fast forward at a fixed spe
 | D-pad / right stick | move the cursor |
 | A | confirm (hold A + left / right to drag a config slider) |
 | B | back |
-| L / R | config tabs, and L / R elsewhere (CG viewer: previous / next picture) |
-| left stick | scroll the CG grid, music list, flowchart, config and save list; CG grid: left / right also move the cursor |
-| CG viewer | L / R or left / right: previous / next picture; left stick: move; right stick up / down: zoom; Minus: fill the screen; R3: fit |
-| Y, ZL | also close the system menu |
-| X, ZL | also close the backlog |
+| L / R | config tabs; previous / next picture in the CG viewer |
+| left stick | scroll lists, the flowchart and the config; move the picture in the CG viewer |
+| right stick up / down | zoom in the CG viewer |
 
-The system menu is touch-only on the Switch, so mouse hover does not move its cursor; a click opens a tab.
-A mouse drag (a touch drag on the Switch) scrolls the flowchart, CG grid, music list and config, and a flick
-coasts; dragging the scroll bar's slider scrolls the flowchart, CG grid and music list. A gallery movie stops with B or Plus only.
+A mouse drag scrolls the flowchart, CG list, music list and config, like a touch drag on the Switch.
 
-## Debug options
+## License
 
-They exist only in a build with the `debug` feature (`cargo build --release -p knife --features debug`);
-`knife --help` lists them. Useful ones: `--load-slot N`, `--scene NAME`, `--shots DIR --shot-every MS
---exit-after MS` for screenshots, and `--keys MS:KEY,...` for scripted input. `--keys` accepts the buttons up, down, left,
-right, a, b, x, y, l, r, zl, zr, rup, rdown, minus and plus (tapped, or held from `NAME+` to `NAME-`), and
-menu, click, press, release, move/X/Y in canvas pixels and wheel/N (mouse wheel notches, + up). `--jump-node N`
-starts at a flowchart node, `--var F822=0,...` sets script variables after the start (F822 = 0 shows the
-one-message-per-window layout of records made without START_SCRIPT).
-
-Research notes live in `re/NOTES.md`.
+knife is licensed under the [Mozilla Public License 2.0](LICENSE).
