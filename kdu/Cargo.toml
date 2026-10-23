@@ -10,3 +10,7 @@ knife-audio = { path = "../knife-audio" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 image = { workspace = true }
+
+# a research tool, not part of the releases
+[package.metadata.dist]
+dist = false
