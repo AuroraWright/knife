@@ -4652,7 +4652,10 @@ impl Ui {
             Action::GalleryBack => self.gallery_back(game, r),
             Action::TitleNow => {
                 self.black_speed = 0.0;
-                self.go_to_title(game);
+                // nothing on the way to the title stops the BGM (sub_48AC0 case 2 state 2): the script's end already
+                // stopped it unless RTMN / RTM2 kept it, and the title's sub_9C470(2) leaves a playing BGM 2 alone,
+                // so the first boot's prologue BGM goes on under PRESS ANY BUTTON
+                self.go_to_title(game, true);
             }
             Action::OpenExtra => {
                 // cGallery state 0: the menu takes [0] as its first mode (sub_6124, 0 when unset) and [2] as its
@@ -5071,7 +5074,7 @@ impl Ui {
             self.closing = false;
         } else {
             tracing::warn!("528_ARCHIVE missing");
-            self.go_to_title(game);
+            self.go_to_title(game, false);
         }
     }
 
@@ -5521,9 +5524,13 @@ impl Ui {
         self.sprite(out, "popup_ja", [0.0, 32.0 * H / 448.0, (x1 - x0) * sx, (y1 - y0) * sy], Some([x0, y0, x1 - x0, y1 - y0]));
     }
 
-    fn go_to_title(&mut self, game: &mut Game) {
+    fn go_to_title(&mut self, game: &mut Game, keep_bgm: bool) {
         self.store_global(game);
-        game.reset();
+        if keep_bgm {
+            game.reset_keep_bgm();
+        } else {
+            game.reset();
+        }
         self.menu_bg = MenuBg::new();
         self.enter_title();
     }
