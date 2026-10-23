@@ -173,14 +173,10 @@ impl SoundArchive {
         let warc_file = u32_(&self.data, wi)?;
         let fwar = self.file(warc_file)?;
         let fwav = fwar_wave(fwar, wave_index as usize)?;
-        let mut pcm = decode_fwav(fwav)?;
-        // the sound's initial volume (0..127, 96 for every sound here), as streams get it in `stream_sound`
-        let volume = u8_(&self.data, si + 8)? as f32 / 127.0;
-        for f in &mut pcm.frames {
-            f[0] *= volume;
-            f[1] *= volume;
-        }
-        Ok(pcm)
+        // the sound's initial volume (si + 8) is 96 (of 127) for every sound, streams too; the Switch output
+        // (Astris capture) has a voice at the config volume times the pan law and an SE at sub_CA0 of its volume
+        // with no 96 / 127 on either, so knife leaves it out everywhere
+        decode_fwav(fwav)
     }
 
     #[allow(dead_code)]
@@ -299,14 +295,18 @@ pub fn decode_fwav(d: &[u8]) -> Result<Pcm> {
     let frames = (0..samples)
         .map(|i| {
             let l = channels[0].get(i).copied().unwrap_or(0.0);
-            let r = channels.get(1).and_then(|c| c.get(i)).copied().unwrap_or(l);
-            [l, r]
+            match channels.get(1) {
+                Some(c) => [l, c.get(i).copied().unwrap_or(0.0)],
+                // nn::atk pans a mono voice to the centre with the sqrt curve: 1 / sqrt 2 on each side
+                None => [l * std::f32::consts::FRAC_1_SQRT_2; 2],
+            }
         })
         .collect();
     Ok(Pcm {
         sample_rate: rate,
         frames,
         loop_range: looping.then_some((loop_start, samples)),
+        mono: channels.len() == 1,
     })
 }
 

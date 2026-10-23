@@ -3260,7 +3260,7 @@ impl Ui {
                 }
             }
         }
-        game.sound.apply_volumes();
+        game.apply_volumes();
     }
 
     /// Whether a check / radio / mute control is on.
@@ -3311,7 +3311,7 @@ impl Ui {
                 game.sound.vol.se = v.se;
                 game.sound.vol.bgm_mute = false;
                 game.sound.vol.se_mute = false;
-                game.sound.apply_volumes();
+                game.apply_volumes();
             }
             Ctl::Minus(i) | Ctl::Plus(i) | Ctl::Slider(i) => {
                 let (v, _, step) = self.conf_slider(game, i);
@@ -3336,16 +3336,22 @@ impl Ui {
                 1 => st.skip_unread = v,
                 2 => st.text_fade_in = v,
                 3 => st.text_fade_out = v,
-                4 => st.voice_on = v,
+                4 => {
+                    st.voice_on = v;
+                    game.apply_volumes();
+                }
                 _ => st.voice_stop_on_advance = v,
             },
             Ctl::Mute(i) if i < 3 => {
                 st.mute ^= 1 << i;
                 game.sound.vol.bgm_mute = st.mute & 1 != 0;
                 game.sound.vol.se_mute = st.mute & 2 != 0;
-                game.sound.apply_volumes();
+                game.apply_volumes();
             }
-            Ctl::Mute(i) => st.char_mute ^= 1 << (i - 3),
+            Ctl::Mute(i) => {
+                st.char_mute ^= 1 << (i - 3);
+                game.apply_volumes();
+            }
             // sub_2B930 object 85 -> sub_29140: a random test SE
             Ctl::Test(0) => self.conf_test_se = game.conf_test_se(self.conf_test_se.take()),
             // sub_2B930 case 1: a voice row's test button plays the row's last voice (G031 + 2 row) on player 4 at
@@ -5069,7 +5075,7 @@ impl Ui {
         // the story task is over (sub_40ED0 returned 1): the script does not step again during the fade
         game.ended = true;
         game.end_story_window();
-        game.sound.stop_se(-1, 0.0);
+        game.sound.stop_se(-1);
         game.sound.stop_voice();
         self.black = self.black.max(0.0);
         self.black_col = [0.0; 3];
@@ -5079,8 +5085,8 @@ impl Ui {
         self.black_then = Some(if game.var("F024") != 0 { Action::GalleryBack } else { Action::TitleNow });
     }
 
-    /// sub_47A90 after a replay: the stage goes (the system data is written first after an RDED end, states
-    /// 7 / 5), BGM 2 keeps playing or the title BGM starts, the backdrop fades in at 0.04 and cGallery reopens
+    /// sub_47A90 after a replay: the stage goes (the system data is written first after a result 2 end, RDED or
+    /// RTM_, states 7 / 5), BGM 2 keeps playing or the title BGM starts, the backdrop fades in at 0.04 and cGallery reopens
     /// on the mode it closed with, its content focused on the replayed entry (sub_6124 / sub_7F38 with
     /// off_AE0288[1]).
     fn gallery_back(&mut self, game: &mut Game, r: &Renderer) {
@@ -5531,7 +5537,7 @@ impl Ui {
         // sub_2B5C0: leaving the config stops its test SE and test voice
         if self.screen != Screen::Config && !self.stack.contains(&Screen::Config) {
             if let Some(ch) = self.conf_test_se.take() {
-                game.sound.stop_se(ch, 0.0);
+                game.sound.stop_se(ch);
             }
             if self.conf_test_row.take().is_some() {
                 game.sound.stop_test_voice();
@@ -5852,7 +5858,9 @@ impl Ui {
         if on_title != self.on_title {
             self.on_title = on_title;
             game.title_stage_step(self.boot_flag);
-            if on_title {
+            // back from LOAD GAME with a record picked (title case 32, result 2) the BGM is already fading out for
+            // the load; starting it here played the title BGM again from the start until the load cut it
+            if on_title && !matches!(self.black_then, Some(Action::LoadNow(_))) {
                 game.play_title_bgm();
             }
         }
@@ -5864,6 +5872,9 @@ impl Ui {
             self.complete_update(game, f);
         } else {
             self.complete = None;
+        }
+        if std::mem::take(&mut game.banner_away) {
+            self.skip_banner();
         }
         // the banner (sub_3C970): +0.04 / frame up to 3, then back from 1 to 0
         if let Some(b) = &mut self.banner {
@@ -5879,6 +5890,7 @@ impl Ui {
                 }
             }
         }
+        game.banner_up = self.banner.is_some();
         if self.title_after_banner && self.banner.is_none() && self.scr_a <= 0.0 {
             // sub_4D7E0 done: sub_40ED0 returns 1 and the story ends (to the title, or the gallery with F024)
             self.title_after_banner = false;
@@ -5921,8 +5933,9 @@ impl Ui {
         }
         self.gal_movie_step(game, r, secs);
         // sub_40ED0 top state 1 after an RDAS hit: the next scene, asked first (dialog 10) when the config's
-        // confirmation is on; nothing in a gallery flowchart replay (0x79b78 tests sub_50F0)
-        if self.screen == Screen::Game && std::mem::take(&mut game.auto_skip_hit) && self.gal_ret[0] != 2 && !game.ended {
+        // confirmation is on
+        if self.screen == Screen::Game && std::mem::take(&mut game.auto_skip_hit) && !game.ended {
+            game.drop_capture();
             if game.settings.skip_confirm {
                 self.confirm(game, Confirm::NextScene);
             } else {
@@ -5938,6 +5951,11 @@ impl Ui {
 
     pub fn game_paused(&self) -> bool {
         !matches!(self.screen, Screen::Game)
+    }
+
+    /// A gallery flowchart replay runs (sub_50F0: off_AE0288 == 2).
+    pub fn flow_replay(&self) -> bool {
+        self.gal_ret[0] == 2
     }
 
     // ---- drawing -----------------------------------------------------------------
@@ -6972,8 +6990,8 @@ impl Ui {
                 let pic = |ui: &Self, game: &mut Game, group: usize, i: usize| {
                     let e = ui.cg_entry(group, i)?;
                     let strip = if crate::gallery::language_strip(e.name) { game.assets.language() as f32 } else { 0.0 };
-                    // sub_BE84 -> sub_B6A20: the picture bakes from the sRGB "Jpeg Tex" (grade::Bake::linear)
-                    let img = game.assets.image_graded(r, e.name, crate::grade::Bake { linear: true, ..crate::grade::Bake::NONE })?;
+                    // sub_BE84 -> sub_B6A20: the picture bakes through pre_alter like every image
+                    let img = game.assets.image(r, e.name)?;
                     let (w, h) = (e.width.max(1) as f32, e.height.max(1) as f32);
                     // the table is in 1920-wide units, the images are stored at 1280 (IMG1685: 2106 x 1266 of a
                     // 1404 x 844 texture)
@@ -6997,7 +7015,7 @@ impl Ui {
                     let mut q = Quad::rect(tex, rc, [1.0, 1.0, 1.0, c]).with_uv_rect(u0, v0, u1, v1);
                     q.rule = game
                         .assets
-                        .image(r, if next { "RULE_27" } else { "RULE_26" })
+                        .rule(r, if next { "RULE_27" } else { "RULE_26" })
                         .map(|i| knife_render::RuleMask { invert: true, ..knife_render::RuleMask::new(i.tex.clone(), c) });
                     out.push(q);
                 }

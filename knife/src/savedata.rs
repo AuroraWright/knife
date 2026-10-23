@@ -71,9 +71,13 @@ pub const P_TEXT: usize = 13956;
 /// u8 x 20: SE channel volumes (0..100), then u8 x 20 SE channel loop flags
 pub const P_SE_VOL: usize = 14468;
 pub const P_SE_LOOP: usize = 14489;
-/// 20 x 20 bytes of SE channel playback state (reset pattern below)
+/// i16 x 20: SE channel pans (x 1000, byte_146E640 + 220)
+pub const P_SE_PAN: usize = 14510;
+/// 20 x 20 bytes: each SE channel's queued key-68 command (byte_146E640 + 1112 + 20 ch, sub_66200; reset
+/// pattern below): i16 frames, i16 sound id, i32 key 1, u8 type, i8 key 17, u8, u8 loop, i16 key 18, i16,
+/// i32 key 70
 pub const P_SE_STATE: usize = 14612;
-const SE_STATE_IDLE: [u8; 20] = [0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+pub const SE_STATE_IDLE: [u8; 20] = [0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 pub const SE_CHANNELS: usize = 20;
 
 // ---- stage block (struct of arrays over 40 layers; STCC sub_62140 resets a layer) ---------------

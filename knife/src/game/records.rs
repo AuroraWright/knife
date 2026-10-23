@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use super::{Game, Settings, get_bit, read_key, set_bit};
 use crate::{
-    save::{Kept, LayerSave, SaveData, SeSave},
+    save::{Kept, LayerSave, SaveData, SeQueued, SeSave},
     stage::Source,
     save_tables::{SE_NAMES, SEEN_ALIAS},
     savedata::{self as sd, SaveFile, cfg, get_f32, get_i16, get_i32, get_i64, get_u16, put_f32, put_i16, put_i32, put_i64, st},
@@ -30,6 +30,11 @@ const TYPE_CHOICE: u16 = 12;
 const TYPE_ATSV: u16 = 6;
 /// ATSV(1): the last message's text kept (0x78fb0)
 const TYPE_ATSV_TEXT: u16 = 7;
+
+/// sub_900: a sound effect's index in the name table.
+fn se_id(name: &str) -> Option<i16> {
+    SE_NAMES.iter().position(|n| n.eq_ignore_ascii_case(name)).map(|i| i as i16)
+}
 
 fn alias_bits() -> &'static HashMap<&'static str, u16> {
     static MAP: OnceLock<HashMap<&'static str, u16>> = OnceLock::new();
@@ -169,12 +174,36 @@ impl Game {
         }
         for se in &d.loops {
             let Ok(ch) = usize::try_from(se.channel) else { continue };
-            let Some(id) = SE_NAMES.iter().position(|n| n.eq_ignore_ascii_case(&se.name)) else { continue };
+            let Some(id) = se_id(&se.name) else { continue };
             if ch < sd::SE_CHANNELS {
-                put_i16(&mut p, sd::P_SE_ID + 2 * ch, id as i16);
+                put_i16(&mut p, sd::P_SE_ID + 2 * ch, id);
                 p[sd::P_SE_VOL + ch] = (se.volume * 100.0).round().clamp(0.0, 255.0) as u8;
                 p[sd::P_SE_LOOP + ch] = 1;
             }
+        }
+        // sub_5A910: every channel's volume word (its low byte) and pan
+        for (ch, &w) in d.se_words.iter().enumerate().take(sd::SE_CHANNELS) {
+            p[sd::P_SE_VOL + ch] = w as u8;
+        }
+        for (ch, &w) in d.se_pans.iter().enumerate().take(sd::SE_CHANNELS) {
+            put_i16(&mut p, sd::P_SE_PAN + 2 * ch, w);
+        }
+        for q in &d.se_queue {
+            let Ok(ch) = usize::try_from(q.channel) else { continue };
+            if ch >= sd::SE_CHANNELS {
+                continue;
+            }
+            let o = sd::P_SE_STATE + 20 * ch;
+            put_i16(&mut p, o, q.frames);
+            put_i16(&mut p, o + 2, q.name.as_deref().and_then(se_id).unwrap_or(-1));
+            put_i32(&mut p, o + 4, q.fade);
+            p[o + 8] = q.kind;
+            p[o + 9] = q.volume as u8;
+            if q.kind == 1 {
+                p[o + 11] = q.looping.into();
+            }
+            put_i16(&mut p, o + 12, q.pan);
+            put_i32(&mut p, o + 16, q.speaker);
         }
         let vars: HashMap<&str, i32> = d.vars.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         sd::write_f(&mut p, |n| sd::clamp16(vars.get(format!("F{n:03}").as_str()).copied().unwrap_or(0)));
@@ -216,6 +245,26 @@ impl Game {
                 Some(SeSave { channel: ch as i32, name: SE_NAMES.get(id)?.to_string(), volume: f32::from(p[sd::P_SE_VOL + ch]) / 100.0 })
             })
             .collect();
+        // sub_5BAF0 reads the volume bytes back signed
+        let se_words = (0..sd::SE_CHANNELS).map(|ch| i16::from(p[sd::P_SE_VOL + ch] as i8)).collect();
+        let se_pans = (0..sd::SE_CHANNELS).map(|ch| get_i16(p, sd::P_SE_PAN + 2 * ch)).collect();
+        let se_queue = (0..sd::SE_CHANNELS)
+            .filter_map(|ch| {
+                let o = sd::P_SE_STATE + 20 * ch;
+                let kind = p[o + 8];
+                (kind != 0).then(|| SeQueued {
+                    channel: ch as i32,
+                    frames: get_i16(p, o),
+                    kind,
+                    name: usize::try_from(get_i16(p, o + 2)).ok().and_then(|i| SE_NAMES.get(i)).map(|n| n.to_string()),
+                    fade: get_i32(p, o + 4),
+                    volume: p[o + 9] as i8,
+                    looping: p[o + 11] == 1,
+                    pan: get_i16(p, o + 12),
+                    speaker: get_i32(p, o + 16),
+                })
+            })
+            .collect();
         Some(SaveData {
             version: 1,
             scene,
@@ -244,6 +293,9 @@ impl Game {
                 (i > 0 || s > 0).then(|| (i.max(0) as usize, s as u8))
             },
             text: raw,
+            se_words,
+            se_pans,
+            se_queue,
         })
     }
 
@@ -275,8 +327,15 @@ impl Game {
             Source::Image(_) => l.name.clone(),
             Source::Color(c) => if *c == [1.0; 3] { "WHITE" } else { "BLACK" }.to_string(),
         };
-        let (_, (ax, ay)) = self.image_anchor(&name);
-        Kept { neg_anchor: (-(ax as i16), -(ay as i16)), blend: l.stbr as i8 as u8, stcc: true }
+        // the stage shift word (2923 / 2924): minus the anchor unless STPV or a motion pivot rewrote it
+        let neg_anchor = match l.stage_shift {
+            Some([x, y]) => (x as i16, y as i16),
+            None => {
+                let (_, (ax, ay)) = self.image_anchor(&name);
+                (-(ax as i16), -(ay as i16))
+            }
+        };
+        Kept { neg_anchor, blend: l.stage_blend().0 as i8 as u8, stcc: true }
     }
 
     /// What a stage reset (sub_57450) leaves of every layer: only the anchor (sub_3D70 starts past it).
@@ -389,8 +448,9 @@ impl Game {
             }
             put_f32(&mut s, st::TONE + 16 * l, ls.bright.unwrap_or(1.0));
             put_f32(&mut s, st::TONE + 16 * l + 4, ls.contrast.unwrap_or(1.0));
-            put_i16(&mut s, e + 2, -(ax as i16));
-            put_i16(&mut s, e + 4, -(ay as i16));
+            let [sx, sy] = ls.shift.unwrap_or([-ax.trunc(), -ay.trunc()]);
+            put_i16(&mut s, e + 2, sx as i16);
+            put_i16(&mut s, e + 4, sy as i16);
         }
         s
     }
@@ -423,6 +483,7 @@ impl Game {
                 let effect = get_i16(s, st::EFFECT + 2 * l);
                 let centre = self.assets.tables.images.get(idx).map_or((0.0, 0.0), |im| (im.center_x.trunc(), im.center_y.trunc()));
                 let anchor = (get_f32(s, st::ANCHOR_X + 4 * l), get_f32(s, st::ANCHOR_Y + 4 * l));
+                let shift = (f32::from(get_i16(s, e + 2)), f32::from(get_i16(s, e + 4)));
                 let motion = get_i16(s, st::MOTION + 12 * l);
                 let blend = s[st::BLEND + l] as i8;
                 Some(LayerSave {
@@ -454,6 +515,7 @@ impl Game {
                     stbr: (blend >= 0).then_some(i32::from(blend)),
                     rot2,
                     pivot: (anchor != centre).then_some([anchor.0, anchor.1]),
+                    shift: (shift != (-centre.0, -centre.1)).then_some([shift.0, shift.1]),
                     // the stage colour is white for a layer that is not a fill unless a motion coloured it
                     tint: (effect != 1 && colour != [1.0; 3] && colour != [0.0; 3]).then_some(colour),
                     soxy: (get_i16(s, st::SOXY_X + 2 * l), get_i16(s, st::SOXY_Y + 2 * l)),
@@ -473,7 +535,7 @@ impl Game {
         vol.se = f32::from(get_u16(c, cfg::SE)) / 100.0;
         vol.bgm_mute = self.settings.mute & 1 != 0;
         vol.se_mute = self.settings.mute & 2 != 0;
-        self.sound.apply_volumes();
+        self.apply_volumes();
         self.vars.retain(|k, _| !k.starts_with('G'));
         for n in (0..sd::G_WORDS).filter(|&n| !Self::g_reserved(n)) {
             let v = f.g(n);

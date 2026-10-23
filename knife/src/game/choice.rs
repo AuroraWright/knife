@@ -3,7 +3,7 @@
 //! (sub_848B0 / sub_84A90 update, sub_85690 / sub_85C20 input, sub_85900 / sub_85E40 draw, drawn by the UI).
 //! The exe steps every timer per 60 Hz frame.
 
-use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, Renderer, TexRef};
+use knife_render::{Blend, BlurMode, CANVAS_H, CANVAS_W, Quad, Renderer, Shade, TexRef};
 
 use super::{Game, UX, UY, Wait, msg_layout};
 use crate::text::Layout;
@@ -167,7 +167,8 @@ impl Game {
         if self.auto_choice {
             let n = self.choice.as_ref().map_or(1, |c| c.opts.len());
             let seed = std::env::var("KNIFE_SEED").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            let pick = (self.pc.wrapping_mul(31) + self.scene_index * 7 + seed) % n.max(1);
+            // the SELA / SELS questions (save progress, hint corner) answer No; story choices vary
+            let pick = if kind == ChoiceKind::Page { (self.pc.wrapping_mul(31) + self.scene_index * 7 + seed) % n.max(1) } else { 0 };
             tracing::info!("auto choice {pick}/{n}");
             self.pick_choice(pick);
             self.choice = None;
@@ -494,10 +495,13 @@ impl Game {
         let text_rt = self.choice_text_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "choice text"));
         r.draw(enc, text_rt, Some([0.0; 4]), &quads);
         let glow = self.choice_glow.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "choice glow"));
-        // sub_A0A90(0, -2, 2.0): target texture 5, sigma 2 taps (13 taps) spaced 1.5 px of 1920, h + v
+        // sub_A0A90(0, -2, 2.0): shader 51 whiteness, sigma 2 taps (13 taps) spaced 1.5 px of 1920. It queues
+        // four passes (h, v, h, v, the last back into texture 5) like the menu blur, but the Switch glow is two
+        // passes wide: against the Switch (first choice of 04_00_ARC04_1B) two passes give the glow's sum 0.97,
+        // its far halo 1.015 and 1.81 mean abs, four passes a halo 1.54 too wide (2.36)
         let step = 1.5 * CANVAS_W as f32 / 1920.0;
-        r.blur(enc, &text_rt.tex, &self.blur_rt, [step, 0.0], 2.0);
-        r.blur(enc, &self.blur_rt.tex, glow, [0.0, step], 2.0);
+        r.blur(enc, &text_rt.tex, &self.blur_rt, [step, 0.0], 2.0, BlurMode::White);
+        r.blur(enc, &self.blur_rt.tex, glow, [0.0, step], 2.0, BlurMode::White);
     }
 
     /// The glow texture's rows: 64 px, 160 in the overseas build (room for two-line options).
@@ -604,8 +608,11 @@ impl Game {
                 let red = if c.state == 4 { 0.75294 } else { 0.43922 };
                 let (x0, y0) = ((x - 5.3333) * UX, Self::glow_row_top(c.top, i, &lay));
                 let (u0, v0) = (x0 / CANVAS_W as f32, i as f32 * band / CANVAS_H as f32);
-                let q = Quad::rect(g.tex.clone(), [x0, y0, CANVAS_W as f32 - x0, band], [red, 1.0, 1.0, ga])
+                // effect 30 (state 1, the default shader) would weigh the glow by its own alpha too, but the
+                // Switch glow is linear in it (squared it is 0.63 as bright), so its alpha is left out
+                let mut q = Quad::rect(g.tex.clone(), [x0, y0, CANVAS_W as f32 - x0, band], [red, 1.0, 1.0, ga])
                     .with_uv_rect(u0, v0, 1.0, v0 + band / CANVAS_H as f32);
+                q.shade = Shade::ForceAlpha;
                 out.push(add(q));
             }
             if focus {

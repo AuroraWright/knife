@@ -116,7 +116,8 @@ struct Cli {
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     title: bool,
-    /// Debug: automatically pick the first option of every choice
+    /// Debug: answer every choice at once (story choices vary with the pc and KNIFE_SEED; the save / hint
+    /// questions answer No)
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     auto_choice: bool,
@@ -394,7 +395,9 @@ impl App {
             }
         }
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32() * 1000.0;
+        // with --shots the game runs on a fixed 60 fps clock, so shots and --keys land at exact game times however
+        // long a frame (and its screenshot) takes
+        let dt = if self.cli.shots.is_some() { 1000.0 / 60.0 } else { (now - self.last).as_secs_f32() * 1000.0 };
         self.last = now;
         // controllers: the same buttons as the keyboard
         let events = self.gamepads.poll(dt / 1000.0 * 60.0);
@@ -404,6 +407,7 @@ impl App {
             ui.pad(g, r, b, pressed, repeat);
         }
         g.paused = ui.game_paused();
+        g.flow_replay = ui.flow_replay();
         if self.cli.hold_skip {
             g.set_skip(ui.in_game());
         }
@@ -414,6 +418,8 @@ impl App {
         }
         g.update(r, dt.min(100.0));
         ui.update(g, r, dt);
+        // nn::atk's update after the frame callback, then the present (sub_FC064)
+        g.sound.flush();
         g.system_menu_shown = ui.system_menu_shown();
         g.render(r, &mut |g, r, out| ui.draw(g, r, out));
         self.elapsed += dt;

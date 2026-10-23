@@ -19,11 +19,12 @@ use story_movie::StoryMovie;
 
 use knife_core::exe::Build;
 use knife_core::vm::parse::{Command, Op, Scene};
-use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, RenderTarget, Renderer, Shade, TexRef};
+use knife_render::{Blend, BlurMode, CANVAS_H, CANVAS_W, Quad, RenderTarget, Renderer, Shade, TexRef};
 
 use crate::{
     assets::Assets,
     motion::MotionTable,
+    save::SeQueued,
     sound::Sound,
     stage::{Layer, Source, Stage, Tween},
     text::{self, FontAtlas, Layout, PlacedChar},
@@ -59,6 +60,24 @@ struct Transition {
     dur: f32,
     t: f32,
     rule: Option<TexRef>,
+    /// FADS's capture (sub_A46F0) drawn whole over the presented stage before its transition starts
+    hold: bool,
+}
+
+impl Transition {
+    fn hold() -> Self {
+        Self { dur: 1.0, t: 0.0, rule: None, hold: true }
+    }
+}
+
+/// A FADS in progress (script_dispatch 0x77a40 -> loc_7FD08; it runs again each frame, loc_7FEF4 returning the
+/// command itself, until it is done).
+#[derive(Clone, Copy)]
+struct Fads {
+    /// frames left before the transition starts (dword_146E660)
+    hold: u8,
+    /// sub_60610 started the transition (qword_146E65C = 1); the next run ends the command
+    started: bool,
 }
 
 #[derive(Default)]
@@ -242,32 +261,6 @@ const TEST_SES: [&str; 14] = [
 /// sub_710's sound ids (dword_3341A0): BFSAR items 0x10040d4.. in order. 0x10040d5 (1) and 0x10040db (7) have no
 /// name; the others are WSD_MOON_SE00001, 03, 04, 07, 10, 11 and 14.
 const SYS_SOUNDS: [u32; 9] = [0x10040d4, 0x10040d5, 0x10040d6, 0x10040d7, 0x10040d8, 0x10040d9, 0x10040da, 0x10040db, 0x10040dc];
-/// sub_CA0's volume curve (flt_3355F0, 100 points over 0..1, linear in between; 1.0 from 0.99).
-const VOLUME_CURVE: [f32; 100] = [
-    0.0, 0.001442, 0.002885, 0.004327, 0.005769, 0.007212, 0.008654, 0.010096, 0.011538, 0.016667, 0.021795,
-    0.026923, 0.030769, 0.034615, 0.038462, 0.042308, 0.046154, 0.05, 0.055769, 0.061538, 0.069231, 0.076923,
-    0.082692, 0.088462, 0.094231, 0.1, 0.105769, 0.111538, 0.119231, 0.126923, 0.132692, 0.138462, 0.15, 0.155769,
-    0.161538, 0.176923, 0.182692, 0.188462, 0.2, 0.205769, 0.211538, 0.226923, 0.238462, 0.244231, 0.25, 0.261538,
-    0.276923, 0.288462, 0.294231, 0.3, 0.311538, 0.326923, 0.338462, 0.35, 0.361538, 0.376923, 0.382692, 0.388462,
-    0.4, 0.411538, 0.426923, 0.438462, 0.45, 0.461538, 0.476923, 0.488462, 0.5, 0.511538, 0.526923, 0.538462, 0.55,
-    0.576923, 0.588462, 0.6, 0.611538, 0.625, 0.638462, 0.65, 0.661538, 0.676923, 0.688462, 0.711538, 0.725,
-    0.738462, 0.75, 0.776923, 0.788462, 0.8, 0.811538, 0.826923, 0.85, 0.863462, 0.876923, 0.9, 0.913462, 0.926923,
-    0.938462, 0.961538, 0.976923, 0.988462,
-];
-
-/// sub_CA0: below 0.0014423 as is; else 100v < 1 -> 0, the table interpolated up to 98, 1.0 above.
-fn volume_curve(v: f32) -> f32 {
-    if v < 0.0014423 {
-        return v;
-    }
-    let x = v * 100.0;
-    let i = x as usize;
-    match i {
-        0 => 0.0,
-        1..=98 => VOLUME_CURVE[i] + (x - i as f32) * (VOLUME_CURVE[i + 1] - VOLUME_CURVE[i]),
-        _ => 1.0,
-    }
-}
 /// Voice name prefix -> speaker (sub_2360, table off_44D970).
 const VOICE_SPEAKERS: [(&str, usize); 55] = [
     ("ZZZ", 0), ("A00", 1), ("A10", 2), ("A11", 2), ("A12", 2), ("A20", 3), ("A21", 3), ("A22", 3), ("A23", 3),
@@ -433,6 +426,9 @@ pub struct Game {
     sysmes: Option<Vec<String>>,
     trans: Option<Transition>,
     snapshot: bool,
+    fads: Option<Fads>,
+    /// sub_4B570: the rule mask the last FADS loaded (dword_590E8C, rule - 1), -1 none
+    fads_rule: i32,
     /// SHOK / SHAF screen shake
     shake: shake::ScreenShake,
     /// MSQK message-text quake and its random source
@@ -479,11 +475,20 @@ pub struct Game {
     /// the message being shown was already read (selects the read text speed)
     line_read: bool,
     pub ended: bool,
-    /// the script stopped with sub_802C0 result 2 (RDED of the replayed node while F024 is set): the
-    /// system data is written before the gallery comes back (sub_48AC0 case 2 states 7 / 5)
+    /// the script stopped with sub_802C0 result 2 (RTM_ / RTMN, or RDED of the replayed node while F024 is
+    /// set): the system data is written before the gallery comes back (sub_48AC0 case 2 states 7 / 5), and
+    /// the stage goes with the window when F0 is 0
     pub replay_done: bool,
     /// RDAS hit a completed node with "既読シーンのオートスキップ" on (sub_92580 -> off_AE06B0 = 1)
     pub auto_skip_hit: bool,
+    /// the mode banner (sub_3B430, `Ui::banner`) is up, as of the last frame's UI step (qword_AFEC90 state != 0)
+    pub banner_up: bool,
+    /// RDAS asks the UI to send the banner away (sub_3B480)
+    pub banner_away: bool,
+    /// a gallery flowchart replay runs (sub_50F0: off_AE0288 == 2, `Ui::flow_replay`), set before each update
+    pub flow_replay: bool,
+    /// the command just run made script_dispatch return (loc_7FEF0 / loc_7FEF4)
+    dispatch_return: bool,
     /// a next / previous scene countdown runs (sub_40ED0 states 3 / 6 return before the script)
     pub hold: bool,
     /// off_AE05B8: a held rewind runs sub_814C0 instead of the script step (sub_40ED0), so the restored
@@ -508,8 +513,10 @@ pub struct Game {
     /// dword_AFFCA4: set by a story start (sub_40CD0) or a load (sub_82330), cleared when a message starts
     /// (sub_6E0D0 / sub_6E950); while set Y does not open the system menu (sub_40ED0)
     pub menu_lock: bool,
-    /// SE commands waiting out their key 68 delay: (channel, ms left, command) (byte_146E640 + 1112 + 20 * ch)
-    se_delayed: Vec<(i32, f32, Command)>,
+    /// SE commands waiting out their key 68 delay (byte_146E640 + 1112 + 20 * ch): (the slot, ms left, queued
+    /// this frame). The frame count starts with the queueing frame's own sound update, so `ms left` is
+    /// one frame short of it and that frame's tick passes the entry by.
+    se_delayed: Vec<(SeQueued, f32, bool)>,
     /// The next-scene seek's sound state (off_AE0568 set): sub_802C0 stops all sound (sub_5EF10(0)), the BGM /
     /// SE commands then only record what they would play (word_146E654 / 650, the channel words at
     /// byte_146E640), and SELD / SELA / SELS (sub_92800 / sub_92930) resume it (sub_5D7E0); TOMP ends it
@@ -533,8 +540,23 @@ pub struct Game {
     history: std::collections::VecDeque<RingEntry>,
     /// ms the current click wait has been up (a skip passes it after `SKIP_FRAMES` 60 Hz frames)
     click_ms: f32,
+    /// sub_391A0's click icon fade (dword_AFEC88), its animation ticks (dword_572B60, advanced only while the
+    /// icon draws) and the last frame's ms
+    icon_fade: f32,
+    icon_ticks: f32,
+    frame_ms: f32,
+    /// ms the page text has been all out at a frame's end (sub_81B30 sees the slot's progress, set by the draw,
+    /// a frame later)
+    text_out_ms: f32,
+    /// frames run (`update`) and the last frame a new message's reveal holds through (sub_A7790 gives the slot
+    /// a 2 frame delay, sub_C3834, during which sub_A8240 reports progress 0 and the draw resets the head)
+    frame_no: u64,
+    reveal_hold: u64,
     /// ms since the script last ran under a skip (one dispatch per 60 Hz frame)
     dispatch_ms: f32,
+    /// game time left before the script goes on after a command script_dispatch returns at (the next 60 Hz
+    /// frame's sub_802C0; under a frame so that frame-time jitter at 60 Hz does not add one)
+    resume_ms: f32,
     /// serial of the next history entry
     ring_serial: u64,
     /// serials of the current page's first and newest history entries
@@ -606,6 +628,8 @@ pub struct Game {
     wnty: i32,
     /// DISP_PARTS_JA textures in order: image slots DISP_SLOT0.. (message windows, wait icons)
     disp: Vec<TexRef>,
+    /// BORDER_PARTS alphagradation020..512 and their `_inv` (stage::ClipRect::band)
+    border: Vec<TexRef>,
     /// `relayout_page` runs: a message past the page bottom stays on the page
     relaying: bool,
 
@@ -622,6 +646,11 @@ pub struct Game {
     /// not stall on large stage images (cache keys in flight, and where they arrive)
     preview_decoding: std::collections::HashSet<String>,
     preview_decoded: (std::sync::mpsc::Sender<crate::assets::Decoded>, std::sync::mpsc::Receiver<crate::assets::Decoded>),
+    /// the script's image look-ahead (`prefetch_images`): cache keys in flight, and where they arrive
+    prefetching: std::collections::HashSet<String>,
+    prefetched: (std::sync::mpsc::Sender<crate::assets::Decoded>, std::sync::mpsc::Receiver<crate::assets::Decoded>),
+    /// Target 0's bucket-1 draws (the stage, the FADE(40) effect, the FCLN effect): what a FADS captures
+    scene_rt: RenderTarget,
     old_rt: RenderTarget,
     blur_rt: RenderTarget,
     /// FADE 40: blur the stage (FADE 41 clears)
@@ -692,8 +721,17 @@ impl Game {
     pub fn new(assets: Assets, motions: MotionTable, font: FontAtlas, r: &Renderer) -> Self {
         let script = Arc::new(Scene::parse(b""));
         let disp = assets.ui_textures(r, &assets.ui_atlas("DISP_PARTS")).unwrap_or_default();
+        // BORDER_PARTS (texture slots 338..355) for the clip bands: alphagradation020..512, then their `_inv`
+        let border = assets.ui_textures(r, "BORDER_PARTS").unwrap_or_default();
+        let border = ["", "_inv"]
+            .iter()
+            .flat_map(|v| ["020", "064", "080", "128", "256", "512"].map(|n| format!("alphagradation{v}{n}")))
+            .map(|n| border.iter().find(|(m, _)| *m == n).map(|(_, t)| t.clone()))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
         let mut g = Self::new_inner(assets, motions, font, r, script);
         g.disp = disp.into_iter().map(|(_, t)| t).collect();
+        g.border = border;
         g
     }
 
@@ -721,6 +759,8 @@ impl Game {
             sysmes: None,
             trans: None,
             snapshot: false,
+            fads: None,
+            fads_rule: -1,
             shake: shake::ScreenShake::default(),
             msg_quake: shake::MsgQuake::default(),
             fx_rng: crate::fx::Rng::default(),
@@ -749,6 +789,10 @@ impl Game {
             ended: false,
             replay_done: false,
             auto_skip_hit: false,
+            banner_up: false,
+            banner_away: false,
+            flow_replay: false,
+            dispatch_return: false,
             hold: false,
             rewinding: false,
             staff_task: false,
@@ -763,7 +807,14 @@ impl Game {
             warned: HashSet::new(),
             backlog_pages: Vec::new(),
             click_ms: 0.0,
+            icon_fade: 0.0,
+            icon_ticks: 0.0,
+            frame_ms: 0.0,
+            text_out_ms: 0.0,
+            frame_no: 0,
+            reveal_hold: 0,
             dispatch_ms: 0.0,
+            resume_ms: 0.0,
             ring_serial: 0,
             page_ring: (None, None),
             hide_text: false,
@@ -800,6 +851,7 @@ impl Game {
             stuck: (0, 0.0),
             wnty: 0,
             disp: Vec::new(),
+            border: Vec::new(),
             relaying: false,
             stage_rt: r.create_target(CANVAS_W, CANVAS_H, "stage"),
             noise_rt: None,
@@ -808,6 +860,9 @@ impl Game {
             preview_rt: None,
             preview_decoding: Default::default(),
             preview_decoded: std::sync::mpsc::channel(),
+            prefetching: Default::default(),
+            prefetched: std::sync::mpsc::channel(),
+            scene_rt: r.create_target(CANVAS_W, CANVAS_H, "scene"),
             old_rt: r.create_target(CANVAS_W, CANVAS_H, "old frame"),
             blur_rt: r.create_target(CANVAS_W, CANVAS_H, "blur"),
             ghost: ghost::Ghost::default(),
@@ -1007,6 +1062,7 @@ impl Game {
     // ---- per-frame update ---------------------------------------------------------
 
     pub fn update(&mut self, r: &Renderer, dt: f32) {
+        self.frame_no += 1;
         // sub_A59F0: the capture fades by its step per frame, gone at 0
         if let Some(f) = &mut self.freeze
             && !f.capture
@@ -1021,8 +1077,35 @@ impl Game {
             self.click_ms += dt;
         }
         self.dispatch_ms = (self.dispatch_ms + dt).min(1000.0 / 60.0);
+        self.resume_ms = (self.resume_ms - dt).max(0.0);
+        // an instant FADS draws its capture in the frame sub_60610 runs only (loc_7FD38); the frame after, the
+        // script is held by the transition flag and nothing draws it
+        if self.resume_ms <= FRAME_MS * 0.75
+            && self.fads.is_some_and(|f| f.started)
+            && self.trans.as_ref().is_some_and(|t| t.hold)
+        {
+            self.trans = None;
+        }
+        self.sound.begin_frame(dt);
         for _ in 0..self.speed.max(1) {
             self.update_step(r, dt);
+        }
+        // the sound update (sub_9B7F0) runs once a frame after the script: sub_65E50 counts the queued SE
+        // commands down (a key-68 SE queued by this frame's script already loses a frame: 500 ms is 29 frames
+        // after the SEPL, 475 ms measured on the Switch), except while a rewind is held (off_AE05B8); then
+        // nn::atk's update
+        if !self.paused && !self.rewinding {
+            self.tick_se_delayed(if self.skip && self.speed <= 1 { dt * 8.0 } else { dt });
+        }
+        self.sound.end_frame();
+        // sub_391A0, once a frame while the window is up: the click icon fades in by 0.1 a frame once the slot's
+        // text is all out (sub_AB8E0 -> sub_A8730) and the message waits for a click (AE04B8 0x400, set by
+        // sub_6E0D0 / sub_6E950 with the message); otherwise it is 0
+        self.frame_ms = dt;
+        let out = self.page.revealed as usize >= self.page.order;
+        self.text_out_ms = if out { self.text_out_ms + dt } else { 0.0 };
+        if self.page.alpha > 0.0 {
+            self.icon_fade = if self.wait == Wait::Click && out { (self.icon_fade + dt * 0.006).min(1.0) } else { 0.0 };
         }
     }
 
@@ -1046,8 +1129,6 @@ impl Game {
         let step = if fast && self.speed <= 1 { dt * 8.0 } else { dt };
         let cut = fast && self.speed <= 1;
 
-        // sub_65E50 (from the sound update) counts the queued SE commands down
-        self.tick_se_delayed(step);
         // layer tweens and motions
         self.stage.advance(step);
         let (p, q) = (self.var("F1120") - 127, self.var("F1121"));
@@ -1063,7 +1144,9 @@ impl Game {
         self.shake.advance(step);
         self.stage.shake = self.shake.offset;
         // transition
-        if let Some(t) = &mut self.trans {
+        if let Some(t) = &mut self.trans
+            && !t.hold
+        {
             t.t += step;
             if t.t >= t.dur || cut {
                 self.trans = None;
@@ -1090,6 +1173,13 @@ impl Game {
             m.2 = if instant || m.3 <= 0.0 { 1.0 } else { (m.2 + dt * 0.06 / m.3).min(1.0) };
         }
         // window fade / text reveal
+        // sub_81B30 (before sub_38D40 steps the fades) holds the text head while the window is shown and still
+        // fading in or the content fade (A8) runs, unless F1103 (Switch 499_QA_05's message after CLO3: the text
+        // starts once the bubble is in, the content fade's 18 frames after the message); instant text and a
+        // skip set the head after that test too
+        let head_held = self.page.visible
+            && (self.page.alpha < 1.0 || self.page.dim_vel < 0.0)
+            && self.var("F1103") == 0;
         let target = if self.page.visible { 1.0 } else { 0.0 };
         let instant = fast || (target < self.page.alpha && !self.settings.text_fade_out);
         let wstep = if self.page.quick && !self.page.visible { 0.26042 * dt / FRAME_MS } else { dt / 128.0 };
@@ -1112,10 +1202,12 @@ impl Game {
         }
         let k = usize::from(self.line_read);
         let ms = self.settings.text_ms[k];
-        if ms <= 0.0 || self.settings.page_at_once[k] || fast {
-            self.page.revealed = self.page.order as f32;
-        } else {
-            self.page.revealed = (self.page.revealed + dt / ms).min(self.page.order as f32);
+        if self.frame_no > self.reveal_hold && !head_held {
+            if ms <= 0.0 || self.settings.page_at_once[k] || fast {
+                self.page.revealed = self.page.order as f32;
+            } else {
+                self.page.revealed = (self.page.revealed + dt / ms).min(self.page.order as f32);
+            }
         }
         self.update_choice(dt);
 
@@ -1140,13 +1232,17 @@ impl Game {
             }
             // under a skip at speed n the exe's waits and effects run n steps a frame (the wait budget
             // sub_802C0 gets is speed x frames); knife cuts them short only for the debug skip at speed 1
+            // (the exe counts whole frames; the tolerance keeps f32 steps of 1000 / 60 from adding one)
             Wait::Time { left, click } => {
                 let left = left - step;
-                self.wait = if left <= 0.0 || cut { Wait::None } else { Wait::Time { left, click } };
+                self.wait = if left <= 0.01 || cut { Wait::None } else { Wait::Time { left, click } };
             }
+            // sub_3C970 clears the transition flag (AE04B8 8) once the progress (sub_4B860) is out, after the
+            // frame's script step, so the script goes on the frame after
             Wait::Transition => {
                 if self.trans.is_none() {
                     self.wait = Wait::None;
+                    self.resume_ms = FRAME_MS * 0.75;
                 }
             }
             Wait::Layer(l, mask) => {
@@ -1164,8 +1260,12 @@ impl Game {
                     self.wait = Wait::None;
                 }
             }
+            // the draw sets the slot's progress (sub_AB710) after sub_81B30 moved the head, so sub_81B30 swaps bit 1
+            // for 0x40 the frame after the text is out and sub_802C0 goes on the frame after that (the exe's head
+            // also takes its first step in the dispatch frame, knife's in the next)
             Wait::Message { voice } => {
-                if self.page.revealed as usize >= self.page.order && (!voice || fast || !self.sound.voice_playing()) {
+                let out = self.page.revealed as usize >= self.page.order && self.text_out_ms >= FRAME_MS - 1.0;
+                if out && (!voice || fast || !self.sound.voice_playing()) {
                     self.wait = Wait::None;
                 }
             }
@@ -1231,7 +1331,7 @@ impl Game {
             self.dispatch_ms = 0.0;
         }
         let mut budget = 20000;
-        while self.wait == Wait::None && !self.ended && !self.auto_skip_hit && !self.hold && !self.rewinding && budget > 0 {
+        while self.resume_ms <= 0.0 && self.wait == Wait::None && !self.ended && !self.hold && !self.rewinding && budget > 0 {
             // the next-scene seek runs whole in this frame (sub_802C0's AE0568 loop)
             if !self.seek_node {
                 budget -= 1;
@@ -1243,18 +1343,29 @@ impl Game {
             };
             self.pc += 1;
             self.exec(r, &cmd);
+            // script_dispatch always returns after these (loc_7FEF0), also when they leave no wait (every CLO, STCF,
+            // `_NOP_`, TOMW without a movie), so the commands after them run the next frame (Switch 196 at 1980:
+            // the click cuts the voice a frame before the SESP behind PGST / CLO3)
+            let returns = matches!(
+                cmd.name.as_str(),
+                "CLO2" | "CLO3" | "CLO4" | "CLO5" | "STCF" | "NOP_" | "TOMW" | "MSAD" | "WTTM" | "SELA" | "SELD" | "SELS" | "END_" | "JUMP"
+            ) || std::mem::take(&mut self.dispatch_return);
             if self.seek_node {
                 // a pass of the seek loop ends where script_dispatch returns
-                if self.wait != Wait::None {
+                if self.wait != Wait::None || returns {
                     self.seek_pass_end(r);
                 }
                 self.seek_clear_wait();
+            } else if returns && self.wait == Wait::None {
+                self.resume_ms = self.resume_ms.max(FRAME_MS * 0.75);
+                break;
             }
         }
         // the pass that ended the seek: script_dispatch went on to the next wait first
         if self.seek_ended && !self.seek_node {
             self.seek_pass_end(r);
         }
+        self.prefetch_images(r);
         // sub_802C0: a stage an STCH / SCH2 changed with no FADS after it is presented as the dispatch returns
         // (sub_5D3A0(0, 0): sub_2E1B0(0, 0) ends any transition)
         if std::mem::take(&mut self.stage_dirty) && !self.seek_node {
@@ -1277,6 +1388,112 @@ impl Game {
             self.clear_page(true);
         }
         self.assets.trim_images(400);
+    }
+
+    /// sub_802C0 after each dispatch: sub_6F4D0(…, 24) queues the images the next 24 commands use into
+    /// off_AE0990 and sub_AC420 loads them, so an STCH finds its image loaded (no stall at the command). knife reads and decodes the STCH /
+    /// SCH2 images (the `_aa_bb` variant when it exists, else the base, as `cmd_stch` takes them) on worker
+    /// threads and uploads them as they arrive; one not ready yet still loads at the command.
+    fn prefetch_images(&mut self, r: &Renderer) {
+        while let Ok(d) = self.prefetched.1.try_recv() {
+            self.prefetching.remove(d.key());
+            self.assets.finish_decoded(r, d);
+        }
+        if self.seek_node {
+            return;
+        }
+        let none = crate::grade::Bake::NONE;
+        let end = (self.pc + 24).min(self.script.commands.len());
+        let mut names = Vec::new();
+        for c in self.script.commands.get(self.pc..end).unwrap_or_default() {
+            if !matches!(c.name.as_str(), "STCH" | "SCH2") {
+                continue;
+            }
+            let Some(base) = c.arg(1).filter(|b| !b.is_empty() && !b.eq_ignore_ascii_case("BLACK") && !b.eq_ignore_ascii_case("WHITE")) else {
+                continue;
+            };
+            let variant = match (c.int(9), c.int(10)) {
+                (Some(a), Some(b)) if (a, b) != (0, 0) => Some(format!("{base}_{a:02}_{b:02}")),
+                _ => None,
+            };
+            let known = |n: &str| self.assets.image_index_of(&n.to_ascii_uppercase()).is_some();
+            let name = variant.filter(|v| known(v)).unwrap_or_else(|| base.to_string());
+            if known(&name) && !self.assets.image_cached(&name, none) {
+                names.push(name);
+            }
+        }
+        for name in names {
+            if self.prefetching.insert(crate::assets::Assets::image_key(&name, none).2) {
+                self.assets.decode_async(&name, none, self.prefetched.0.clone());
+            }
+        }
+    }
+
+    /// sub_60610, FADS's start: the window flags, the stage presented and backed up, the transition (rule mask
+    /// sub_4B4C0 loaded outside the seek) and its flag. Outside the seek / a rewind FADS then runs once more
+    /// (`fads`).
+    fn fads_start(&mut self, r: &Renderer, c: &Command) {
+        let arg = |i: usize| c.int(i);
+        for f in ["F996", "F997", "F985"] {
+            self.set_var(f, 0);
+        }
+        // arg 3 = 1 hides the text until the next message; 2 too when the fade lasts 2+ ms and no content fade
+        // runs (config byte 99, 1 unless a whole-config copy changes it)
+        let wnd = arg(3).unwrap_or(-1);
+        if wnd == 1 || (wnd == 2 && arg(1).unwrap_or(0) >= 2 && self.page.dim_vel == 0.0) {
+            self.set_var("F1103", 1);
+        }
+        let mode = c.int_or(0, 1);
+        let dur = c.int_or(1, 0) as f32;
+        let rule = c.int_or(2, 0);
+        self.stage.commit();
+        self.stage_dirty = false;
+        // sub_60610 copies the committed stage into the backup
+        self.stage_backup = Some(self.stage_bytes());
+        let rule_before = self.fads_rule;
+        if !self.seek_node {
+            self.fads_rule = if rule >= 1 { rule - 1 } else { -1 };
+        }
+        if mode == 1 || dur <= 0.0 || self.skip {
+            // sub_60610 returns 0 when a rule was loaded before (mode 1: sub_4B570 >= 0), and FADS then draws its
+            // capture this frame too (loc_7FD38)
+            let keep = !self.seek_node && !self.rewinding && mode == 1 && rule_before >= 0;
+            self.trans = keep.then(Transition::hold);
+            // sub_4B740 starts the progress at 1 with a step of -1, taken at the end of sub_48AC0 after
+            // sub_3C970's check: the transition flag holds the script one frame, then FADS returns (Switch:
+            // 001_00_00's CLO3 .. FADS(1,0,0) + STGS(0,,255,800), the fade 7 frames after the window goes)
+            if !self.seek_node && !self.rewinding {
+                self.resume_ms = FRAME_MS * 1.75;
+            }
+        } else {
+            // sub_47DD0: only mode 2 draws the old frame through the rule (sub_A48C0); mode 0 is a crossfade
+            // (sub_A46F0) even with a rule loaded
+            let rule = (mode == 2 && rule > 0)
+                .then(|| self.assets.rule(r, &format!("RULE_{rule:02}")))
+                .flatten()
+                .map(|i| i.tex.clone());
+            if self.seek_node || self.rewinding {
+                self.snapshot = true;
+            }
+            self.trans = Some(Transition { dur, t: 0.0, rule, hold: false });
+            self.wait = Wait::Transition;
+        }
+        if !self.seek_node && !self.rewinding {
+            self.fads = Some(Fads { hold: 0, started: true });
+        }
+    }
+
+    /// sub_538E0, as sub_40ED0 opens the next / previous scene dialog or countdown (after an RDAS hit or a mode
+    /// panel button): FADS's old-frame capture (byte_146E640) and its image-load wait count (qword_146E65C) are
+    /// dropped. A FADS from the last dispatch is still in that wait (its STCH images load after the dispatch,
+    /// sub_6F4D0), so the live new stage shows under the dialog, and when the script goes on FADS runs again,
+    /// captures that stage and runs its transition between the same frames (Switch 010 at RDAS(66): the
+    /// classroom of FADS(0,1500) is up in full the frame the dialog appears). A transition already stepping is
+    /// left alone.
+    pub fn drop_capture(&mut self) {
+        if self.fads.take().is_some_and(|f| !f.started) && self.trans.as_ref().is_some_and(|t| t.hold) {
+            self.trans = None;
+        }
     }
 
     /// sub_6E0D0: every message pushes its type 0 ring entry as it starts (sub_5A910, not while a held rewind
@@ -1393,7 +1610,11 @@ impl Game {
         if self.seek_node {
             self.end_seek(true);
         }
-        self.sound.stop_se(-1, 0.0);
+        // sub_5F200 also clears the queued SE ops, the loop words, the volume words (-1) and the pans
+        self.se_delayed.clear();
+        self.sound.stop_se(-1);
+        self.sound.se_word = [-1; 20];
+        self.sound.se_pan = [0; 20];
         self.sound.stop_voice();
         if !std::mem::take(&mut self.keep_bgm_at_end) {
             self.sound.stop_bgm_rate(416.67);
@@ -1708,7 +1929,7 @@ impl Game {
             loops: self.sound.looping_effects().into_iter().map(|(c, n, v)| (c, (n, v))).collect(),
         });
         self.sound.stop_bgm(0.0);
-        self.sound.stop_se(-1, 0.0);
+        self.sound.stop_se(-1);
     }
 
     /// sub_5D7E0: the BGM word plays at once (a track already playing keeps going, sub_9C470) at its volume
@@ -1718,12 +1939,27 @@ impl Game {
             Some((id, vol)) => self.play_bgm(id, vol, 0.0),
             None => self.sound.stop_bgm(0.0),
         }
-        self.sound.stop_se(-1, 0.0);
+        self.sound.stop_se(-1);
         for (&ch, (name, vol)) in &st.loops {
+            // sub_5D7E0 rebinds the channel from its saved speaker byte, 0 for every looping SEPL, and sets the
+            // pan word (sub_9CE60)
+            self.sound.bind_speaker(ch, None);
+            let pan = self.sound.se_pan.get(ch as usize).map_or(0.0, |&p| f32::from(p) / 1000.0);
             if let Some(pcm) = self.assets.sound_effect(name) {
-                self.sound.play_se(ch, name, pcm, *vol, 0.0, true);
+                self.sound.play_se(ch, name, pcm, *vol, 0.0, true, pan);
             }
         }
+    }
+
+    /// Category volumes changed: the speaker rows' voice volumes (0 for a muted row or with voices off, the
+    /// type 2 SE channels' category in sub_9B7F0), then every playing sound.
+    pub fn apply_volumes(&mut self) {
+        let st = &self.settings;
+        let gains = (0..19)
+            .map(|r| if st.voice_on && st.char_mute >> r & 1 == 0 { st.char_voice.get(r).copied().unwrap_or(1.0) } else { 0.0 })
+            .collect();
+        self.sound.set_speaker_gains(gains);
+        self.sound.apply_volumes();
     }
 
     /// Mode panel voice replay (case 7: the current message's voice).
@@ -1797,6 +2033,11 @@ impl Game {
                 }
                 let (text, wait) = message_end(&text);
                 self.show_message(&message_end(raw).0, wait);
+                // sub_A7790 without 0x20000: the slot's 2 frame delay (none in the seek, 0x1000) costs the reveal
+                // the next frame's steps; MSAD keeps the progress and has none
+                if !self.seek_node {
+                    self.reveal_hold = self.frame_no + 1;
+                }
                 crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
                 let (raw_text, code) = raw_message(raw, "");
                 if !wait {
@@ -1878,7 +2119,18 @@ impl Game {
                     self.goto_label(&l);
                 }
             }
-            "IFNX" | "IFSC" | "IFUR" => {}
+            // IFUR(_, label) (0x79c00, both builds): on while sub_926F0(1) finds an ending node of 533..556 not
+            // completed (G300 + n, RDED), else to the label; the argument is not read. 519_QA_25 opens with
+            // IFUR(1, COMP_CHECK_OK, ..) and an RTM_ after it
+            "IFUR" => {
+                if (533..=556).all(|n| get_bit(&self.endings, n))
+                    && let Some(l) = c.arg(1).filter(|l| !l.is_empty())
+                {
+                    let l = l.to_string();
+                    self.goto_label(&l);
+                }
+            }
+            "IFNX" | "IFSC" => {}
             "GOTO" => {
                 if let Some(l) = c.arg(0) {
                     let l = l.to_string();
@@ -1908,13 +2160,15 @@ impl Game {
                     }
                 }
             }
-            // END_ (0x7f408, result 1) / RTM_ (0x789c8, result 2; RTMN first sets byte_146E64D, RTM2 only sets
-            // it): the script ends (sub_5F200 at 0x7f5d4 / 0x7f9f8)
+            // END_ (0x7f408, result 1) / RTM_ (0x789c8 -> loc_7F9A4, result 2 like a replay's RDED; RTMN first
+            // sets byte_146E64D, RTM2 only sets it): the script ends (sub_5F200 at 0x7f5d4 / 0x7f9f8). RTM_ also
+            // zeroes stage word 0x19A4, which nothing sets
             "RTM2" => self.keep_bgm_at_end = true,
             "END_" | "RTM_" | "RTMN" => {
                 if name == "RTMN" {
                     self.keep_bgm_at_end = true;
                 }
+                self.replay_done = name != "END_";
                 tracing::info!("{name}: scene finished");
                 self.script_end();
             }
@@ -1986,28 +2240,28 @@ impl Game {
                 self.set_var("F799", (self.wnty != 0).into());
             }
             "MSAD" => {
-                if let Some(a) = c.args.first() {
-                    // sub_6E950: the push hold ends, the raw text grows (a trailing `@k` dropped), the newest
-                    // ring entry takes it, and an `@n` holds the pushes again
-                    self.ring_hold = false;
-                    let prev = std::mem::take(&mut self.msg_text);
-                    let base = prev.strip_suffix("@k").unwrap_or(&prev).to_string();
-                    let (raw_text, code) = raw_message(a, &base);
-                    self.msg_text = raw_text;
-                    let (text, wait) = message_end(&self.resolve_text(a));
-                    self.append_message(&message_end(a).0, wait);
-                    if !wait {
-                        // sub_6E950 sets bit 1 but plays no voice
-                        self.wait = Wait::Message { voice: false };
-                    }
-                    // the text hooker gets the addition (the message itself went out already)
-                    crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.pc as u64);
-                    if !wait {
-                        self.wait = Wait::None;
-                    }
-                    self.update_message_entry();
-                    self.ring_hold = code == Some(b'n');
+                // `_MSAD()` (36 in the scripts, closing `@n` chains) appends nothing but still ends like any MSAD
+                // without a code: sub_6E950 stops its copy at the `)` and sets the click wait (0x500)
+                let a = c.args.first().map(String::as_str).unwrap_or("");
+                // sub_6E950: the push hold ends, the raw text grows (a trailing `@k` dropped), the newest
+                // ring entry takes it, and an `@n` holds the pushes again
+                self.ring_hold = false;
+                let prev = std::mem::take(&mut self.msg_text);
+                let base = prev.strip_suffix("@k").unwrap_or(&prev).to_string();
+                let (raw_text, code) = raw_message(a, &base);
+                self.msg_text = raw_text;
+                let (text, wait) = message_end(&self.resolve_text(a));
+                self.append_message(&message_end(a).0, wait);
+                if !wait {
+                    // sub_6E950 sets bit 1 but plays no voice
+                    self.wait = Wait::Message { voice: false };
                 }
+                // the text hooker gets the addition (the message itself went out already)
+                if !text.is_empty() {
+                    crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.pc as u64);
+                }
+                self.update_message_entry();
+                self.ring_hold = code == Some(b'n');
             }
 
             // choices
@@ -2044,29 +2298,34 @@ impl Game {
                     let range = if l < 0 { 0..crate::stage::LAYERS } else { l as usize..l as usize + 1 };
                     for i in range {
                         self.stage.kept[i] = Some(self.kept_of(i));
+                        // the render rule (+280) goes at once; the image leaves the render at the commit
+                        self.stage.rules[i] = None;
                     }
                     self.stage.clear(l);
+                    // word 0x7CA: the dispatch presents the stage as it returns
+                    self.stage_dirty = true;
                 }
             }
-            // SACL(layer = 0, on = 0) (inline 0x7af80): stage byte +0x54 bit 0x40
+            // SACL(layer = 0, on = 0) (inline 0x7af80): stage byte +0x54 bit 0x40, drawn from the next commit
             "SACL" => {
                 let on = c.int_or(1, 0) != 0;
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
-                    l.absolute = on;
+                    l.staged.absolute = Some(on);
                 }
             }
-            // SBAS(layer = 0, base = -1) (inline 0x7afec): stage word 0x93C / 2 + layer
+            // SBAS(layer = 0, base = -1) (inline 0x7afec): stage word 0x93C / 2 + layer, drawn from the next commit
             "SBAS" => {
                 let b = c.int_or(1, -1);
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
-                    l.base = usize::try_from(b).ok().filter(|&b| b < crate::stage::LAYERS);
+                    l.staged.base = Some(usize::try_from(b).ok().filter(|&b| b < crate::stage::LAYERS));
                 }
             }
-            // STCP(layer = 0, prio = 0) (sub_62A40): stage word 282 + layer
+            // STCP(layer = 0, prio = 0) (sub_62A40): stage word 282 + layer; sub_5D3A0 -> sub_32450 draws it from
+            // the next commit, so STCP(l, 0) before a wait leaves the layer up until then
             "STCP" => {
                 let p = c.int_or(1, 0);
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
-                    l.prio = p;
+                    l.staged.prio = Some(p);
                 }
             }
             // STZ4(layer = 0, zx0, zy0, zx1, zy1, ms, ease, flag) (sub_62D20 -> sub_31F30): zoom x1000 over
@@ -2110,9 +2369,11 @@ impl Game {
                 let frames = c.int(3).map_or(0, |ms| 60 * ms / 1000);
                 let ease = c.int_or(4, 0);
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
-                    let from = c.int(1).map_or(l.rotation.to, |v| v as f32 / 100.0);
+                    // the default start is the stage rotation (dword 161), which STRT then sets to the target
+                    let from = c.int(1).map_or(l.stage_rot.unwrap_or(l.rotation.to), |v| v as f32 / 100.0);
                     let to = c.int_or(2, 0) as f32 / 100.0;
                     l.rotation = Tween::new(from, to, frames, ease);
+                    l.stage_rot = None;
                 }
             }
             // STGS(layer = 0, from = last target, to = 0, ms, ease) (sub_637A0 -> sub_32820): alpha 0..255,
@@ -2126,9 +2387,12 @@ impl Game {
                     l.alpha = Tween::new(from as f32 / 255.0, to as f32 / 255.0, frames, ease);
                 }
             }
-            // STPV(layer, px, py, rot) (sub_639A0): set the pivot (stage anchor, render floats 25 / 26) in script
-            // units, scaled by the image level and offset by a variant's centre; the quad offset stays, so the
-            // image does not move, but zoom and rotation turn about the new point. Arg 3 sets the rotation.
+            // STPV(layer, px, py, rot) (sub_639A0): set the pivot (stage anchor floats 221 / 261, and the render
+            // pivot through sub_32BD0) in script units, scaled by the image level and offset by a variant's
+            // centre. The render quad offset stays, so the image does not move until the next commit, but zoom
+            // and rotation turn about the new point; the stage shift word becomes (int)-pivot, which the commit
+            // (sub_5D3A0) makes the render offset, putting the pivot on the layer's position. Arg 3 sets the
+            // stage rotation only.
             "STPV" => {
                 let li = c.int_or(0, -1);
                 let delta = self.stage.get(li).map(|l| l.name.clone()).map_or((0.0, 0.0), |n| self.variant_delta(&n));
@@ -2137,16 +2401,18 @@ impl Game {
                         Source::Image(img) => (img.anchor(), img.level),
                         Source::Color(_) => ([0.0; 2], 1.0),
                     };
-                    let mut piv = l.pivot.unwrap_or(centre);
+                    let mut piv = l.stage_pivot.unwrap_or(centre);
                     if let Some(v) = c.int(1) {
                         piv[0] = v as f32 * 1.875 / 0.46875 * k * 0.33333 + delta.0;
                     }
                     if let Some(v) = c.int(2) {
                         piv[1] = v as f32 * 1.875 * 576.0 / 272.0 * k * 362.0 / 1080.0 + delta.1;
                     }
+                    l.stage_pivot = Some(piv);
                     l.pivot = Some(piv);
+                    l.stage_shift = Some([(-piv[0]).trunc(), (-piv[1]).trunc()]);
                     if let Some(rot) = c.int(3) {
-                        l.rotation = Tween::fixed(rot as f32 / 100.0);
+                        l.stage_rot = Some(rot as f32 / 100.0);
                     }
                 }
             }
@@ -2186,13 +2452,13 @@ impl Game {
                     self.rebake(r, c.int_or(0, -1));
                 }
             }
-            // STBR(layer = 0, mode = 0, override) (sub_62490): a non-negative arg 2 replaces the mode
+            // STBR(layer = 0, mode = 0, override) (sub_62490): a non-negative arg 2 replaces the mode; stage byte 124,
+            // drawn from the next commit (sub_322E0)
             "STBR" => {
                 let mode = c.int(2).filter(|&v| v >= 0).map_or(c.int_or(1, 0), |v| v & 0xff);
                 let (blend, _) = blend_mode(mode);
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
-                    l.blend = blend;
-                    l.stbr = mode;
+                    l.staged.stbr = Some((mode, blend));
                 }
             }
             // MSQK(ms = 1000, ax = 5, ay = 5) (0x77d8c -> sub_39110(ms, ay, ax)): shake the message text
@@ -2242,26 +2508,52 @@ impl Game {
                     }
                 }
             }
+            // FADS (0x77a40): in the seek or while a rewind is held the capture and counts clear and the script goes
+            // on (0x77a58). Otherwise it runs again every frame (loc_7FEF4 returns the command itself):
+            // - first run: the screen is captured (sub_A4560). A stage whose images changed since it was presented
+            //   (sub_2E0B0; knife: a pending layer) is presented under the capture (sub_5D3A0(1, -1)), which stays
+            //   drawn while dword_146E660 counts a frame, so the transition starts two frames later; otherwise
+            //   it starts now
+            // - the start (sub_60610 once sub_B6920 reports the images loaded): the transition, its flag and the
+            //   window flags; an instant one draws the capture once more when the last FADS left a rule loaded
+            // - the run after the transition flag clears ends it, and script_dispatch returns with the next
+            //   command (loc_80260)
+            // So the command after an instant FADS of a changed stage runs four frames later, the new stage
+            // showing in the third.
             "FADS" => {
-                let mode = c.int_or(0, 1);
-                let dur = c.int_or(1, 0) as f32;
-                let rule = c.int_or(2, 0);
-                self.stage.commit();
-                self.stage_dirty = false;
-                // sub_60610 copies the committed stage into the backup
-                self.stage_backup = Some(self.stage_bytes());
-                if mode == 1 || dur <= 0.0 || self.skip {
-                    self.trans = None;
-                } else {
-                    // sub_47DD0: only mode 2 draws the old frame through the rule (sub_A48C0); mode 0 is a
-                    // crossfade (sub_A46F0) even with a rule loaded
-                    let rule = (mode == 2 && rule > 0)
-                        .then(|| self.assets.image(r, &format!("RULE_{rule:02}")))
-                        .flatten()
-                        .map(|i| i.tex.clone());
-                    self.snapshot = true;
-                    self.trans = Some(Transition { dur, t: 0.0, rule });
-                    self.wait = Wait::Transition;
+                if self.seek_node || self.rewinding {
+                    self.fads = None;
+                    self.fads_start(r, c);
+                    return;
+                }
+                match self.fads {
+                    None => {
+                        self.snapshot = true;
+                        if self.stage.layers.iter().flatten().any(|l| l.pending) {
+                            self.stage.commit();
+                            self.stage_dirty = false;
+                            self.trans = Some(Transition::hold());
+                            self.fads = Some(Fads { hold: 1, started: false });
+                        } else {
+                            self.fads_start(r, c);
+                        }
+                    }
+                    Some(Fads { hold, started: false }) if hold > 0 => {
+                        self.fads = Some(Fads { hold: hold - 1, started: false });
+                    }
+                    Some(Fads { started: false, .. }) => self.fads_start(r, c),
+                    Some(Fads { started: true, .. }) => {
+                        self.fads = None;
+                        if self.trans.as_ref().is_some_and(|t| t.hold) {
+                            self.trans = None;
+                        }
+                        self.dispatch_return = true;
+                        return;
+                    }
+                }
+                if self.fads.is_some() {
+                    self.pc -= 1;
+                    self.dispatch_return = true;
                 }
             }
             // SSW2(layer = 0, amp_min = 7, amp_max = 15, period_min_ms = 1000, period_max_ms = 2000, strength = 1,
@@ -2327,7 +2619,7 @@ impl Game {
                 let li = c.int_or(0, 0);
                 let off = (c.int_or(3, 0) as i16, c.int_or(4, 0) as i16);
                 if let Some(l) = self.stage.get(li) {
-                    l.soxy = off;
+                    l.staged.soxy = Some(off);
                 }
             }
             // FCLN (sub_92120): only arg 5 counts, the effect (the others repeat its table entry); stage byte
@@ -2379,21 +2671,34 @@ impl Game {
             "STNS" => {
                 self.load_noise(r);
                 let n = c.int_or(1, 0);
-                if let Some(l) = self.stage.get(c.int_or(0, -1)) {
+                if let Some(l) = self.stage.get(c.int_or(0, 0)) {
                     l.noise = (n > 0).then_some(n);
+                }
+                // sub_648A0 sets word 0x7CA for a layer 0..39: the dispatch presents the stage as it returns
+                if (0..=39).contains(&c.int_or(0, 0)) {
+                    self.stage_dirty = true;
                 }
             }
             // STTR(layer, rule): following alpha fades wipe through RULE_nn; -1/0 clears
+            // STTR(layer = 0, rule = 0, b = 0) (inline 0x7b188): stage word 1142 = (rule - 1) | (b << 12), -1 for no
+            // rule; the same word goes to render +280 at once when the slot shows an image (render +12), and
+            // nothing else ever copies it there (sub_36520 passes (word >> 12) & 7; a negative word is no rule)
             "STTR" => {
-                let n = c.int_or(1, -1);
-                let tex = (n > 0)
-                    .then(|| self.assets.image(r, &format!("RULE_{n:02}")))
-                    .flatten()
-                    .map(|i| (n, i.tex.clone()));
-                if let Some(l) = self.stage.get(c.int_or(0, -1)) {
-                    l.rule = tex;
-                    // cmd_STCH_impl stores (rule - 1) | (b << 12); sub_36520 passes (word >> 12) & 7
-                    l.rule_flip = (c.int_or(2, 0) & 7) as u8;
+                let li = c.int_or(0, 0);
+                let (n, b) = (c.int_or(1, 0), c.int_or(2, 0));
+                if !(0..=39).contains(&li) {
+                    return;
+                }
+                let word = if n >= 1 { ((n - 1) & 0xffff | b << 12) as i16 } else { -1 };
+                if let Some(l) = self.stage.get(li) {
+                    l.rule = (word >= 0).then_some(n);
+                    l.rule_flip = (word.max(0) >> 12 & 7) as u8;
+                }
+                if self.stage.shown[li as usize] {
+                    self.stage.rules[li as usize] = (word >= 0)
+                        .then(|| self.assets.rule(r, &format!("RULE_{:02}", (word & 0xfff) + 1)))
+                        .flatten()
+                        .map(|i| crate::stage::RenderRule { tex: i.tex.clone(), flip: (word >> 12 & 7) as u8 });
                 }
             } // per-layer effect seed for the sway/raster animation; no visible effect alone
             // SQK2(layer = 0, ax = 15, ay = 15, period_ms, dur_ms = -1, delay_ms, follow, ramp_ms) (sub_91540):
@@ -2463,12 +2768,13 @@ impl Game {
                     self.rebake(r, li);
                 }
             }
-            // STRR(layer, r) (sub_633D0): the clip rotation its children are composited with; -99999 stores
-            // -32768, which follows the child's own rotation
+            // STRR(layer = 0, r) (sub_633D0): the clip rotation its children are composited with; -99999 stores
+            // -32768, which follows the child's own rotation. Stage word 1522 only, drawn from the next commit
+            // (sub_5D3A0 -> render +328)
             "STRR" => {
                 let v = c.int_or(1, 0);
-                if let Some(l) = self.stage.get(c.int_or(0, -1)) {
-                    l.rot2 = if c.int(1).is_none() { 0 } else if v == -99999 { i16::MIN } else { wrap_rot2(v) };
+                if let Some(l) = self.stage.get(c.int_or(0, 0)) {
+                    l.staged.rot2 = Some(if c.int(1).is_none() { 0 } else if v == -99999 { i16::MIN } else { wrap_rot2(v) });
                 }
             }
             "SNX4" | "FANX" | "STQK" | "TRPY" => {}
@@ -2484,7 +2790,7 @@ impl Game {
             },
 
             // audio
-            "SEPL" | "SEFD" | "SESP" | "SEVL" => self.cmd_se(c, false),
+            "SEPL" | "SEFD" | "SESP" | "SEVL" => self.cmd_se(c),
             // MPLY(n, key 17 volume = 100, key 1 fade-in ms, key 11 fade-out ms, key 69 start sample) (sub_649E0):
             // a track already playing is left alone; with a fade-in the old track fades out at 1666.7 / (key 11
             // or key 1) volume points a frame while the new one rises at 1666.7 / key 1 (so key 1 ms at full
@@ -2675,17 +2981,27 @@ impl Game {
                     self.scene_msgs = 2;
                 }
             }
-            // RDAS(n) (0x79b78 -> sub_92580): with the auto skip of read scenes on, a completed node n asks for the
-            // next scene (sub_40ED0 top state 1), unless skipping / seeking (off_AE0568, byte_146E638); the UI
-            // drops it in a gallery flowchart replay (sub_50F0)
+            // RDAS(n) (0x79b78): with the auto skip of read scenes on and node n completed, a mode banner still up
+            // is sent away (sub_3B480: one holding jumps to its fall) and RDAS runs again each frame until it is
+            // gone (sub_3B580; loc_7FEF4 returns the command itself); then sub_92580 asks for the next scene
+            // (sub_40ED0 top state 1, from the next frame) unless the next-scene seek runs (off_AE0568; a skip does
+            // not stop it), and the dispatch goes on to the next wait. In a gallery flowchart replay (sub_50F0)
+            // RDAS does nothing. The seek loop does not step the banner (sub_3C970 runs once a frame after
+            // sub_40ED0), so knife only waits for it outside the seek.
             "RDAS" => {
                 if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n))
                     && self.settings.auto_skip_read
-                    && !self.seek_node
-                    && !self.skip
+                    && !self.flow_replay
+                    && !self.skip_all
                     && get_bit(&self.endings, n as usize)
                 {
-                    self.auto_skip_hit = true;
+                    if self.banner_up && !self.seek_node {
+                        self.banner_away = true;
+                        self.pc -= 1;
+                        self.dispatch_return = true;
+                    } else if !self.seek_node {
+                        self.auto_skip_hit = true;
+                    }
                 }
             }
             "NOP_" | "WTSV" => {}
@@ -2787,7 +3103,7 @@ impl Game {
 
     /// sub_ACFA0(n): system sound n on the SE volume through the sub_CA0 curve.
     fn play_se_sound(&mut self, n: usize) {
-        let vol = volume_curve(self.sound.se_volume());
+        let vol = knife_audio::volume_curve(self.sound.se_volume());
         if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|&id| self.assets.sound_effect_id(id)) {
             self.sound.play_sys(1, pcm, vol);
         }
@@ -2852,15 +3168,7 @@ impl Game {
         match self.assets.sar.stream_sound(n as usize - 1) {
             Ok(s) => {
                 let path = self.assets.romfs.join(&s.path);
-                let base = s.volume;
-                let loop_range = s.loop_range;
-                self.sound.play_bgm(n, vol, fade, start, move || {
-                    let data = std::fs::read(&path)?;
-                    let mut pcm = knife_audio::codec::decode_nopus(&data)?;
-                    let len = pcm.frames.len();
-                    pcm.loop_range = Some(loop_range.map_or((0, len), |(a, b)| (a.min(len), b.min(len))));
-                    Ok((pcm, base))
-                });
+                self.sound.play_bgm(n, vol, fade, start, path, s.loop_range);
             }
             Err(e) => tracing::warn!("MPLY {n}: {e:#}"),
         }
@@ -2884,18 +3192,8 @@ impl Game {
         let unsigned = |i: usize| arg(i).is_none_or(|l| (0..=39).contains(&l));
         let name = c.name.as_str();
         match name {
-            "FADS" => {
-                for f in ["F996", "F997", "F985"] {
-                    self.set_var(f, 0);
-                }
-                // sub_60610: arg 3 = 1 hides the text until the next message; 2 too when the fade lasts 2+ ms
-                // and no content fade runs (config byte 99, 1 unless a whole-config copy changes it)
-                let wnd = arg(3).unwrap_or(-1);
-                if wnd == 1 || (wnd == 2 && arg(1).unwrap_or(0) >= 2 && self.page.dim_vel == 0.0) {
-                    self.set_var("F1103", 1);
-                }
-                return;
-            }
+            // FADS: `fads_start`, once its transition starts
+            "FADS" => return,
             // sub_99620: the same switch in arg 2, without the duration
             "STMA" if matches!(arg(2), Some(1)) || (arg(2) == Some(2) && self.page.dim_vel == 0.0) => {
                 self.set_var("F1103", 1);
@@ -2951,101 +3249,272 @@ impl Game {
         }
     }
 
-    /// VPLY / MSAD / WTTM / `_Z` commands: a stage changed since the backup becomes the backup.
-    /// SEPL / SEFD / SEVL (sub_6A340 / sub_6B310 / sub_6AE10). With a delay (key 68, ms, past the first
-    /// argument) outside a seek (off_AE0568 / AE0900), sub_66200 queues the command on its channel (all 20
-    /// for -1) for ceil(ms * 60 / 1000) frames (at least 1); an op already queued there runs at once first. sub_65E50 counts
-    /// the frames down and sub_65A60 runs it.
-    fn cmd_se(&mut self, c: &Command, delayed: bool) {
+    /// Whether speaker row `key70 - 1` has its voice on (SEPL key 70: voices on and the row's bit set in the
+    /// config, off_AE03D8 + 6 / + 0x24); a key outside the rows reads off.
+    fn se_speaker_on(&self, key70: i32) -> bool {
+        usize::try_from(key70 - 1).is_ok_and(|r| r < 19 && self.settings.voice_on && self.settings.char_mute >> r & 1 == 0)
+    }
+
+    /// SEPL / SEFD / SEVL / SESP (sub_6A340 / sub_6B310 / sub_6AE10 / 0x7a6f4). With a delay (key 68, ms, past
+    /// the first argument) outside a seek (off_AE0568 / AE0900), sub_66200 queues the command on its channel (all
+    /// 20 for a negative one) for (3 ms + 49) / 50 frames (1 for -32..0); an op already queued there runs at once
+    /// first. sub_65E50 counts the frames down and sub_65A60 runs it (`run_se_queued`).
+    fn cmd_se(&mut self, c: &Command) {
         let ch = c.int_or(0, if c.name == "SEPL" { 0 } else { -1 });
-        // the next-scene seek only records the channel words
-        if let Some(sa) = &mut self.seek_audio {
-            match c.name.as_str() {
-                "SEPL" if c.int_or(1, 0) != 0 => {
-                    if let Some(n) = c.arg(2) {
-                        sa.loops.insert(ch, (n.to_string(), c.keyed_int(17).unwrap_or(100) as f32 / 100.0));
-                    }
-                }
-                "SEVL" => {
-                    let v = c.keyed_int(17).unwrap_or(0) as f32 / 100.0;
-                    for (k, l) in sa.loops.iter_mut() {
-                        if ch < 0 || *k == ch {
-                            l.1 = v;
-                        }
-                    }
-                }
-                _ if ch < 0 => sa.loops.clear(),
-                _ => {
-                    sa.loops.remove(&ch);
+        let seek = self.seek_audio.is_some();
+        if c.name == "SESP" {
+            // SESP(ch % 20, all 20 when negative) clears the channel's loop words and drops its queued op unrun;
+            // outside the seek it stops the channel at once (sub_9CF90). The volume word stays.
+            let k = ch % 20;
+            self.se_delayed.retain(|d| k >= 0 && d.0.channel != k);
+            for k in if k < 0 { 0..20 } else { k..k + 1 } {
+                if let Some(sa) = &mut self.seek_audio {
+                    sa.loops.remove(&k);
+                } else {
+                    self.sound.stop_se(k);
                 }
             }
             return;
         }
-        if !delayed
-            && c.name != "SESP"
-            && let Some(ms) = c.keyed_int(68)
-        {
+        if !seek && let Some(ms) = c.keyed_int(68) {
             let frames = if (-32..=0).contains(&ms) { 1 } else { (3 * ms + 49) / 50 };
-            let chs: Vec<i32> = if ch < 0 { (0..20).collect() } else { vec![ch % 20] };
-            for k in chs {
-                if let Some(i) = self.se_delayed.iter().position(|d| d.0 == k) {
-                    let (_, _, old) = self.se_delayed.remove(i);
-                    self.cmd_se(&old, true);
+            let kind = match c.name.as_str() {
+                "SEPL" => 1,
+                "SEFD" => 2,
+                _ => 3,
+            };
+            for k in if ch < 0 { 0..20 } else { ch % 20..ch % 20 + 1 } {
+                if let Some(i) = self.se_delayed.iter().position(|d| d.0.channel == k) {
+                    let (old, _, _) = self.se_delayed.remove(i);
+                    self.run_se_queued(&old);
                 }
-                let mut one = c.clone();
-                if ch < 0 {
-                    one.args[0] = k.to_string();
-                }
-                self.se_delayed.push((k, frames as f32 * 1000.0 / 60.0, one));
+                let key = |n| c.keyed_int(n);
+                let q = SeQueued {
+                    channel: k,
+                    frames: frames as i16,
+                    kind,
+                    name: (kind == 1).then(|| c.arg(2).map(str::to_string)).flatten(),
+                    fade: if kind == 1 || kind == 2 || kind == 3 { key(1).unwrap_or(-1) } else { -1 },
+                    volume: if kind != 2 { key(17).map_or(-1, |v| v as i8) } else { -1 },
+                    looping: kind == 1 && c.int_or(1, 0) != 0,
+                    pan: if kind == 1 { key(18).map_or(-1, |v| v as i16) } else { -1 },
+                    speaker: if kind == 1 { key(70).unwrap_or(0) } else { 0 },
+                };
+                self.se_delayed.push((q, (frames - 1) as f32 * 1000.0 / 60.0, true));
             }
             return;
         }
-        let fade = c.keyed_int(1).unwrap_or(0) as f64 / 1000.0;
+        let fade = c.keyed_int(1).unwrap_or(0);
         match c.name.as_str() {
-            // sub_6A340: a looping SE already looping on the channel is left alone; under the fast skip
-            // (AE0670) a one-shot SE does not play and stops the channel's loop
             "SEPL" => {
-                let looping = c.int_or(1, 0) != 0;
-                if let Some(n) = c.arg(2) {
-                    let vol = c.keyed_int(17).unwrap_or(100) as f32 / 100.0;
-                    if looping && self.sound.looping_on(ch).is_some_and(|l| l.0 == n && l.1 > 0.0) {
-                        return;
+                let ch = ch % 20;
+                let looping = c.int_or(1, 0) == 1;
+                let Some(name) = c.arg(2) else {
+                    // no sound: the channel stops (sub_9CF90) and its loop word clears
+                    if seek {
+                        self.seek_audio.as_mut().unwrap().loops.remove(&ch);
+                    } else {
+                        self.sound.stop_se(ch);
                     }
-                    if self.skip && !looping {
-                        if self.sound.looping_on(ch).is_some() {
-                            self.sound.stop_se(ch, 0.0);
+                    return;
+                };
+                let raw = c.keyed_int(17);
+                let mut vol = raw.unwrap_or(100).clamp(0, 100);
+                let mut word = raw.map_or(100, |v| v as i16);
+                let pan = c.keyed_int(18).map_or(0, |p| (1000 * p - 64000) / 64);
+                // a loop already looping on the channel at a volume is left alone; under the fast skip (AE0670) a
+                // one-shot SE does not play and stops the channel's loop (both also during the seek, on its words)
+                let cur_loop = match &self.seek_audio {
+                    Some(sa) => sa.loops.get(&ch).map(|l| l.0.clone()),
+                    None => self.sound.looping_on(ch).map(str::to_string),
+                };
+                if looping && cur_loop.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(name)) && self.sound.se_word[ch as usize] > 0 {
+                    return;
+                }
+                if !looping && self.skip {
+                    match &mut self.seek_audio {
+                        Some(sa) => {
+                            sa.loops.remove(&ch);
                         }
-                        return;
+                        None if cur_loop.is_some() => self.sound.stop_se(ch),
+                        None => {}
                     }
-                    if let Some(pcm) = self.assets.sound_effect(n) {
-                        self.sound.play_se(ch, n, pcm, vol, fade, looping);
+                    return;
+                }
+                if let Some(sa) = &mut self.seek_audio {
+                    if looping {
+                        sa.loops.insert(ch, (name.to_string(), 0.0));
+                    } else {
+                        sa.loops.remove(&ch);
                     }
+                }
+                // 0x6ac64: key 70 binds the channel to that speaker (sub_9CF70; 0 otherwise); with voices off
+                // or the speaker's voice off the volume and its word become 0
+                let speaker = c.keyed_int(70);
+                if speaker.is_some_and(|s| !self.se_speaker_on(s)) {
+                    vol = 0;
+                    word = 0;
+                }
+                self.sound.bind_speaker(ch, speaker.and_then(|s| usize::try_from(s - 1).ok()).filter(|&r| r < 19));
+                if seek {
+                    let sa = self.seek_audio.as_mut().unwrap();
+                    if let Some(l) = sa.loops.get_mut(&ch) {
+                        l.1 = f32::from(word) / 100.0;
+                    }
+                } else {
+                    // a fade-in (key 1 given, even 0) on a channel still fading out takes a second longer
+                    let fade = if c.keyed_int(1).is_some() && self.sound.se_state(ch) == 2 { fade + 1000 } else { fade };
+                    if let Some(pcm) = self.assets.sound_effect(name) {
+                        let fade = if fade < 2 { 0.0 } else { f64::from(fade) / 1000.0 };
+                        self.sound.play_se(ch, name, pcm, vol as f32 / 100.0, fade, looping, pan as f32 / 1000.0);
+                    } else {
+                        self.sound.stop_se(ch);
+                    }
+                }
+                self.sound.se_word[ch as usize] = word;
+                // the pan word (a queued SEPL plays with its pan but leaves the word)
+                self.sound.se_pan[ch as usize] = pan as i16;
+            }
+            "SEFD" => {
+                for k in if ch % 20 < 0 { 0..20 } else { ch % 20..ch % 20 + 1 } {
+                    // a queued SEPL on the channel is dropped (a queued slot's counter is still >= 1)
+                    self.se_delayed.retain(|d| !(d.0.channel == k && d.0.kind == 1));
+                    if let Some(sa) = &mut self.seek_audio {
+                        sa.loops.remove(&k);
+                    } else if fade < 1 {
+                        self.sound.stop_se(k);
+                    } else {
+                        // sub_9D020: from the player's current volume to 0 over the fade
+                        let cur = self.sound.se_player_volume(k) * 100.0;
+                        self.sound.forget_loop(k);
+                        self.sound.fade_se(k, cur * 1000.0 / 60.0 / fade as f32);
+                    }
+                    self.sound.se_word[k as usize] = 0;
                 }
             }
             "SEVL" => {
-                if let Some(v) = c.keyed_int(17) {
-                    self.sound.set_se_volume(ch, v as f32 / 100.0, fade);
+                let k = ch % 20;
+                let Ok(ku) = usize::try_from(k) else { return };
+                let mut vol = c.keyed_int(17).unwrap_or(0).clamp(0, 100);
+                // a queued SEPL on the channel takes the volume instead
+                if let Some(d) = self.se_delayed.iter_mut().find(|d| d.0.channel == k && d.0.kind == 1) {
+                    d.0.volume = vol as i8;
+                    return;
+                }
+                if self.sound.chan_speaker(k).is_some_and(|r| !self.se_speaker_on(r as i32 + 1)) {
+                    vol = 0;
+                }
+                if !seek {
+                    let rate = if fade < 1 {
+                        2000.0
+                    } else {
+                        (vol - i32::from(self.sound.se_word[ku])) as f32 * 1000.0 / 60.0 / fade as f32
+                    };
+                    self.sound.ramp_se(k, vol as f32 / 100.0, rate);
+                    self.sound.se_word[ku] = vol as i16;
                 }
             }
-            _ => self.sound.stop_se(ch, fade),
+            _ => {}
         }
     }
 
+    /// sub_65A60: a queued SE op runs (its slot then clears).
+    fn run_se_queued(&mut self, q: &SeQueued) {
+        let (ch, chu) = (q.channel, q.channel as usize);
+        let seek = self.seek_audio.is_some();
+        let word = i32::from(self.sound.se_word[chu]);
+        match q.kind {
+            // sub_65780
+            1 => {
+                let Some(name) = q.name.as_deref() else {
+                    self.sound.stop_se(ch);
+                    return;
+                };
+                if seek {
+                    let sa = self.seek_audio.as_mut().unwrap();
+                    if q.looping {
+                        sa.loops.insert(ch, (name.to_string(), f32::from(self.sound.se_word[chu]) / 100.0));
+                    } else {
+                        sa.loops.remove(&ch);
+                    }
+                    return;
+                }
+                if !q.looping && self.skip {
+                    if self.sound.looping_on(ch).is_some() {
+                        self.sound.stop_se(ch);
+                    }
+                    return;
+                }
+                let mut vol = i32::from(q.volume);
+                if q.speaker >= 1 && !self.se_speaker_on(q.speaker) {
+                    vol = 0;
+                }
+                self.sound.bind_speaker(ch, usize::try_from(q.speaker - 1).ok().filter(|&r| r < 19));
+                let fade = if q.fade < 1 {
+                    0
+                } else if self.sound.se_state(ch) == 2 {
+                    q.fade + 1000
+                } else {
+                    q.fade
+                };
+                let pan = if q.pan < 0 { 0 } else { (1000 * i32::from(q.pan) - 64000) / 64 };
+                if let Some(pcm) = self.assets.sound_effect(name) {
+                    let secs = if fade < 2 { 0.0 } else { f64::from(fade) / 1000.0 };
+                    self.sound.play_se(ch, name, pcm, vol.clamp(0, 100) as f32 / 100.0, secs, q.looping, pan as f32 / 1000.0);
+                } else {
+                    self.sound.stop_se(ch);
+                }
+                if vol < 0 {
+                    self.sound.se_word[chu] = 100;
+                } else {
+                    // the rate then comes from the volume word: a fade-in to the channel's last volume steps at
+                    // the minimum 0.2 points a frame
+                    self.sound.ramp_se(ch, vol as f32 / 100.0, (vol - word) as f32 * 1000.0 / 60.0 / fade.max(1) as f32);
+                    self.sound.se_word[chu] = vol as i16;
+                }
+            }
+            2 => {
+                if let Some(sa) = &mut self.seek_audio {
+                    sa.loops.remove(&ch);
+                } else if q.fade > 0 && word > 0 {
+                    // sub_9CFE0: the rate from the volume word, not the player's volume
+                    self.sound.forget_loop(ch);
+                    self.sound.fade_se(ch, word as f32 * 1000.0 / 60.0 / q.fade as f32);
+                } else {
+                    self.sound.stop_se(ch);
+                }
+                self.sound.se_word[chu] = 0;
+            }
+            3 if !seek && q.volume >= 0 => {
+                let vol = i32::from(q.volume);
+                self.sound.ramp_se(ch, vol as f32 / 100.0, (vol - word) as f32 * 1000.0 / 60.0 / q.fade.max(1) as f32);
+                self.sound.se_word[chu] = vol as i16;
+            }
+            _ => {}
+        }
+    }
+
+    /// sub_65E50: `ms` of frames pass for the queued SE commands; one queued this frame already had its first
+    /// frame (`se_delayed`). Due ones run (the tolerance keeps f32 steps of 1000 / 60 from adding a frame).
     fn tick_se_delayed(&mut self, ms: f32) {
         if self.se_delayed.is_empty() {
             return;
         }
         for d in &mut self.se_delayed {
-            d.1 -= ms;
+            d.1 -= if std::mem::take(&mut d.2) { (ms - 1000.0 / 60.0).max(0.0) } else { ms };
         }
-        let due: Vec<Command> = self
-            .se_delayed
-            .extract_if(.., |d| d.1 <= 0.0)
-            .map(|d| d.2)
-            .collect();
-        for c in due {
-            self.cmd_se(&c, true);
+        let due: Vec<SeQueued> = self.se_delayed.extract_if(.., |d| d.1 <= 0.01).map(|d| d.0).collect();
+        for q in due {
+            self.run_se_queued(&q);
         }
+    }
+
+    /// The queued SE commands as a save keeps them (the exe's frame counters before this frame's count-down).
+    fn se_queue_save(&self) -> Vec<SeQueued> {
+        self.se_delayed
+            .iter()
+            .map(|(q, ms, fresh)| SeQueued { frames: ((ms * 60.0 / 1000.0).round() as i16 + i16::from(*fresh)).max(1), ..q.clone() })
+            .collect()
     }
 
     /// VPLY / MSAD / WTTM / `_ZY` (0x78174 / 0x7f498 / 0x7f4f0 / 0x78f40) also push a type 9 ring entry.
@@ -3098,7 +3567,7 @@ impl Game {
         };
         let x = c.int(2).map(|v| v as f32).or(prev.as_ref().map(|p| p.x.value_x())).unwrap_or(240.0);
         let y = c.int(3).map(|v| v as f32).or(prev.as_ref().map(|p| p.y.value())).unwrap_or(136.0);
-        let prio = c.int(6).or(prev.as_ref().map(|p| p.prio)).unwrap_or(li * 10);
+        let prio = c.int(6).or(prev.as_ref().map(|p| p.stage_prio())).unwrap_or(li * 10);
         // the exe marks shown images in a persistent bitmap (sub_774F0) for gallery unlocks, BLACK and WHITE
         // (table indices 0 and 5) too
         if let Some(b) = self.seen_bit(variant.as_deref().unwrap_or(&upper)) {
@@ -3110,10 +3579,17 @@ impl Game {
             l.zoom_y = Tween::fixed(p.zoom_y.value());
             l.alpha = Tween::fixed(p.alpha.value());
             l.rotation = Tween::fixed(p.rotation.value_rot());
-            l.parent = p.parent;
-            l.rot2 = p.rot2;
+            l.stage_rot = p.stage_rot;
+            // without a source layer cmd_STCH_impl resets the clip parent (word 1102) to -1 and the SACL byte,
+            // but leaves the SBAS base (1182), the clip words (651..), inset and SOXY as the slot had them
+            if src_layer.is_some() {
+                l.parent = p.parent;
+            }
+            l.base = p.stage_base();
+            l.clip = p.clip;
+            l.rot2 = p.stage_rot2();
             l.clip_inset = p.clip_inset;
-            l.soxy = p.soxy;
+            l.soxy = p.stage_soxy();
             // a source layer's quake slots come along; otherwise cmd_STCH_impl clears them
             if src_layer.is_some() {
                 l.quake = p.quake;
@@ -3124,10 +3600,12 @@ impl Game {
             if src_layer.is_some()
                 && let (Source::Image(si), Source::Image(img)) = (&p.source, &l.source)
             {
-                let sp = p.pivot.unwrap_or(si.anchor());
+                let sp = p.stage_pivot.unwrap_or(si.anchor());
                 let moved = [sp[0] - si.center_x + img.center_x, sp[1] - si.center_y + img.center_y];
-                l.pivot = Some(moved);
-                l.shift = Some([-moved[0].trunc(), -moved[1].trunc()]);
+                l.stage_pivot = Some(moved);
+                l.stage_shift = Some([-moved[0].trunc(), -moved[1].trunc()]);
+                l.pivot = l.stage_pivot;
+                l.shift = l.stage_shift;
             }
             // the commit reloads the texture only when the layer's image changes
             if src_layer.is_none() && p.name == l.name && (!p.pending || p.keeps_texture) {
@@ -3145,7 +3623,7 @@ impl Game {
                 l.stec_mode = p.stec_mode;
                 l.stec_color = p.stec_color;
                 l.snx = p.snx;
-                if !p.bake.is_none()
+                if p.bake.cpu()
                     && let Source::Image(_) = l.source
                     && let Some(img) = self.assets.image_graded(r, &l.name, p.bake)
                 {
@@ -3170,24 +3648,30 @@ impl Game {
         if let Some(p) = c.int(11) {
             l.parent = (p >= 0).then_some(p as usize);
         }
-        if let (Some(x), Some(y), Some(w), Some(h)) = (c.int(12), c.int(13), c.int(14), c.int(15)) {
-            l.clip = Some(crate::stage::ClipRect {
-                x: x as f32,
-                y: y as f32,
-                w: w as f32,
-                h: h as f32,
-                ..Default::default()
-            });
-        } else if let Some(p) = &prev
-            && src_layer.is_some()
-        {
-            l.clip = p.clip;
+        // args 12..15 each replace one clip word
+        let clip_args = [c.int(12), c.int(13), c.int(14), c.int(15)];
+        if clip_args.iter().any(Option::is_some) {
+            let mut cr = l.clip.unwrap_or_default();
+            for (v, a) in [&mut cr.x, &mut cr.y, &mut cr.w, &mut cr.h].into_iter().zip(clip_args) {
+                if let Some(a) = a {
+                    *v = a as f32;
+                }
+            }
+            l.clip = Some(cr);
         }
         // arg 16: scissor inset (stage word 1462), arg 17: its mode (byte 3004, 0 when absent)
         if let Some(v) = c.int(16) {
             l.clip_inset = v as i16;
         }
         l.clip_mode = c.int_or(17, 0) as i8;
+        // LABEL_245: a layer with a clip parent takes the parent slot's clip words, inset and mode (an SACL child
+        // keeps them; sub_37F50 overwrites the others' at every draw)
+        if let Some(b) = l.parent.filter(|&b| b != li as usize && b < crate::stage::LAYERS) {
+            (l.clip, l.clip_inset, l.clip_mode) = match &self.stage.layers[b] {
+                Some(p) => (p.clip, p.clip_inset, p.clip_mode),
+                None => (None, 0, 0),
+            };
+        }
         // arg 19: the STRR clip rotation (stage word 1522), wrapped to +-180 degrees
         if let Some(v) = c.int(19) {
             l.rot2 = wrap_rot2(v);
@@ -3210,7 +3694,8 @@ impl Game {
 
     /// sub_6E0D0: a voice plays unless voices are off or its speaker's row is muted, at that row's volume.
     /// Neither a message start nor VPL2 (0x7a450) plays one during the next-scene seek (off_AE0568).
-    /// `replay`: it becomes the voice the replay button plays (AE06A8), as at a message start.
+    /// `replay`: it becomes the voice the replay button plays (AE06A8), as at a message start, which first stops
+    /// both voice players (sub_9C3B0); VPL2 leaves the last voice playing.
     fn play_voice(&mut self, n: &str, replay: bool) {
         if self.skip || self.seek_node || !self.settings.voice_on {
             return;
@@ -3223,7 +3708,7 @@ impl Game {
         if self.settings.char_mute >> row & 1 == 0 {
             let gain = self.settings.char_voice.get(row).copied().unwrap_or(1.0);
             match self.assets.voice(n) {
-                Ok(pcm) => self.sound.play_voice_gain(Arc::new(pcm), gain),
+                Ok(pcm) => self.sound.play_voice_gain(Arc::new(pcm), gain, replay),
                 Err(e) => tracing::warn!("voice {n}: {e:#}"),
             }
         }
@@ -3251,11 +3736,12 @@ impl Game {
         }
     }
 
-    /// `name` as the scene voice at voice row `row`'s volume.
+    /// `name` as the scene voice at voice row `row`'s volume, both voice players stopped first (sub_4E170:
+    /// sub_AA9E0 = sub_9C3B0, then sub_AA970).
     pub fn play_test_voice(&mut self, name: &str, row: usize) {
         let gain = self.settings.char_voice.get(row).copied().unwrap_or(1.0);
         match self.assets.voice(name) {
-            Ok(pcm) => self.sound.play_voice_gain(Arc::new(pcm), gain),
+            Ok(pcm) => self.sound.play_voice_gain(Arc::new(pcm), gain, true),
             Err(e) => tracing::warn!("voice {name}: {e:#}"),
         }
     }
@@ -3272,14 +3758,14 @@ impl Game {
         }
     }
 
-    /// sub_2A9B0 with a voice test row held: a muted row stops the scene voice (sub_9C3B0: players 2, 3),
-    /// and the scene voice takes the row's volume (sub_9D240).
+    /// sub_2A9B0 with a voice test row held: a muted row stops the scene voice (sub_9C3B0: players 2, 3).
+    /// sub_9D240 then sets the row's volume on voice player sub_9B5A0() (0 / 1) of the voice group, which no
+    /// voice plays on (scene voices are 2 / 3, sub_9C300; the config test 4), so the scene voice keeps its
+    /// volume; the volume byte it writes (off_AE0350 + 1) is set again before every voice plays.
     pub fn conf_test_row_volume(&mut self, row: usize) {
         if self.settings.char_mute >> row & 1 != 0 {
             self.sound.stop_voice();
         }
-        let gain = self.settings.char_voice.get(row).copied().unwrap_or(1.0);
-        self.sound.set_voice_gain(gain);
     }
 
     /// Config SE test (sub_29140): the last test SE stops (sub_9CF90), then one of the 14 test effects
@@ -3287,13 +3773,13 @@ impl Game {
     /// fade (sub_9CAA0). Returns the channel (qword_46F810), or None when every channel is busy.
     pub fn conf_test_se(&mut self, last: Option<i32>) -> Option<i32> {
         if let Some(ch) = last {
-            self.sound.stop_se(ch, 0.0);
+            self.sound.stop_se(ch);
         }
         let ch = (0..20).find(|&c| !self.sound.se_busy(c))?;
         let name = TEST_SES[self.app_rng.range(0, 13) as usize];
         tracing::debug!("config SE test {name} on channel {ch}");
         let pcm = self.assets.sound_effect(name)?;
-        self.sound.play_se(ch, name, pcm, 1.0, 0.0, false);
+        self.sound.play_se(ch, name, pcm, 1.0, 0.0, false, 0.0);
         Some(ch)
     }
 
@@ -3797,7 +4283,12 @@ impl Game {
         if a > 0.0 {
             let content = 1.0 - self.page.dim;
             let layer = a * (2.0 * (content - 0.5)).clamp(0.0, 1.0);
-            self.window_quads(a, &mut out);
+            // sub_391A0 composites target 29 (the window) only while F1103 is 0, so CLO2 / CLO3 / FADS take the
+            // window away at once and the 64 ms quick hide is not seen (Switch: CLO3 + FADS(1,0,0) in
+            // 001_00_00, the page band gone in the frame the text goes)
+            if self.var("F1103") == 0 {
+                self.window_quads(a, &mut out);
+            }
             let (ox, oy) = self.msg_offset();
             // sub_391A0 composites the window (target 29), then draws the choice (sub_84E50), then composites
             // the text (target 30): the page text stays above the choice backdrop
@@ -3854,7 +4345,7 @@ impl Game {
             // (sub_38EC0 draws nothing while a rewind runs)
             // (the overseas sub_38EC0 also draws nothing in auto mode, word_1916DEC bit 0)
             let auto_hidden = self.assets.build == Build::Overseas && self.auto;
-            if self.wait == Wait::Click && revealed as usize >= self.page.order && !self.rewinding && !auto_hidden {
+            if self.icon_fade > 0.0 && !self.rewinding && !auto_hidden {
                 // sub_38EC0 at the pen + (2, 3.5) units for the F799 line icon (slot 54, lineBreak_a), (2, 5.5)
                 // for the page icon (slot 55, pageBreak_a, at half alpha); F822 != 1 always the page icon at
                 // (2, 6.5). Window types 3..32 draw slot 56 (pageBreak_ciel_a, 59 frames of 43x46) at (4, 4).
@@ -3882,13 +4373,17 @@ impl Game {
                 let (ux, uy) = ((px / UX).trunc(), ((py - lay.ascent) / UY).trunc());
                 let (sx, sy) = shift.unwrap_or((0.0, 0.0));
                 let (x, y) = ((ux + dx) * UX + sx, (uy + dy) * UY + sy);
+                // one animation frame per 2 ticks of a counter that runs only while an icon draws (sub_B0190's
+                // frame ticks, at most 2) and wraps at twice the kind's frames, so each icon starts where the
+                // last one stopped
+                self.icon_ticks = (self.icon_ticks + (self.frame_ms * 0.06).min(2.0)) % (2 * frames) as f32;
                 if let Some(t) = self.disp.get(slot - usize::from(DISP_SLOT0)) {
-                    let frame = ((self.time / 33.3) as u32 % frames) as f32;
+                    let frame = ((self.icon_ticks / 2.0) as u32 % frames) as f32;
                     let tw = t.texture.size().width as f32;
                     let th = t.texture.size().height as f32;
                     let (w, h) = (fw * ICON_SCALE.0, fh * ICON_SCALE.1);
                     out.push(
-                        Quad::rect(t.clone(), [x, y, w, h], [1.0, 1.0, 1.0, alpha * a * content * layer])
+                        Quad::rect(t.clone(), [x, y, w, h], [1.0, 1.0, 1.0, alpha * self.icon_fade * a * content * layer])
                             .with_uv_rect(frame * fw / tw, 0.0, (frame + 1.0) * fw / tw, fh / th),
                     );
                 }
@@ -3913,7 +4408,7 @@ impl Game {
     /// The layers into the stage target, through the layer group surfaces where stage::Draw says so.
     fn render_stage(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
         use crate::stage::Draw;
-        let draws = self.stage.draws(&r.white);
+        let draws = self.stage.draws(&r.white, &self.border);
         let mut run: Vec<Quad> = Vec::new();
         let mut clear = Some([0.0, 0.0, 0.0, 1.0]);
         for d in draws {
@@ -3960,7 +4455,7 @@ impl Game {
         let mut enc = r.encoder();
         self.render_previews(r, &mut enc);
         if self.snapshot {
-            r.copy_target(&mut enc, &self.stage_rt, &self.old_rt);
+            r.copy_target(&mut enc, &self.scene_rt, &self.old_rt);
             self.snapshot = false;
         }
         if let Some(q) = self.stage.noise_pass() {
@@ -3976,21 +4471,20 @@ impl Game {
         }
         self.render_choice_glow(r, &mut enc);
         self.render_stage(r, &mut enc);
-        match &self.trans {
-            Some(t) => {
-                let p = (t.t / t.dur).clamp(0.0, 1.0);
-                let rule = t.rule.clone();
-                r.transition(&mut enc, &self.canvas, &self.old_rt.tex, &self.stage_rt.tex, rule.as_deref(), p);
-            }
-            None => r.copy_target(&mut enc, &self.stage_rt, &self.canvas),
-        }
+        // Target 0 draws in bucket order (sprite +16, sub_D2378), each bucket in queue order: bucket 1 takes the
+        // stage (sub_3BBA0, task 20), the FADE(40) effect (sub_2FC50, task 60) and the text pass's FCLN effect
+        // (task 80: sub_391A0 queues it before its first sub_B04E0(9)); a FADS's capture sprite (sub_A46F0, task
+        // 50) is bucket 9, so it lies over all three, and what it shows is target 0 as it was, effects included
+        // (035 ARC02_1's crossfade under FADE(40, -250): Switch region means 0.31 from this order, 1.38 with the
+        // effect over the mixed frame, whose overlay of the frame with itself darkened the middle of the fade)
+        r.copy_target(&mut enc, &self.stage_rt, &self.scene_rt);
         // sub_3C490 draws the FADE(40) effect over the composed frame, before the text
         if self.ghost.active() {
             let [src, out] = self.ghost_rt.get_or_insert_with(|| {
                 [r.create_target(CANVAS_W, CANVAS_H, "ghost frame"), r.create_target(CANVAS_W, CANVAS_H, "ghost channels")]
             });
             let trans = self.trans.as_ref().map(|t| (t.t / t.dur).clamp(0.0, 1.0));
-            self.ghost.render(r, &mut enc, &self.canvas, [src, &self.blur_rt, out], trans);
+            self.ghost.render(r, &mut enc, &self.scene_rt, [src, &self.blur_rt, out], trans);
         }
         // sub_391A0 starts the text pass with the FCLN effect (sub_87A90(2)) unless F963 = 1
         if self.focus.active() && self.var("F963") != 1 {
@@ -4002,8 +4496,16 @@ impl Game {
             }
             if let Some(tex) = &self.focus_tex {
                 let quads = self.focus.quads(tex);
-                r.draw(&mut enc, &self.canvas, None, &quads);
+                r.draw(&mut enc, &self.scene_rt, None, &quads);
             }
+        }
+        match &self.trans {
+            Some(t) => {
+                let p = if t.hold { 0.0 } else { (t.t / t.dur).clamp(0.0, 1.0) };
+                let rule = t.rule.clone();
+                r.transition(&mut enc, &self.canvas, &self.old_rt.tex, &self.scene_rt.tex, rule.as_deref(), p);
+            }
+            None => r.copy_target(&mut enc, &self.scene_rt, &self.canvas),
         }
         if self.menu_blur.is_some() && !self.menu_captured {
             // sub_A46F0 copies target 0 in the frame the blur starts, before the composites that frame queued:
@@ -4034,19 +4536,24 @@ impl Game {
                         let full = Quad::rect(self.canvas.tex.clone(), [0.0, 0.0, hw as f32, hh as f32], [1.0; 4]);
                         r.draw(&mut enc, a, Some([0.0, 0.0, 0.0, 1.0]), &[full]);
                         let step = 1.25 * (2.0 * std::f32::consts::PI).sqrt() * hw as f32 / 1920.0;
-                        r.blur(&mut enc, &a.tex, b, [step, 0.0], 1.25);
-                        r.blur(&mut enc, &b.tex, a, [0.0, step], 1.25);
+                        r.blur(&mut enc, &a.tex, b, [step, 0.0], 1.25, BlurMode::Uv);
+                        r.blur(&mut enc, &b.tex, a, [0.0, step], 1.25, BlurMode::Uv);
                         let up = Quad::rect(a.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
                         r.draw(&mut enc, rt, Some([0.0, 0.0, 0.0, 1.0]), &[up]);
                     } else {
-                        // sub_A0A90(.., 2.25): sigma 2.25 taps spaced 1.75 px (of 1920)
+                        // sub_A0A90(0, 0, 2.25): sigma 2.25 taps spaced 1.75 px (of 1920), horizontally, vertically,
+                        // horizontally again and vertically again (targets +107, +214, +107, +321)
                         let step = 1.75 * CANVAS_W as f32 / 1920.0;
-                        r.blur(&mut enc, &self.canvas.tex, &self.blur_rt, [step, 0.0], 2.25);
-                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25);
+                        r.blur(&mut enc, &self.canvas.tex, &self.blur_rt, [step, 0.0], 2.25, BlurMode::FullAdd);
+                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25, BlurMode::FullAdd);
+                        r.blur(&mut enc, &rt.tex, &self.blur_rt, [step, 0.0], 2.25, BlurMode::FullAdd);
+                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25, BlurMode::FullAdd);
                     }
                     self.menu_captured = true;
                 }
-                let q = Quad::rect(rt.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, a.min(1.0)]);
+                // sub_A2680: shader 17 forcealpha, the fade as a colour byte ((unsigned)(a * 255))
+                let mut q = Quad::rect(rt.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0, 1.0, 1.0, (a.min(1.0) * 255.0).floor() / 255.0]);
+                q.shade = Shade::ForceAlpha;
                 r.draw(&mut enc, &self.canvas, None, &[q]);
             }
             None => self.menu_captured = false,
@@ -4116,18 +4623,19 @@ impl Game {
                     zoom_x: l.zoom_x.to,
                     zoom_y: l.zoom_y.to,
                     alpha: l.alpha.to,
-                    rotation: l.rotation.to,
-                    prio: l.prio,
+                    // the stage rotation (dword 161)
+                    rotation: l.stage_rot.unwrap_or(l.rotation.to),
+                    prio: l.stage_prio(),
                     parent: l.parent,
-                    base: l.base,
-                    absolute: l.absolute,
+                    base: l.stage_base(),
+                    absolute: l.stage_absolute(),
                     quake: l.quake.map(|q| (q.mode, q.delay, q.remaining, q.params)),
-                    rule: l.rule.as_ref().map(|(n, _)| *n),
+                    rule: l.rule,
                     rule_flip: l.rule_flip,
                     noise: l.noise,
                     // the restore takes the blend from `stbr` when one is set (backdrop blends always have one)
-                    blend: match l.blend {
-                        Blend::Alpha | Blend::Ps(_) | Blend::Footprint | Blend::MaskAlpha => 0,
+                    blend: match l.stage_blend().1 {
+                        Blend::Alpha | Blend::Over | Blend::Ps(_) | Blend::Footprint | Blend::MaskAlpha => 0,
                         Blend::Add => 1,
                         Blend::Sub => 2,
                         Blend::Multiply => 3,
@@ -4143,11 +4651,12 @@ impl Game {
                     clip_mode: l.clip_mode,
                     bright: Some(l.snx[0]),
                     contrast: Some(l.snx[1]),
-                    stbr: Some(l.stbr),
-                    rot2: l.rot2,
-                    pivot: l.pivot,
+                    stbr: Some(l.stage_blend().0),
+                    rot2: l.stage_rot2(),
+                    pivot: l.stage_pivot,
+                    shift: l.stage_shift,
                     tint: (l.stec_mode != 1 && l.stec_color != [1.0; 3]).then_some(l.stec_color),
-                    soxy: l.soxy,
+                    soxy: l.stage_soxy(),
                 })
             })
             .collect()
@@ -4194,6 +4703,9 @@ impl Game {
                 .into_iter()
                 .map(|(channel, name, volume)| SeSave { channel, name, volume })
                 .collect(),
+            se_words: self.sound.se_word.to_vec(),
+            se_pans: self.sound.se_pan.to_vec(),
+            se_queue: self.se_queue_save(),
             timestamp: crate::save::now(),
             preview,
             kind: 0,
@@ -4262,7 +4774,9 @@ impl Game {
             l.alpha = Tween::fixed(a);
         }
         // fields 6 / 7: the pivot in script units (x 4/3, y 362/272 to 640x362 units), scaled by the image level
-        // (sub_2DFD0); the pivot also takes the variant's centre offset, the quad offset is minus the pivot
+        // (sub_2DFD0); the render pivot also takes the variant's centre offset, the quad offset is minus the
+        // pivot. A layer with an image (BLACK / WHITE included) also gets the stage anchor p and shift word
+        // (int)-p, without the offset.
         if f.pivot.iter().any(Option::is_some) {
             let (k, (dx, dy)) = pivot_info.unwrap_or((1.0, (0.0, 0.0)));
             let centre = match &l.source {
@@ -4271,24 +4785,34 @@ impl Game {
             };
             let mut piv = l.pivot.unwrap_or(centre);
             let mut sh = l.shift.unwrap_or([-centre[0], -centre[1]]);
-            if let Some(v) = f.pivot[0] {
-                let p = v * 1.875 / 0.46875 * k * 0.33333;
-                piv[0] = dx + p;
-                sh[0] = -p;
-            }
-            if let Some(v) = f.pivot[1] {
-                let p = v * 1.875 * 576.0 / 272.0 * k * 362.0 / 1080.0;
-                piv[1] = dy + p;
-                sh[1] = -p;
+            let mut spiv = l.stage_pivot.unwrap_or(centre);
+            let mut ssh = l.stage_shift.unwrap_or([-centre[0], -centre[1]]);
+            for (a, (v, d)) in [(f.pivot[0], dx), (f.pivot[1], dy)].into_iter().enumerate() {
+                let Some(v) = v else { continue };
+                let p = if a == 0 {
+                    v * 1.875 / 0.46875 * k * 0.33333
+                } else {
+                    v * 1.875 * 576.0 / 272.0 * k * 362.0 / 1080.0
+                };
+                piv[a] = d + p;
+                sh[a] = -p;
+                spiv[a] = p;
+                ssh[a] = (-p).trunc();
             }
             l.pivot = Some(piv);
             l.shift = Some(sh);
+            l.stage_pivot = Some(spiv);
+            l.stage_shift = Some(ssh);
         }
         if let Some(rot) = f.rot {
+            // render dword 20 and stage dword 161
             l.rotation = Tween::fixed(rot);
+            l.stage_rot = None;
         }
+        // render word 164 and stage word 1522
         if let Some(v) = f.rot2 {
             l.rot2 = v as i16;
+            l.staged.rot2 = None;
         }
         if let Some(z) = f.zoom_x {
             l.zoom_x = Tween::fixed(z);
@@ -4324,6 +4848,7 @@ impl Game {
             if mode != l.stbr {
                 l.stbr = mode;
                 l.blend = blend_mode(mode).0;
+                l.staged.stbr = None;
             }
         }
         // field 18 = 1 on a layer that is not a fill sets the render colour (fields 19..21) it is multiplied by
@@ -4345,12 +4870,14 @@ impl Game {
         {
             l.noise = (g > 0).then_some(g);
         }
-        // field 27 moves the layer only while its priority is not 0: STCP(layer, 0) hides it from a running motion
+        // field 27 moves the layer only while its stage priority is not 0: STCP(layer, 0) hides it from a running
+        // motion; it writes render dword 5883 and the stage word
         if let Some(p) = f.prio
             && p != 0
-            && l.prio != 0
+            && l.stage_prio() != 0
         {
             l.prio = p;
+            l.staged.prio = None;
         }
         if let Some(name) = variant {
             let (bake, cur) = (l.bake, l.name.clone());
@@ -4368,6 +4895,17 @@ impl Game {
                     None => l.pivot = Some([img.center_x, img.center_y]),
                 }
                 l.shift = Some([-img.center_x, -img.center_y]);
+                // the stage anchor moves by the difference of the two images' centres and the shift word is
+                // (int) minus it
+                let spiv = match &l.source {
+                    Source::Image(o) => {
+                        let s = l.stage_pivot.unwrap_or(o.anchor());
+                        [s[0] + img.center_x - o.center_x, s[1] + img.center_y - o.center_y]
+                    }
+                    Source::Color(_) => [img.center_x, img.center_y],
+                };
+                l.stage_pivot = Some(spiv);
+                l.stage_shift = Some([(-spiv[0]).trunc(), (-spiv[1]).trunc()]);
                 l.source = Source::Image(img);
                 l.name = name;
             }
@@ -4476,9 +5014,8 @@ impl Game {
         if l.noise.is_some() {
             self.load_noise(r);
         }
-        l.rule = ls
-            .rule
-            .and_then(|n| self.assets.image(r, &format!("RULE_{n:02}")).map(|i| (n, i.tex.clone())));
+        // only the stage word: no load writes render +280
+        l.rule = ls.rule;
         l.rule_flip = ls.rule_flip;
         l.quake = ls.quake.map(|(mode, delay, remaining, params)| crate::stage::Quake::restore(mode, delay, remaining, params));
         l.blend = match (ls.stbr, ls.blend) {
@@ -4492,7 +5029,11 @@ impl Game {
         };
         l.stbr = ls.stbr.unwrap_or(-1);
         l.rot2 = ls.rot2;
+        // sub_5D3A0 gives the render pivot and shift the stage's
         l.pivot = ls.pivot;
+        l.stage_pivot = ls.pivot;
+        l.shift = ls.shift;
+        l.stage_shift = ls.shift;
         l.clip_mode = ls.clip_mode;
         l.soxy = ls.soxy;
         l.shade = match ls.shade {
@@ -4700,6 +5241,8 @@ impl Game {
             self.scene_ring.push(ScenePoint { data: p, serial: None });
         }
         self.scene_ring.push(ScenePoint { data: crate::save::SaveData { prev: None, ..d.clone() }, serial: None });
+        // sub_82330 -> sub_3C550 resets the render layers: no rule survives a load
+        self.stage.rules.fill(None);
         self.restore_with(r, d, false);
         self.restore_save_point(d, false, d.kind);
         self.scene_ring.pop();
@@ -4720,7 +5263,7 @@ impl Game {
         // it is the same track. Both then resume the saved words (sub_5D7E0).
         self.seek_audio = None;
         if rewind && self.sound.bgm_state().map(|b| b.0) == d.bgm.map(|b| b.0) {
-            self.sound.stop_se(-1, 0.0);
+            self.sound.stop_se(-1);
             self.sound.stop_voice();
             self.sound.stop_movie_audio();
         } else {
@@ -4733,8 +5276,11 @@ impl Game {
         self.shake.stop();
         self.msg_quake.stop();
         let noise = self.stage.noise.take();
+        // sub_5BAF0 / sub_5D3A0 never write the render rules (+280): a rewind or the seek keeps them
+        let rules = std::mem::take(&mut self.stage.rules);
         self.stage = Stage::new();
         self.stage.noise = noise;
+        self.stage.rules = rules;
         for (k, v) in self.stage.kept.iter_mut().zip(&d.kept) {
             *k = *v;
         }
@@ -4754,6 +5300,24 @@ impl Game {
                 self.stage.set(i as i32, l);
             }
         }
+        // sub_5D3A0(0, -1) presents the restored stage
+        self.stage.commit();
+        // sub_5BAF0: the SE channels' volume and pan words and their queued key-68 ops come back (a record
+        // without them: the reset words, 100 / centre, with the loops' volumes)
+        self.sound.se_word = [100; 20];
+        self.sound.se_pan = [0; 20];
+        for se in &d.loops {
+            if let Some(w) = usize::try_from(se.channel).ok().and_then(|c| self.sound.se_word.get_mut(c)) {
+                *w = (se.volume * 100.0).round() as i16;
+            }
+        }
+        for (w, &v) in self.sound.se_word.iter_mut().zip(&d.se_words) {
+            *w = v;
+        }
+        for (w, &v) in self.sound.se_pan.iter_mut().zip(&d.se_pans) {
+            *w = v;
+        }
+        self.se_delayed = d.se_queue.iter().map(|q| (q.clone(), f32::from(q.frames - 1).max(0.0) * 1000.0 / 60.0, true)).collect();
         self.resume_sound(&SoundState {
             bgm: d.bgm,
             loops: d.loops.iter().map(|se| (se.channel, (se.name.clone(), se.volume))).collect(),
@@ -4813,6 +5377,7 @@ impl Game {
             self.start_choice(Choice::new(var.clone(), ChoiceKind::Page, opts));
         }
         self.snapshot = false;
+        self.fads = None;
     }
 
     /// cGallery replay (sub_5040, then sub_48AC0 case 4): the BGM fades out at 3.33 / frame (sub_9C9B0: 0.5 s
@@ -4860,6 +5425,7 @@ impl Game {
 
     pub fn reset(&mut self) {
         self.menu_lock = true;
+        self.resume_ms = 0.0;
         // sub_57240 clears the queued SE commands
         self.se_delayed.clear();
         self.history.clear();
@@ -4878,6 +5444,9 @@ impl Game {
         self.focus_saved = 0;
         self.stop_movie();
         self.sound.stop_all();
+        // sub_57240: the SE channels' volume words read 100, their pans 0
+        self.sound.se_word = [100; 20];
+        self.sound.se_pan = [0; 20];
         // sub_57450 resets every layer field but the anchor (sub_3D70 starts past it)
         let leftovers = self.reset_leftovers();
         self.stage = Stage::new();
@@ -4903,6 +5472,7 @@ impl Game {
         self.choice = None;
         self.sel_opts.clear();
         self.trans = None;
+        self.fads = None;
         // sub_2EA70(-1) / sub_3C550: the screen shake and the message quake stop
         self.shake.stop();
         self.msg_quake.stop();
@@ -4910,6 +5480,7 @@ impl Game {
         self.ended = false;
         self.replay_done = false;
         self.auto_skip_hit = false;
+        self.banner_away = false;
         self.hold = false;
         self.end_staff_task();
         self.archive = false;
@@ -5005,6 +5576,7 @@ impl Game {
                         .filter(|q| q.active())
                         .map(|q| format!(" quake{} ({:.1},{:.1})", q.mode, q.offset.0, q.offset.1))
                         .collect::<String>()
+                        + &if l.rot2 != 0 || l.clip.is_some() { format!(" rot2 {} clip {:?}", l.rot2, l.clip) } else { String::new() }
                         + &l.noise.map_or(String::new(), |n| format!(" noise {n}{}", if self.stage.noise.is_some() { "" } else { " (no tex)" }))
                 );
             }
@@ -5014,7 +5586,7 @@ impl Game {
 
     /// RGBA8 copy of the last presented canvas as the screen shows it (through the output curve).
     pub fn screenshot(&self, r: &Renderer) -> Vec<u8> {
-        let lut: Vec<u8> = (0..=255).map(knife_render::output_level).collect();
+        let lut: Vec<u8> = (0..=255).map(knife_render::target_level).collect();
         let mut px = r.read_target(&self.canvas);
         for c in px.chunks_mut(4) {
             for v in &mut c[..3] {

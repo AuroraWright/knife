@@ -2,13 +2,34 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, mpsc},
 };
 
-use knife_audio::{Audio, Pcm, Voice};
+use knife_audio::{Audio, Curve, Pcm, Voice};
 
+/// One 60 Hz frame (ms). The app loop (sub_FC064) runs the game's frame, whose sound update (sub_9B7F0) comes
+/// after the script, and then the sound manager's update: nn::atk's update (sub_106734, which flushes the frame's
+/// commands and detaches finished sounds) and `nn::audio::RequestUpdateAudioRenderer`, once a frame.
+const FRAME_MS: f64 = 1000.0 / 60.0;
+
+/// How long after the first frame end that finds a sound finished the script sees it stopped. The renderer
+/// update at that frame's end reports it, nn::atk's next update detaches the handle, the sound update after that
+/// clears the state word (sub_EEAC4 / sub_EE07C), and the script reads it the frame after: three frames, so a
+/// VCWT then SEPL starts the effect 55 / 75 ms after the voice's last sample on the Switch (Astris capture).
+const ENDED_MS: f64 = 3.0 * FRAME_MS - 0.5;
+
+/// A stream (BGM, voice) starts at nn::atk's update a frame after its command, once the loader has its first
+/// blocks; an SE starts at the command's own frame end (voices measured 17.5 / 17.5 / 32.5 ms after SEs started
+/// with them, a BGM 22.5 ms after the loops a load restarted with it). knife starts it at the first flush after
+/// the command's frame once this much game time has passed: under a frame, so frame-time jitter at 60 Hz does not
+/// add one, and a frame's worth on faster displays.
+const STREAM_START_MS: f64 = FRAME_MS * 0.75;
+
+/// Category volumes (off_AE0350 + 8 BGM, + 9 voices, + 10 SE, 0..100 from the config). The sound update
+/// (sub_9B7F0) multiplies a player's volume by its category and maps the product through its `Curve`: BGM and
+/// SE channels through sub_CA0 (BGM after easing 12), voices linearly.
 pub struct Volumes {
-    pub master: f32,
     pub bgm: f32,
     pub se: f32,
     pub voice: f32,
@@ -29,8 +50,7 @@ impl Volumes {
 impl Default for Volumes {
     fn default() -> Self {
         Self {
-            master: 1.0,
-            // config defaults 40 / 40 (0x46B080), linear x 0.01 (sub_9B7F0)
+            // config defaults 40 / 40 (0x46B080), x 0.01 (sub_9B7F0)
             bgm: 0.4,
             se: 0.4,
             voice: 1.0,
@@ -45,28 +65,100 @@ pub struct Bgm {
     voice: Option<Voice>,
     /// script volume 0..1 (before category volume)
     volume: f32,
-    base: f32,
+    /// started on a prefix of the stream: the request generation whose whole decode is still to come
+    partial: Option<u64>,
 }
 
-/// A finished background BGM decode: (request generation, track, PCM and its BFSAR volume).
-type BgmLoaded = (u64, i32, anyhow::Result<(Pcm, f32)>);
+/// A background BGM decode result: (request generation, track, PCM).
+type BgmLoaded = (u64, i32, anyhow::Result<Loaded>);
 
-struct PendingBgm {
+enum Loaded {
+    /// the stream from its start position on (source frame of the first), enough to start on
+    Prefix(usize, Pcm),
+    Whole(Pcm),
+}
+
+/// A BGM play (a stopped one is dropped); it starts once `pcm` is there and a frame has passed.
+pub struct PendingBgm {
     id: i32,
     generation: u64,
     volume: f32,
     fade_in: f64,
     start: usize,
+    /// the sound clock and the flush count at the command
+    at: (f64, u64),
+    /// the PCM to start on and, for a prefix, its first source frame
+    pcm: Option<(Arc<Pcm>, Option<usize>)>,
+}
+
+/// A scene voice player (sound players 2 / 3, sub_9B520): its state word and sound.
+#[derive(Default)]
+struct VoicePlayer {
+    /// the state word: set by a play, cleared by a stop or once the sound's end reaches it (`ENDED_MS`)
+    on: bool,
+    /// a play waiting for its stream to start: (sound clock and flush count at the command, source, volume)
+    pending: Option<((f64, u64), Arc<Pcm>, f32)>,
+    voice: Option<Voice>,
+    /// the sound clock of the first frame end that found the sound finished
+    end: Option<f64>,
+}
+
+impl VoicePlayer {
+    fn stop(&mut self) {
+        self.pending = None;
+        if let Some(v) = self.voice.take() {
+            v.stop(0.0);
+        }
+        self.on = false;
+        self.end = None;
+    }
+}
+
+/// An SE channel's player (sound player 11 + ch, off_AE0BE8 + 60 ch).
+struct SeChan {
+    voice: Voice,
+    /// the speaker row the channel was bound to when it played (SEPL key 70): that row's voice volume
+    /// replaces the SE category
+    speaker: Option<usize>,
+    /// state 2: fading out (sub_9D020), stopped when its volume comes down to 0
+    fading: bool,
+}
+
+/// A player's volume rate, points (0..100) a frame, in volume (0..1) a second; sub_9B7F0 steps a rate of 0 or
+/// less at 0.2.
+fn se_rate(per_frame: f32) -> f32 {
+    (if per_frame > 0.0 { per_frame } else { 0.2 }) * 0.6
 }
 
 pub struct Sound {
     audio: Audio,
     pub vol: Volumes,
     bgm: Option<Bgm>,
-    se: HashMap<i32, (Voice, f32)>,
-    /// looping effects by channel (name, volume) so saves can restore them
-    loops: HashMap<i32, (String, f32)>,
-    voice: Option<Voice>,
+    /// SE channels (sound players 11..30)
+    se: HashMap<i32, SeChan>,
+    /// each channel's volume word (byte_146E640 + 140): SEPL / SEVL set it to their volume, SEFD to 0,
+    /// sub_5F200 to -1, a reset (sub_57240 / sub_82330) to 100; SESP leaves it. Fades take their rates from it.
+    pub se_word: [i16; 20],
+    /// each channel's pan word (byte_146E640 + 220, -1000..1000): SEPL's key 18, what a load restarts a loop with
+    pub se_pan: [i16; 20],
+    /// each speaker row's voice volume, 0 while voices are off or the row is muted (`set_speaker_gains`)
+    speaker_gain: Vec<f32>,
+    /// the speaker row each channel is bound to (sub_9CF70, channel struct + 52): SEPL sets it, key 70 or none,
+    /// and it stays after the sound ends, so the config SE test (sub_9CAA0 alone) plays on it
+    chan_speaker: [Option<usize>; 20],
+    /// the sound clock of the first frame end that found each channel's sound finished (sub_9CD30's state word
+    /// clears `ENDED_MS` later)
+    se_end: HashMap<i32, f64>,
+    /// looping effects by channel (word100, with the loop flag word180): what a load or the seek's end restarts
+    loops: HashMap<i32, String>,
+    /// sound players 2 / 3: each scene voice plays on the other one (sub_9B570), so a VPL2 does not cut the
+    /// last voice; the current one (dword_1536850) is the one VCWT and the voice waits read
+    voices: [VoicePlayer; 2],
+    cur_voice: usize,
+    /// ms of game frames, advanced once a frame (`begin_frame`)
+    clock: f64,
+    /// `flush` calls so far: a stream starts at a flush after the one that took its command's frame
+    flushes: u64,
     /// sound player 4: the config's voice test (sub_2B930), apart from the scene voices on players 2 / 3
     test_voice: Option<Voice>,
     movie: Option<Voice>,
@@ -74,7 +166,7 @@ pub struct Sound {
     /// (dword_18C04E8 / dword_18C04EC), stopping what the player was playing
     sys: [Option<Voice>; 4],
     sys_next: [usize; 2],
-    bgm_cache: HashMap<i32, (Arc<Pcm>, f32)>,
+    bgm_cache: HashMap<i32, Arc<Pcm>>,
     tx: mpsc::Sender<BgmLoaded>,
     rx: mpsc::Receiver<BgmLoaded>,
     pending: Option<PendingBgm>,
@@ -89,8 +181,16 @@ impl Sound {
             vol: Volumes::default(),
             bgm: None,
             se: HashMap::new(),
+            se_word: [100; 20],
+            se_pan: [0; 20],
+            speaker_gain: Vec::new(),
+            chan_speaker: [None; 20],
+            se_end: HashMap::new(),
             loops: HashMap::new(),
-            voice: None,
+            voices: Default::default(),
+            cur_voice: 0,
+            clock: 0.0,
+            flushes: 0,
             test_voice: None,
             movie: None,
             sys: Default::default(),
@@ -103,14 +203,17 @@ impl Sound {
         }
     }
 
-    /// `MPLY`: play BGM `id` (volume 0..1, fade in seconds). `loader` decodes in the background.
+    /// `MPLY`: play BGM `id` (volume 0..1, fade in seconds) from source frame `start`: the Nintendo Opus stream
+    /// at `path`, looping over `loop_range` (the whole stream without one). A track not in the cache decodes in
+    /// the background, a second from `start` first so that it can start in time.
     pub fn play_bgm(
         &mut self,
         id: i32,
         volume: f32,
         fade_in: f64,
         start: usize,
-        loader: impl FnOnce() -> anyhow::Result<(Pcm, f32)> + Send + 'static,
+        path: PathBuf,
+        loop_range: Option<(usize, usize)>,
     ) {
         if let Some(b) = &self.bgm
             && b.id == id
@@ -119,48 +222,81 @@ impl Sound {
             self.set_bgm_volume(volume, fade_in);
             return;
         }
+        if self.pending.as_ref().is_some_and(|p| p.id == id) {
+            self.set_bgm_volume(volume, fade_in);
+            return;
+        }
         self.stop_bgm(0.0);
         self.generation += 1;
-        if let Some((pcm, base)) = self.bgm_cache.get(&id).cloned() {
-            self.start_bgm(id, pcm, base, volume, fade_in, start);
-            return;
+        let cached = self.bgm_cache.get(&id).cloned();
+        let generation = self.generation;
+        if cached.is_none() {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let res = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|data| {
+                    let (base, prefix) = knife_audio::codec::decode_nopus_part(&data, start, start + 48_000)?;
+                    let _ = tx.send((generation, id, Ok(Loaded::Prefix(base, prefix))));
+                    let mut pcm = knife_audio::codec::decode_nopus(&data)?;
+                    let len = pcm.frames.len();
+                    pcm.loop_range = Some(loop_range.map_or((0, len), |(a, b)| (a.min(len), b.min(len))));
+                    Ok(Loaded::Whole(pcm))
+                });
+                let _ = tx.send((generation, id, res));
+            });
         }
         self.pending = Some(PendingBgm {
             id,
-            generation: self.generation,
+            generation,
             volume,
             fade_in,
             start,
-        });
-        let tx = self.tx.clone();
-        let generation = self.generation;
-        std::thread::spawn(move || {
-            let _ = tx.send((generation, id, loader()));
+            at: (self.clock, self.flushes),
+            pcm: cached.map(|p| (p, None)),
         });
     }
 
-    fn start_bgm(&mut self, id: i32, pcm: Arc<Pcm>, base: f32, volume: f32, fade_in: f64, start: usize) {
-        let v = self.audio.play_at(pcm, volume * base * self.vol.bgm_level() * self.vol.master, fade_in, true, start);
+    fn start_bgm(&mut self, p: PendingBgm) {
+        let Some((pcm, base)) = p.pcm else { return };
+        let vol = p.volume * self.vol.bgm_level();
+        let v = match base {
+            Some(base) => self.audio.play_prefix(pcm, base, vol, p.fade_in, true, p.start, Curve::Bgm),
+            None => self.audio.play_at(pcm, vol, p.fade_in, true, p.start, Curve::Bgm),
+        };
         self.bgm = Some(Bgm {
-            id,
+            id: p.id,
             voice: Some(v),
-            volume,
-            base,
+            volume: p.volume,
+            partial: base.map(|_| p.generation),
         });
     }
 
-    /// Call once per frame.
+    /// Once a frame before the game's: the sound clock.
+    pub fn begin_frame(&mut self, dt: f32) {
+        self.clock += f64::from(dt);
+    }
+
+    /// Take in finished background decodes.
     pub fn update(&mut self) {
         while let Ok((generation, id, res)) = self.rx.try_recv() {
             match res {
-                Ok((pcm, base)) => {
+                Ok(Loaded::Prefix(base, pcm)) => {
+                    if let Some(p) = self.pending.as_mut().filter(|p| p.generation == generation && p.pcm.is_none()) {
+                        p.pcm = Some((Arc::new(pcm), Some(base)));
+                    }
+                }
+                Ok(Loaded::Whole(pcm)) => {
                     let pcm = Arc::new(pcm);
                     if self.bgm_cache.len() >= 4 {
                         self.bgm_cache.clear();
                     }
-                    self.bgm_cache.insert(id, (pcm.clone(), base));
-                    if let Some(p) = self.pending.take_if(|p| p.generation == generation) {
-                        self.start_bgm(id, pcm, base, p.volume, p.fade_in, p.start);
+                    self.bgm_cache.insert(id, pcm.clone());
+                    if let Some(p) = self.pending.as_mut().filter(|p| p.generation == generation) {
+                        p.pcm = Some((pcm, None));
+                    } else if let Some(b) = self.bgm.as_mut().filter(|b| b.partial == Some(generation)) {
+                        if let Some(v) = &b.voice {
+                            v.replace_source(pcm);
+                        }
+                        b.partial = None;
                     }
                 }
                 Err(e) => {
@@ -169,7 +305,44 @@ impl Sound {
                 }
             }
         }
-        self.se.retain(|_, (v, _)| !v.finished());
+    }
+
+    /// Once a frame after the game's (nn::atk's update): streams a frame old start, and finished sounds are
+    /// noted for the state words.
+    /// Once a frame after the game's and the UI's update, before the present: this frame's sound commands
+    /// reach the mixer together (`Audio::flush`).
+    pub fn flush(&mut self) {
+        self.audio.flush();
+        self.flushes += 1;
+    }
+
+    pub fn end_frame(&mut self) {
+        let (clock, flushes) = (self.clock, self.flushes);
+        // a stream command's frame has been flushed (a load from the UI can run before or after the game's
+        // update) and a frame's time has passed
+        let due = |(at, flush): (f64, u64)| clock - at >= STREAM_START_MS && flushes > flush;
+        if self.pending.as_ref().is_some_and(|p| p.pcm.is_some() && due(p.at)) {
+            let p = self.pending.take().unwrap();
+            self.start_bgm(p);
+        }
+        for pl in &mut self.voices {
+            if let Some((_, pcm, vol)) = pl.pending.take_if(|p| due(p.0)) {
+                pl.voice = Some(self.audio.play(pcm, vol, 0.0, false));
+            }
+            if pl.on && pl.end.is_none() && pl.pending.is_none() && pl.voice.as_ref().is_none_or(Voice::finished) {
+                pl.end = Some(clock);
+            }
+        }
+        for (ch, c) in &self.se {
+            if c.voice.finished() {
+                self.se_end.entry(*ch).or_insert(clock);
+            }
+        }
+        let ended: Vec<i32> = self.se_end.iter().filter(|(_, t)| clock - **t >= ENDED_MS).map(|(c, _)| *c).collect();
+        for ch in ended {
+            self.se_end.remove(&ch);
+            self.se.remove(&ch);
+        }
     }
 
     /// sub_9C460: the BGM playing or loading (-1 after a stop).
@@ -193,14 +366,17 @@ impl Sound {
         self.stop_bgm(f64::from(vol * 100.0 / (rate * 60.0)));
     }
 
-    /// Take the playing BGM out (with `put_bgm`, a stop that leaves it alone).
-    pub fn take_bgm(&mut self) -> Option<Bgm> {
-        self.bgm.take()
+    /// Take the playing BGM and a play still to start out (with `put_bgm`, a stop that leaves them alone).
+    pub fn take_bgm(&mut self) -> (Option<Bgm>, Option<PendingBgm>) {
+        (self.bgm.take(), self.pending.take())
     }
 
-    pub fn put_bgm(&mut self, b: Option<Bgm>) {
-        if b.is_some() {
-            self.bgm = b;
+    pub fn put_bgm(&mut self, b: (Option<Bgm>, Option<PendingBgm>)) {
+        if b.0.is_some() {
+            self.bgm = b.0;
+        }
+        if b.1.is_some() {
+            self.pending = b.1;
         }
     }
 
@@ -212,53 +388,140 @@ impl Sound {
     }
 
     pub fn set_bgm_volume(&mut self, volume: f32, secs: f64) {
-        let (m, c) = (self.vol.master, self.vol.bgm_level());
+        let c = self.vol.bgm_level();
         if let Some(p) = &mut self.pending {
             p.volume = volume;
         }
         if let Some(b) = &mut self.bgm {
             b.volume = volume;
             if let Some(v) = &b.voice {
-                v.set_volume(volume * b.base * c * m, secs);
+                v.set_volume(volume * c, secs);
             }
         }
     }
 
-    pub fn play_se(&mut self, ch: i32, name: &str, pcm: Arc<Pcm>, volume: f32, fade_in: f64, looping: bool) {
-        if let Some((v, _)) = self.se.remove(&ch) {
-            v.stop(0.0);
+    /// The category gain and curve of an SE channel: the SE volume through sub_CA0, or for a channel bound to
+    /// a speaker (SEPL key 70, type 2) that speaker's voice volume, linear (sub_9CD40 / sub_9B7F0).
+    fn se_mix(&self, speaker: Option<usize>) -> (f32, Curve) {
+        match speaker {
+            Some(r) => (self.speaker_gain.get(r).copied().unwrap_or(0.0), Curve::Linear),
+            None => (self.vol.se_level(), Curve::Se),
         }
+    }
+
+    /// Voice volume per speaker row (0 for a muted row or with voices off), for speaker-bound SE channels.
+    pub fn set_speaker_gains(&mut self, gains: Vec<f32>) {
+        self.speaker_gain = gains;
+    }
+
+    /// The speaker row SE channel `ch` is bound to (byte_146E640 + 80).
+    pub fn chan_speaker(&self, ch: i32) -> Option<usize> {
+        usize::try_from(ch).ok().and_then(|c| self.chan_speaker.get(c).copied().flatten())
+    }
+
+    /// sub_9CF70: bind SE channel `ch` to a speaker row (SEPL key 70) or to none.
+    pub fn bind_speaker(&mut self, ch: i32, speaker: Option<usize>) {
+        if let Some(s) = usize::try_from(ch).ok().and_then(|c| self.chan_speaker.get_mut(c)) {
+            *s = speaker;
+        }
+    }
+
+    /// Play on SE channel `ch` (sub_9CAA0 / sub_9CBF0): what the channel's player held stops at once, fading
+    /// or not (sub_EDD28 stops the handle). `volume` 0..1, `fade_in` seconds from 0, `pan` -1..1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_se(&mut self, ch: i32, name: &str, pcm: Arc<Pcm>, volume: f32, fade_in: f64, looping: bool, pan: f32) {
+        let speaker = usize::try_from(ch).ok().and_then(|c| self.chan_speaker.get(c).copied().flatten());
+        if let Some(c) = self.se.remove(&ch) {
+            c.voice.stop(0.0);
+        }
+        self.se_end.remove(&ch);
         if looping {
-            self.loops.insert(ch, (name.to_string(), volume));
+            self.loops.insert(ch, name.to_string());
         } else {
             self.loops.remove(&ch);
         }
-        let v = self.audio.play(pcm, volume * self.vol.se_level() * self.vol.master, fade_in, looping);
-        self.se.insert(ch, (v, volume));
+        let (k, curve) = self.se_mix(speaker);
+        let voice = self.audio.play_gain(pcm, (volume.max(0.0), k, pan), fade_in, looping, curve);
+        self.se.insert(ch, SeChan { voice, speaker, fading: false });
     }
 
-    pub fn stop_se(&mut self, ch: i32, fade: f64) {
+    /// Stop SE channel `ch` (all for a negative one) at once (sub_9CF90) and forget its loop.
+    pub fn stop_se(&mut self, ch: i32) {
         if ch < 0 {
             self.loops.clear();
+            for (_, c) in self.se.drain() {
+                c.voice.stop(0.0);
+            }
+            self.se_end.clear();
         } else {
             self.loops.remove(&ch);
-        }
-        if ch < 0 {
-            for (_, (v, _)) in self.se.drain() {
-                v.stop(fade);
+            if let Some(c) = self.se.remove(&ch) {
+                c.voice.stop(0.0);
             }
-        } else if let Some((v, _)) = self.se.remove(&ch) {
-            v.stop(fade);
+            self.se_end.remove(&ch);
         }
     }
 
-    /// The looping SE on channel `ch` (its name and volume).
-    pub fn looping_on(&self, ch: i32) -> Option<&(String, f32)> {
-        self.loops.get(&ch)
+    /// Forget channel `ch`'s loop (word100 = -1) without touching its sound.
+    pub fn forget_loop(&mut self, ch: i32) {
+        self.loops.remove(&ch);
     }
 
+    /// sub_9CFC0: the channel player's state, 0 idle, 1 playing, 2 fading out.
+    pub fn se_state(&self, ch: i32) -> u8 {
+        match self.se.get(&ch) {
+            Some(_) if !self.se_busy(ch) => 0,
+            // sub_9B7F0 idles a fading player in the update that brings it to 0
+            Some(c) if c.fading && c.voice.volume() <= 0.0 => 0,
+            Some(c) if c.fading => 2,
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+
+    /// The channel player's current volume (0..1 before its category), 0 when idle.
+    pub fn se_player_volume(&self, ch: i32) -> f32 {
+        if self.se_state(ch) == 0 {
+            return 0.0;
+        }
+        self.se.get(&ch).map_or(0.0, |c| c.voice.volume())
+    }
+
+    /// sub_9D020 / sub_9CFE0: an active player starts fading out (state 2) at `per_frame` volume points a frame,
+    /// stopping once at 0.
+    pub fn fade_se(&mut self, ch: i32, per_frame: f32) {
+        if self.se_state(ch) == 0 {
+            return;
+        }
+        if let Some(c) = self.se.get_mut(&ch) {
+            c.fading = true;
+            c.voice.fade_out(se_rate(per_frame));
+        }
+    }
+
+    /// sub_9D0B0: an active player's volume moves to `volume` (0..1) at `per_frame` points a frame (its
+    /// magnitude), at once from 1666.7 up; a fading player keeps fading (it stops only at 0).
+    pub fn ramp_se(&mut self, ch: i32, volume: f32, per_frame: f32) {
+        if self.se_state(ch) == 0 {
+            return;
+        }
+        if let Some(c) = self.se.get(&ch) {
+            let r = per_frame.abs();
+            c.voice.ramp_to(volume, if r >= 1666.7 { 0.0 } else { se_rate(r) });
+        }
+    }
+
+    /// The looping SE on channel `ch` (word100 with word180 set).
+    pub fn looping_on(&self, ch: i32) -> Option<&str> {
+        self.loops.get(&ch).map(String::as_str)
+    }
+
+    /// The looping effects (channel, name, volume word / 100), what a save restarts.
     pub fn looping_effects(&self) -> Vec<(i32, String, f32)> {
-        self.loops.iter().map(|(c, (n, v))| (*c, n.clone(), *v)).collect()
+        self.loops
+            .iter()
+            .map(|(c, n)| (*c, n.clone(), f32::from(self.se_word.get(*c as usize).copied().unwrap_or(100)) / 100.0))
+            .collect()
     }
 
     pub fn bgm_state(&self) -> Option<(i32, f32)> {
@@ -272,25 +535,9 @@ impl Sound {
     /// stop at once.
     pub fn stop_all(&mut self) {
         self.stop_bgm(0.0);
-        self.stop_se(-1, 0.0);
+        self.stop_se(-1);
         self.stop_voice();
         self.stop_movie_audio();
-    }
-
-    pub fn set_se_volume(&mut self, ch: i32, volume: f32, secs: f64) {
-        let k = self.vol.se_level() * self.vol.master;
-        for (c, (n, vol)) in self.loops.iter_mut() {
-            let _ = n;
-            if ch < 0 || *c == ch {
-                *vol = volume;
-            }
-        }
-        for (c, (v, vol)) in self.se.iter_mut() {
-            if ch < 0 || *c == ch {
-                *vol = volume;
-                v.set_volume(volume * k, secs);
-            }
-        }
     }
 
     /// A system sound on the next sound player of counter `k` (0 sub_ACEF0, 1 sub_ACFA0) at `volume`
@@ -301,7 +548,7 @@ impl Sound {
         if let Some(v) = self.sys[slot].take() {
             v.stop(0.0);
         }
-        self.sys[slot] = Some(self.audio.play(pcm, volume * self.vol.master, 0.0, false));
+        self.sys[slot] = Some(self.audio.play(pcm, volume, 0.0, false));
     }
 
     /// The SE volume (`se_level`), for sub_ACFA0.
@@ -309,23 +556,24 @@ impl Sound {
         self.vol.se_level()
     }
 
-    /// A voice at `gain` times the voice volume (the speaker's config row volume).
-    pub fn play_voice_gain(&mut self, pcm: Arc<Pcm>, gain: f32) {
-        self.stop_voice();
-        self.voice = Some(self.audio.play(pcm, gain * self.vol.voice * self.vol.master, 0.0, false));
-    }
-
-    /// sub_9D240: the playing scene voice changes to `gain` times the voice volume.
-    pub fn set_voice_gain(&mut self, gain: f32) {
-        if let Some(v) = &self.voice {
-            v.set_volume(gain * self.vol.voice * self.vol.master, 0.0);
+    /// sub_9C300: a voice at `gain` times the voice volume (the speaker's config row volume) on the other voice
+    /// player, which drops what it played (sub_EE6B4); `stop_all` first stops both (sub_9C3B0), as a message
+    /// voice and the replay do and VPL2 does not.
+    pub fn play_voice_gain(&mut self, pcm: Arc<Pcm>, gain: f32, stop_all: bool) {
+        if stop_all {
+            self.stop_voice();
         }
+        self.cur_voice ^= 1;
+        let pl = &mut self.voices[self.cur_voice];
+        pl.stop();
+        pl.on = true;
+        pl.pending = Some(((self.clock, self.flushes), pcm, gain * self.vol.voice));
     }
 
     /// The config voice test on player 4 (sub_9B740(4) stops the last one, sub_EE6B4 plays without a fade).
     pub fn play_test_voice(&mut self, pcm: Arc<Pcm>, gain: f32) {
         self.stop_test_voice();
-        self.test_voice = Some(self.audio.play(pcm, gain * self.vol.voice * self.vol.master, 0.0, false));
+        self.test_voice = Some(self.audio.play(pcm, gain * self.vol.voice, 0.0, false));
     }
 
     /// sub_9B740(4)
@@ -335,20 +583,23 @@ impl Sound {
         }
     }
 
-    /// sub_9CD30: SE channel `ch` is playing.
+    /// sub_9CD30: SE channel `ch`'s state word.
     pub fn se_busy(&self, ch: i32) -> bool {
-        self.se.get(&ch).is_some_and(|(v, _)| !v.finished())
+        self.se.contains_key(&ch) && self.se_end.get(&ch).is_none_or(|t| self.clock - t < ENDED_MS)
     }
 
+    /// sub_9C3B0: both voice players stop at once (sub_EE9A8: `Stop(0)`, cut at the next renderer frame) and
+    /// their state words clear.
     pub fn stop_voice(&mut self) {
-        if let Some(v) = self.voice.take() {
-            v.stop(0.05);
+        for pl in &mut self.voices {
+            pl.stop();
         }
     }
 
     pub fn play_movie_audio(&mut self, pcm: Arc<Pcm>) {
         self.stop_movie_audio();
-        self.movie = Some(self.audio.play(pcm, self.vol.bgm_level() * self.vol.master, 0.0, false));
+        // the movie player takes the BGM copy (off_AE0350 + 7) as is
+        self.movie = Some(self.audio.play(pcm, self.vol.bgm_level(), 0.0, false));
     }
 
     pub fn stop_movie_audio(&mut self) {
@@ -357,20 +608,22 @@ impl Sound {
         }
     }
 
+    /// sub_9C400: the current voice player's state word.
     pub fn voice_playing(&self) -> bool {
-        self.voice.as_ref().is_some_and(|v| !v.finished())
+        let pl = &self.voices[self.cur_voice];
+        pl.on && pl.end.is_none_or(|t| self.clock - t < ENDED_MS)
     }
 
     /// Re-apply category volumes after a settings change.
     pub fn apply_volumes(&mut self) {
-        let m = self.vol.master;
         if let Some(b) = &self.bgm
             && let Some(v) = &b.voice
         {
-            v.set_volume(b.volume * b.base * self.vol.bgm_level() * m, 0.1);
+            v.set_volume(b.volume * self.vol.bgm_level(), 0.1);
         }
-        for (v, vol) in self.se.values() {
-            v.set_volume(vol * self.vol.se_level() * m, 0.1);
+        // the category multiplies the player's volume each frame (sub_9B7F0), outside its fades
+        for c in self.se.values() {
+            c.voice.set_gain(self.se_mix(c.speaker).0);
         }
     }
 }

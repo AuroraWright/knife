@@ -65,6 +65,9 @@ pub struct LayerSave {
     /// STPV / motion pivot (stage anchor, 640x362 units) when not the image centre
     #[serde(default)]
     pub pivot: Option<[f32; 2]>,
+    /// stage shift word (2923 / 2924, whole units) when not minus the image centre
+    #[serde(default)]
+    pub shift: Option<[f32; 2]>,
     /// render colour a motion set on a layer that is not a fill (stage colour at +5850)
     #[serde(default)]
     pub tint: Option<[f32; 3]>,
@@ -85,6 +88,28 @@ pub struct SeSave {
     pub channel: i32,
     pub name: String,
     pub volume: f32,
+}
+
+/// A channel's queued key-68 SE command (sub_66200: byte_146E640 + 1112 + 20 ch; saved at entry +14612).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SeQueued {
+    pub channel: i32,
+    /// frames left on the exe's counter (+1112), before this frame's count-down
+    pub frames: i16,
+    /// +1120: 1 SEPL, 2 SEFD, 3 SEVL
+    pub kind: u8,
+    /// +1114: SEPL's sound (sub_900; none when not in the table)
+    pub name: Option<String>,
+    /// +1116: key 1, ms (-1 none)
+    pub fade: i32,
+    /// +1121: key 17 (-1 none)
+    pub volume: i8,
+    /// +1123: SEPL's loop argument
+    pub looping: bool,
+    /// +1124: key 18 (-1 none)
+    pub pan: i16,
+    /// +1128: key 70 (0 none)
+    pub speaker: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -131,6 +156,15 @@ pub struct SaveData {
     /// ATSV(1)'s copy of the last message's, empty otherwise
     #[serde(default)]
     pub text: String,
+    /// each SE channel's volume word (byte_146E640 + 140, saved as a byte at +14468); empty in old saves
+    #[serde(default)]
+    pub se_words: Vec<i16>,
+    /// each SE channel's pan word (byte_146E640 + 220, x 1000; +14510)
+    #[serde(default)]
+    pub se_pans: Vec<i16>,
+    /// the queued key-68 SE commands
+    #[serde(default)]
+    pub se_queue: Vec<SeQueued>,
 }
 
 /// What an empty layer keeps in the stage block: the negated anchor at +5844+2 / +4 of the last image shown

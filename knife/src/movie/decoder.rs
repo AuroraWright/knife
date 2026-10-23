@@ -121,18 +121,21 @@ pub unsafe fn copy_plane(source: *const u8, stride: usize, width: usize, rows: u
     plane
 }
 
-/// NV12 (BT.709, video range) to RGBA. The chroma plane is sampled bilinearly with centred siting, as a linear
-/// texture lookup of the half-size plane would.
+/// NV12 to RGBA as the Switch shows its movies: BT.601 video range in 8-bit integer coefficients, (298 Y' +
+/// 409 Cr, 298 Y' - 100 Cb - 208 Cr, 298 Y' + 516 Cb) / 256 rounded down, whatever the stream says (the
+/// movies are tagged BT.709; an Astris capture of the titlebg4 title fits this at 0.78 mean abs, float BT.601
+/// rounded at 0.98, BT.709 at 1.5 and more). The chroma plane is sampled bilinearly with centred siting, as a
+/// linear texture lookup of the half-size plane would.
 pub fn nv12_to_rgba(f: &Nv12Frame) -> Vec<u8> {
     let (w, h) = (f.width as usize, f.height as usize);
     let (cw, ch) = (w / 2, h / 2);
     let mut out = vec![0u8; w * h * 4];
-    // 16.16 fixed point: (Y - 16) * 1.1643835, Cr * 1.7927411 / -0.5328817, Cb * -0.21322097 / 2.1124017
-    const KY: i32 = 76309;
-    const KRV: i32 = 117489;
-    const KGU: i32 = -13973;
-    const KGV: i32 = -34923;
-    const KBU: i32 = 138438;
+    // per 256, with chroma in sixteenths
+    const KY: i32 = 298 * 16;
+    const KRV: i32 = 409;
+    const KGU: i32 = -100;
+    const KGV: i32 = -208;
+    const KBU: i32 = 516;
     // the two chroma taps of output coordinate `i` (weights 3 / 1, in quarters)
     let taps = |i: usize, n: usize| -> (usize, usize) {
         let c = i / 2;
@@ -173,9 +176,9 @@ pub fn nv12_to_rgba(f: &Nv12Frame) -> Vec<u8> {
                         let v = sample(1) - 128 * 16;
                         let yy = (i32::from(luma[x]) - 16) * KY;
                         let px = &mut row[x * 4..x * 4 + 4];
-                        px[0] = ((yy + KRV * v / 16 + 32768) >> 16).clamp(0, 255) as u8;
-                        px[1] = ((yy + (KGU * u + KGV * v) / 16 + 32768) >> 16).clamp(0, 255) as u8;
-                        px[2] = ((yy + KBU * u / 16 + 32768) >> 16).clamp(0, 255) as u8;
+                        px[0] = ((yy + KRV * v) >> 12).clamp(0, 255) as u8;
+                        px[1] = ((yy + KGU * u + KGV * v) >> 12).clamp(0, 255) as u8;
+                        px[2] = ((yy + KBU * u) >> 12).clamp(0, 255) as u8;
                         px[3] = 255;
                     }
                 }

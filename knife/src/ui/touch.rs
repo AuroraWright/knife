@@ -533,6 +533,7 @@ impl Ui {
             // cases 0 / 4 test the objects' flag 2 (sub_ADE60(207 / 211, 2)), 5 / 6 sub_47B10 itself
             0 if !self.touch.pflags[0] => {
                 self.snd(game, 1);
+                game.drop_capture();
                 self.confirm(game, Confirm::PrevScene);
             }
             2 => {
@@ -541,6 +542,7 @@ impl Ui {
             }
             4 if !self.touch.pflags[4] => {
                 self.snd(game, 1);
+                game.drop_capture();
                 self.confirm(game, Confirm::NextScene);
             }
             // case 5 also wants dword_AFFCC4 run out (sub_40E90)

@@ -50,8 +50,12 @@ impl Image {
 
 /// Decoded pixels of an image, ready to upload.
 pub enum Pixels {
-    Bntx(bntx::Texture),
-    Rgba(u32, u32, Vec<u8>),
+    /// As stored; `true`: still to go through pre_alter (`Renderer::upload_altered`)
+    Bntx(bntx::Texture, bool),
+    /// RGBA8; `Some(srgb)`: still to go through pre_alter, sampled through an sRGB view when `srgb`
+    Rgba(u32, u32, Vec<u8>, Option<bool>),
+    /// RGBA8 baked on the CPU (`Bake::apply`), sRGB-encoded like the altered texture it stands for
+    Baked(u32, u32, Vec<u8>),
 }
 
 /// An image `Assets::decode_async` read on a worker thread.
@@ -342,6 +346,11 @@ impl Assets {
         self.image_graded(r, name, Bake::NONE)
     }
 
+    /// Load (and cache) a rule mask (RULE_nn), which the transitions sample as stored (`Bake::raw`).
+    pub fn rule(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
+        self.image_graded(r, name, Bake::RAW)
+    }
+
     /// Load (and cache) an image built with an STEC colour grade and the SNX2 / SNX3 tone (`grade::Bake`). The
     /// exe keys its texture cache (sub_AAA40) the same way, by image and the pre_alter parameters.
     pub fn image_graded(&mut self, r: &Renderer, name: &str, bake: Bake) -> Option<Arc<Image>> {
@@ -422,24 +431,30 @@ impl Assets {
     /// the language strip.
     fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: Bake, strip: Option<(usize, usize)>) -> Result<Pixels> {
         let data = Self::image_bytes(archives, name).context("not found")?;
-        if grade.is_none() && strip.is_none() && bntx::is_bntx(&data) {
-            return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?));
+        if !grade.cpu() && strip.is_none() && bntx::is_bntx(&data) {
+            return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?, !grade.raw));
         }
-        let (w, mut h, mut px) = decode_image(&data)?;
+        let (w, mut h, mut px, srgb) = decode_image(&data)?;
         if let Some((k, n)) = strip {
             let rows = h / n as u32;
             let top = (h as usize * k / n) * w as usize * 4;
             px = px[top..top + (rows * w) as usize * 4].to_vec();
             h = rows;
         }
-        grade.apply(&mut px);
-        Ok(Pixels::Rgba(w, h, px))
+        if grade.cpu() {
+            grade.apply(&mut px, srgb);
+            return Ok(Pixels::Baked(w, h, px));
+        }
+        Ok(Pixels::Rgba(w, h, px, (!grade.raw).then_some(srgb)))
     }
 
     fn upload_pixels(&self, r: &Renderer, name: &str, pixels: Pixels) -> Result<Image> {
         let tex = match pixels {
-            Pixels::Bntx(t) => upload_bntx(r, &t)?,
-            Pixels::Rgba(w, h, px) => r.upload(w, h, Upload::Rgba8(&px), name),
+            Pixels::Bntx(t, true) => upload_bntx(r, &t)?,
+            Pixels::Bntx(t, false) => upload_bntx_raw(r, &t)?,
+            Pixels::Rgba(w, h, px, Some(srgb)) => r.upload_altered(w, h, Upload::Rgba8(&px), srgb, name),
+            Pixels::Rgba(w, h, px, None) => r.upload(w, h, Upload::Rgba8(&px), name),
+            Pixels::Baked(w, h, px) => r.upload_baked(w, h, &px, name),
         };
         let no_shake = self.image_info(name).is_some_and(|i| i.no_shake);
         let (width, height, center_x, center_y, level) = match self.image_info(name) {
@@ -706,7 +721,23 @@ impl Assets {
     }
 }
 
+/// Upload a BNTX texture as a sprite texture (through pre_alter, `Renderer::upload_altered`; the exe builds every
+/// image slot with sub_A3180).
 pub fn upload_bntx(r: &Renderer, t: &bntx::Texture) -> Result<TexRef> {
+    let (label, srgb) = (&t.name, t.format.is_srgb());
+    Ok(match t.format {
+        TexFormat::Bc7Unorm | TexFormat::Bc7Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc7(&t.data), srgb, label),
+        TexFormat::Bc1Unorm | TexFormat::Bc1Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc1(&t.data), srgb, label),
+        TexFormat::Bc3Unorm | TexFormat::Bc3Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc3(&t.data), srgb, label),
+        _ => {
+            let rgba = bntx_decode::to_rgba8(t)?;
+            r.upload_altered(t.width, t.height, Upload::Rgba8(&rgba), srgb, label)
+        }
+    })
+}
+
+/// Upload a BNTX texture to be sampled as stored (rule masks).
+fn upload_bntx_raw(r: &Renderer, t: &bntx::Texture) -> Result<TexRef> {
     let label = &t.name;
     Ok(match t.format {
         TexFormat::Bc7Unorm | TexFormat::Bc7Srgb if r.bc_supported => r.upload(t.width, t.height, Upload::Bc7(&t.data), label),
@@ -720,14 +751,15 @@ pub fn upload_bntx(r: &Renderer, t: &bntx::Texture) -> Result<TexRef> {
     })
 }
 
-/// Decode an archive image (BNTX, JPEG or PNG) to RGBA8: (width, height, pixels).
-fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+/// Decode an archive image (BNTX, JPEG or PNG) to RGBA8: (width, height, pixels, sampled through an sRGB view).
+/// sub_A3180 uploads JPEG / PNG decodes as "Jpeg Tex" / "Png Tex" (sub_E0CD8 format 0 -> 2822, sRGB).
+fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>, bool)> {
     if bntx::is_bntx(data) {
         let t = bntx::parse(data)?.into_iter().next().context("empty BNTX")?;
-        return Ok((t.width, t.height, bntx_decode::to_rgba8(&t)?));
+        return Ok((t.width, t.height, bntx_decode::to_rgba8(&t)?, t.format.is_srgb()));
     }
     let img = image::load_from_memory(data).context("decoding image")?.to_rgba8();
-    Ok((img.width(), img.height(), img.into_raw()))
+    Ok((img.width(), img.height(), img.into_raw(), true))
 }
 
 fn sysmes_u32(d: &[u8], o: usize) -> Option<u32> {
@@ -737,3 +769,5 @@ fn sysmes_u32(d: &[u8], o: usize) -> Option<u32> {
 fn sysmes_u64(d: &[u8], o: usize) -> Option<usize> {
     Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?) as usize)
 }
+
+

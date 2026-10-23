@@ -175,11 +175,12 @@ pub struct Bake {
     pub grade: i32,
     pub bright: f32,
     pub contrast: f32,
-    /// pre_alter samples its source as linear and starts with pow(x, 1 / 2.2), so a source decoded through an
-    /// sRGB view ("Jpeg Tex", sub_E0CD8 format 0 -> 2822 R8G8B8A8 sRGB) bakes to pow(srgb_decode(x), 1 / 2.2),
-    /// which the output curve maps back to x: the gallery CG viewer picture shows the image's own values
-    /// (0.85 mean abs against Astris; through the curve 4.8). Story layers come out without it.
-    pub linear: bool,
+    /// Sampled as stored, without pre_alter: the rule masks, which the transition draws bind as the source
+    /// texture (sub_A48C0 / sub_A7190 / sub_9FE00 bind slot + 64, never the altered copy). Every other image
+    /// goes through pre_alter, which starts with pow(x, 1 / 2.2) on the sample: an sRGB source ("Jpeg Tex" /
+    /// "Png Tex", sub_E0CD8 format 0 -> 2822 R8G8B8A8 sRGB, and the BC7 sRGB art) bakes to
+    /// pow(srgb_decode(x), 1 / 2.2), which the output curve maps back to x (`Renderer::upload_altered`).
+    pub raw: bool,
 }
 
 impl Default for Bake {
@@ -189,15 +190,17 @@ impl Default for Bake {
 }
 
 impl Bake {
-    pub const NONE: Self = Self { grade: 0, bright: 1.0, contrast: 1.0, linear: false };
+    pub const NONE: Self = Self { grade: 0, bright: 1.0, contrast: 1.0, raw: false };
+    pub const RAW: Self = Self { raw: true, ..Self::NONE };
 
     /// The bake for an STEC mode and SNX factors (modes without a grade bake no grade).
     pub fn new(stec: i32, bright: f32, contrast: f32) -> Self {
-        Self { grade: if is_grade(stec) { stec } else { 0 }, bright, contrast, linear: false }
+        Self { grade: if is_grade(stec) { stec } else { 0 }, bright, contrast, raw: false }
     }
 
-    pub fn is_none(&self) -> bool {
-        self.grade == 0 && !self.tones() && !self.linear
+    /// Whether the bake needs the pixels on the CPU (a grade or a tone); plain pre_alter runs on the GPU.
+    pub fn cpu(&self) -> bool {
+        self.grade != 0 || self.tones()
     }
 
     fn tones(&self) -> bool {
@@ -211,37 +214,48 @@ impl Bake {
             (g, false) => format!("#{g}"),
             (g, true) => format!("#{g}#{}#{}", self.bright.to_bits(), self.contrast.to_bits()),
         };
-        if self.linear { k + "#lin" } else { k }
+        if self.raw { k + "#raw" } else { k }
     }
 
-    /// Apply to RGBA8 pixels in place (alpha untouched).
-    pub fn apply(&self, px: &mut [u8]) {
-        if self.linear {
-            let lut: Vec<u8> = (0..=255u8)
-                .map(|x| {
-                    let s = f32::from(x) / 255.0;
-                    let l = if s <= 0.040_45 {
-                        s / 12.92
-                    } else {
-                        ((s + 0.055) / 1.055).powf(2.4)
-                    };
-                    (l.powf(1.0 / 2.2) * 255.0).round() as u8
-                })
-                .collect();
+    /// Apply to RGBA8 pixels in place (alpha untouched), leaving the result sRGB-encoded for an sRGB texture
+    /// (`Renderer::upload_baked`): shader 44 runs the whole bake in float and the altered texture (format 2822)
+    /// stores it encoded, so nothing rounds before that. `srgb`: the source samples through an sRGB view.
+    pub fn apply(&self, px: &mut [u8], srgb: bool) {
+        // pre_alter's first step on a source byte, in 0..255 levels
+        let pre: [f32; 256] = std::array::from_fn(|x| {
+            let s = x as f32 / 255.0;
+            let l = if self.raw || !srgb {
+                s
+            } else if s <= 0.040_45 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            255.0 * if self.raw { l } else { l.powf(1.0 / 2.2) }
+        });
+        let p = params(self.grade).filter(|_| self.grade != 0);
+        let last = |v: [f32; 3]| match &p {
+            Some(p) => channels(p, v).map(|x| self.tone(x)),
+            None => v.map(|x| self.tone(x)),
+        };
+        if p.as_ref().is_some_and(|p| p.grey) {
+            // the grey (54 R + 183 G + 19 B) / 256 is a float now: tabulate on a 1/256-level grid and interpolate
+            let lut: Vec<[f32; 3]> = (0..=255 * 256).map(|k| last([k as f32 / 256.0; 3])).collect();
             for q in px.as_chunks_mut::<4>().0 {
+                let g = (pre[usize::from(q[0])] * 54.0 + pre[usize::from(q[1])] * 183.0 + pre[usize::from(q[2])] * 19.0)
+                    / 256.0
+                    * 256.0;
+                let k = (g as usize).min(lut.len() - 2);
+                let f = g - k as f32;
                 for c in 0..3 {
-                    q[c] = lut[usize::from(q[c])];
+                    q[c] = srgb_byte(lut[k][c] + (lut[k + 1][c] - lut[k][c]) * f);
                 }
             }
-        }
-        if self.grade != 0 {
-            apply(self.grade, px);
-        }
-        if self.tones() {
-            let lut: Vec<u8> = (0..=255u8).map(|x| (self.tone(f32::from(x)) * 255.0).round() as u8).collect();
+        } else {
+            let lut: Vec<[u8; 3]> = pre.iter().map(|&x| last([x; 3]).map(srgb_byte)).collect();
             for q in px.as_chunks_mut::<4>().0 {
                 for c in 0..3 {
-                    q[c] = lut[usize::from(q[c])];
+                    q[c] = lut[usize::from(q[c])][c];
                 }
             }
         }
@@ -272,29 +286,15 @@ pub fn is_grade(mode: i32) -> bool {
     mode >= 2 && params(mode).is_some()
 }
 
-/// Apply STEC `mode` to RGBA8 pixels in place (alpha untouched).
-pub fn apply(mode: i32, px: &mut [u8]) {
-    let Some(p) = params(mode) else { return };
-    // after the optional grey, each channel only depends on its own value: tabulate it per input (the grey
-    // value is a 1/256 multiple, so it is indexed by the integer weighted sum)
-    if p.grey {
-        let lut: Vec<[u8; 3]> = (0..=255 * 256).map(|s| channels(&p, [s as f32 / 256.0; 3])).collect();
-        for q in px.as_chunks_mut::<4>().0 {
-            let s = usize::from(q[0]) * 54 + usize::from(q[1]) * 183 + usize::from(q[2]) * 19;
-            q[..3].copy_from_slice(&lut[s]);
-        }
-    } else {
-        let lut: Vec<[u8; 3]> = (0..=255u8).map(|x| channels(&p, [f32::from(x); 3])).collect();
-        for q in px.as_chunks_mut::<4>().0 {
-            for c in 0..3 {
-                q[c] = lut[usize::from(q[c])][c];
-            }
-        }
-    }
+/// The sRGB-encoded byte of a 0..1 level (what an sRGB texture stores).
+fn srgb_byte(l: f32) -> u8 {
+    let l = l.clamp(0.0, 1.0);
+    let e = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+    (e * 255.0).round() as u8
 }
 
-/// The per-channel part of the grade: levels, then the tint layers.
-fn channels(p: &Params, mut v: [f32; 3]) -> [u8; 3] {
+/// The per-channel part of the grade (0..255 levels): levels, then the tint layers.
+fn channels(p: &Params, mut v: [f32; 3]) -> [f32; 3] {
     let amount = p.amount.clamp(0.0, 1.0);
     if amount > 0.0 {
         for (c, vc) in v.iter_mut().enumerate() {
@@ -319,7 +319,7 @@ fn channels(p: &Params, mut v: [f32; 3]) -> [u8; 3] {
             v[c] = tint(v[c], rgb[c], a, mode);
         }
     }
-    v.map(|x| x.clamp(0.0, 255.0).round() as u8)
+    v.map(|x| x.clamp(0.0, 255.0))
 }
 
 #[cfg(test)]
@@ -327,14 +327,19 @@ mod tests {
     use super::*;
 
     /// The direct per-pixel form the tables replace.
-    fn reference(mode: i32, px: &mut [u8]) {
-        let Some(p) = params(mode) else { return };
+    fn reference(bake: &Bake, px: &mut [u8]) {
+        let p = params(bake.grade).unwrap();
         for q in px.as_chunks_mut::<4>().0 {
-            let mut v = [q[0], q[1], q[2]].map(f32::from);
+            let mut v = [q[0], q[1], q[2]].map(|x| {
+                let s = f32::from(x) / 255.0;
+                let l = if s <= 0.040_45 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) };
+                l.powf(1.0 / 2.2) * 255.0
+            });
             if p.grey {
                 v = [(v[0] * 54.0 + v[1] * 183.0 + v[2] * 19.0) / 256.0; 3];
             }
-            q[..3].copy_from_slice(&channels(&p, v));
+            let v = channels(&p, v).map(|x| srgb_byte(bake.tone(x)));
+            q[..3].copy_from_slice(&v);
         }
     }
 
@@ -348,25 +353,26 @@ mod tests {
             px.extend_from_slice(&[(s >> 8) as u8, (s >> 16) as u8, (s >> 24) as u8, s as u8]);
         }
         for mode in 2..TABLE.len() as i32 {
+            let bake = Bake::new(mode, 1.1, 0.9);
             let (mut a, mut b) = (px.clone(), px.clone());
-            apply(mode, &mut a);
-            reference(mode, &mut b);
-            assert!(a == b, "mode {mode}");
+            bake.apply(&mut a, true);
+            reference(&bake, &mut b);
+            // per-channel modes tabulate exactly; the grey modes interpolate, off by a step only at a rounding edge
+            let off = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            assert!(a.iter().zip(&b).all(|(x, y)| x.abs_diff(*y) <= 1) && off * 2000 < a.len(), "mode {mode}: {off}");
+            if !params(mode).unwrap().grey {
+                assert!(a == b, "mode {mode}");
+            }
         }
     }
 
     #[test]
     fn linear_bake_undoes_output_curve() {
+        // a tone that changes nothing still bakes on the CPU: the screen shows the file value again within a step
         let mut px: Vec<u8> = (0..=255u8).flat_map(|x| [x, x, x, 255]).collect();
-        Bake {
-            linear: true,
-            ..Bake::NONE
-        }
-        .apply(&mut px);
-        // dark values lift (4 -> 12), and the screen shows the file value again within a step
-        assert_eq!(px[4 * 4], 12);
+        Bake::new(0, 1.0, 1.0 + 1e-7).apply(&mut px, true);
         for x in 0..=255u8 {
-            let shown = knife_render::output_level(px[usize::from(x) * 4]);
+            let shown = knife_render::target_level(px[usize::from(x) * 4]);
             assert!(shown.abs_diff(x) <= 1, "{x} -> {shown}");
         }
     }

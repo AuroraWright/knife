@@ -170,7 +170,7 @@ fn spawn_ffmpeg(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "rgba",
+            "nv12",
             "-s",
             &format!("{W}x{H}"),
             "-",
@@ -182,13 +182,16 @@ fn spawn_ffmpeg(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(6);
     std::thread::spawn(move || {
-        let size = (W * H * 4) as usize;
+        // NV12 out of ffmpeg, converted like the platform decoder's frames (`decoder::nv12_to_rgba`)
+        let size = (W * H) as usize;
         loop {
-            let mut buf = vec![0u8; size];
+            let mut buf = vec![0u8; size * 3 / 2];
             if stdout.read_exact(&mut buf).is_err() {
                 break;
             }
-            if tx.send(buf).is_err() {
+            let uv_plane = buf.split_off(size);
+            let frame = decoder::Nv12Frame { y_plane: buf, uv_plane, width: W, height: H };
+            if tx.send(decoder::nv12_to_rgba(&frame)).is_err() {
                 break;
             }
         }
@@ -209,6 +212,7 @@ pub fn decode_audio(path: &Path) -> Option<Pcm> {
         sample_rate,
         frames,
         loop_range: None,
+        mono: false,
     })
 }
 

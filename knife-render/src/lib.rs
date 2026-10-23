@@ -12,7 +12,13 @@ use wgpu::util::DeviceExt;
 
 pub const CANVAS_W: u32 = 1920;
 pub const CANVAS_H: u32 = 1080;
-const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Every surface the exe draws into (sub_A5C10's backbuffer / temp buffer / thumbnail / saveicon surfaces, the
+/// capture, movie and display surfaces) takes sub_CD5F8's format, 2822 = nn::gfx R8_G8_B8_A8_UnormSrgb: the
+/// blend maths runs on the decoded levels as before, but a target stores them sRGB-encoded, finer in the dark
+/// and coarser in the light than 8-bit levels.
+const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// sub_A3180's altered textures (see `Renderer::upload_altered`)
+const ALTERED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -40,6 +46,10 @@ pub enum Blend {
     /// A blend computed in the shader from a copy of the target taken just before the quad is drawn (the
     /// exe's blend state 7, which captures the framebuffer per draw).
     Ps(PsOp),
+    /// Normal (premultiplied) colour with the source alpha added to the target's: the exe's blend state 0 (colour
+    /// SrcAlpha / OneMinusSrcAlpha, alpha One / One), which a draw into a cleared group surface needs so the
+    /// surface keeps the drawn alpha (`Alpha` leaves the target's alpha alone).
+    Over,
     /// Colour kept, source alpha added to the target's (the exe's blend state 0 alpha One / One, for the layer
     /// group mask sub_9FE00 / sub_A4BC0 accumulate).
     Footprint,
@@ -105,6 +115,19 @@ pub enum Shade {
     Nega,
     /// The texture's rgb with alpha 1 (shader noalpha: the exe draws a clipped layer of a layer group this way)
     NoAlpha,
+    /// The texture's rgb with the colour's alpha alone (shader 17 forcealpha)
+    ForceAlpha,
+}
+
+/// How a `Renderer::blur` pass takes its taps (see fs_blur).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlurMode {
+    /// Taps offset in uv, edges clamped, rgb only (overseas sub_9CCD0)
+    Uv = 0,
+    /// Shifted quads of shader 3 fulladd (sub_A0A90 on a picture)
+    FullAdd = 1,
+    /// Shifted quads of shader 51 whiteness (sub_A0A90 on a coverage texture)
+    White = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -124,7 +147,17 @@ enum PipeKey {
 /// the swapchain (sub_D683C: format 2822, R8G8B8A8 sRGB) with shader 1, noalpha_srgb (rgb^2.2), and the sRGB
 /// target encodes the result, so dark levels sink (12 -> 4, 21 -> 13, 63 -> 61) while 90..255 barely move.
 pub fn output_level(v: u8) -> u8 {
-    let l = (f32::from(v) / 255.0).powf(2.2);
+    output(f32::from(v) / 255.0)
+}
+
+/// The level the Switch displays for a stored (sRGB-encoded) target byte, see `TARGET_FORMAT`.
+pub fn target_level(e: u8) -> u8 {
+    let e = f32::from(e) / 255.0;
+    output(if e <= 0.040_45 { e / 12.92 } else { ((e + 0.055) / 1.055).powf(2.4) })
+}
+
+fn output(v: f32) -> u8 {
+    let l = v.powf(2.2);
     let e = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
     (e * 255.0).round().clamp(0.0, 255.0) as u8
 }
@@ -140,12 +173,14 @@ pub struct SoftClip {
     pub radius: f32,
     pub row: u32,
     pub texels: u32,
+    /// alpha inside the inner rectangle
+    pub fill: f32,
 }
 
 impl SoftClip {
     fn vertex(&self) -> [[f32; 4]; 3] {
         let (s, c) = self.rot.sin_cos();
-        [self.inner, [self.pivot[0], self.pivot[1], s, c], [self.radius, self.row as f32, self.texels as f32, 0.0]]
+        [self.inner, [self.pivot[0], self.pivot[1], s, c], [self.radius, self.row as f32, self.texels as f32, 1.0 - self.fill]]
     }
 }
 
@@ -312,6 +347,8 @@ pub struct Renderer {
     pub white: TexRef,
     soft_lut: wgpu::Texture,
     lut_group: wgpu::BindGroup,
+    /// pre_alter without a grade, into an sRGB texture (`upload_altered`)
+    alter: wgpu::RenderPipeline,
 }
 
 pub enum Upload<'a> {
@@ -462,7 +499,36 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let white = upload_texture(&device, &queue, &sprite_layout, &sampler, 1, 1, Upload::Rgba8(&[255, 255, 255, 255]), "white");
+        let white = upload_texture(&device, &queue, &sprite_layout, &sampler, 1, 1, Upload::Rgba8(&[255, 255, 255, 255]), false, "white");
+        let alter = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fs_alter"),
+            layout: Some(&sprite_pl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_alter"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: ALTERED_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         Ok(Self {
             device,
             queue,
@@ -480,6 +546,7 @@ impl Renderer {
             white,
             soft_lut,
             lut_group,
+            alter,
         })
     }
 
@@ -520,7 +587,85 @@ impl Renderer {
     /// Upload a texture. `width`/`height` are the logical size; block data must cover
     /// whole 4x4 blocks.
     pub fn upload(&self, width: u32, height: u32, data: Upload, label: &str) -> TexRef {
-        upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, label)
+        upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, false, label)
+    }
+
+    /// Upload RGBA8 pixels already baked the way pre_alter would (sRGB-encoded, see `upload_altered`).
+    pub fn upload_baked(&self, width: u32, height: u32, data: &[u8], label: &str) -> TexRef {
+        upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, Upload::Rgba8(data), true, label)
+    }
+
+    /// Upload an image the way sub_A3180 builds every sprite texture: the source (sampled through an sRGB view
+    /// when `srgb`, as the exe's "Jpeg Tex" / "Png Tex" and the BC7 sRGB art are) is drawn once through
+    /// pre_alter, which starts with pow(x, 1 / 2.2), into an "altered texture" of the graphics config's format
+    /// 0 (sub_CD5F8 -> 2822, R8G8B8A8 sRGB); draws sample that copy. The output curve then shows an opaque
+    /// texel at its file value.
+    pub fn upload_altered(&self, width: u32, height: u32, data: Upload, srgb: bool, label: &str) -> TexRef {
+        let src = upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, srgb, label);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ALTERED_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let [u, v] = src.uv_max();
+        let c = [1.0; 4];
+        let vx = |pos: [f32; 2], uv: [f32; 2]| Vertex { pos, uv, color: c, haze: [[0.0; 4]; 2], soft: [[0.0; 4]; 3] };
+        let verts = [
+            vx([-1.0, 1.0], [0.0, 0.0]),
+            vx([1.0, 1.0], [u, 0.0]),
+            vx([1.0, -1.0], [u, v]),
+            vx([-1.0, 1.0], [0.0, 0.0]),
+            vx([1.0, -1.0], [u, v]),
+            vx([-1.0, -1.0], [0.0, v]),
+        ];
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alter"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let mut encoder = self.encoder();
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("alter"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.alter);
+            pass.set_bind_group(0, &src.bind_group, &[]);
+            pass.set_bind_group(1, &self.lut_group, &[]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.draw(0..6, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        let bind_group = self.bind_group_for(&view);
+        Arc::new(GpuTexture {
+            texture,
+            view,
+            bind_group,
+            width,
+            height,
+        })
     }
 
     /// Update a sub-rectangle of an RGBA8/R8 texture (glyph atlas, movie frames).
@@ -616,6 +761,7 @@ impl Renderer {
                         Shade::Mono => "fs_mono",
                         Shade::Nega => "fs_nega",
                         Shade::NoAlpha => "fs_noalpha",
+                        Shade::ForceAlpha => "fs_forcealpha",
                     },
                     blend_state(blend),
                     &self.sprite_pl,
@@ -909,10 +1055,13 @@ impl Renderer {
 
     /// One separable gaussian blur pass of `src` into `dst` along `dir` (pixels of `src` per tap): the
     /// Switch's 2 ceil(3 sigma) + 1 taps.
-    pub fn blur(&mut self, encoder: &mut wgpu::CommandEncoder, src: &GpuTexture, dst: &RenderTarget, dir: [f32; 2], sigma: f32) {
+    /// One blur pass of `src` into `dst` (overwritten), taps `dir` canvas px apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blur(&mut self, encoder: &mut wgpu::CommandEncoder, src: &GpuTexture, dst: &RenderTarget, dir: [f32; 2], sigma: f32, mode: BlurMode) {
         self.pipeline(PipeKey::Blur, TARGET_FORMAT);
         let half = (sigma * 3.0).ceil();
-        let bg = self.trans_bind_group(&src.view, &self.white.view, &self.white.view, [dir[0], dir[1], sigma, half]);
+        let params = [dir[0], dir[1], sigma, half, mode as u32 as f32, 0.0, 0.0, 0.0];
+        let bg = self.effect_bind_group(&src.view, &self.white.view, &self.white.view, params);
         let verts = fullscreen_verts([1.0; 4]);
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fullscreen"),
@@ -1024,7 +1173,7 @@ impl Renderer {
         self.queue.present(frame);
     }
 
-    /// Read a render target back to RGBA8 (for save thumbnails / debugging).
+    /// Read a render target's stored bytes back (sRGB-encoded rgb, see `TARGET_FORMAT`; for debugging).
     pub fn read_target(&self, target: &RenderTarget) -> Vec<u8> {
         let (w, h) = (target.tex.width, target.tex.height);
         let row = (w * 4).div_ceil(256) * 256;
@@ -1135,7 +1284,7 @@ fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
                 },
             });
         }
-        Blend::Alpha => alpha,
+        Blend::Alpha | Blend::Over => alpha,
         Blend::Add => C {
             src_factor: F::One,
             dst_factor: F::One,
@@ -1157,10 +1306,11 @@ fn blend_state(b: Blend) -> Option<wgpu::BlendState> {
             operation: O::Add,
         },
     };
+    let add = matches!(b, Blend::Over);
     Some(wgpu::BlendState {
         color,
         alpha: C {
-            src_factor: F::Zero,
+            src_factor: if add { F::One } else { F::Zero },
             dst_factor: F::One,
             operation: O::Add,
         },
@@ -1195,14 +1345,16 @@ fn upload_texture(
     width: u32,
     height: u32,
     data: Upload,
+    srgb: bool,
     label: &str,
 ) -> TexRef {
+    use wgpu::TextureFormat as F;
     let (format, bytes, block) = match data {
-        Upload::Rgba8(d) => (wgpu::TextureFormat::Rgba8Unorm, d, 1),
-        Upload::Bc7(d) => (wgpu::TextureFormat::Bc7RgbaUnorm, d, 4),
-        Upload::Bc1(d) => (wgpu::TextureFormat::Bc1RgbaUnorm, d, 4),
-        Upload::Bc3(d) => (wgpu::TextureFormat::Bc3RgbaUnorm, d, 4),
-        Upload::R8(d) => (wgpu::TextureFormat::R8Unorm, d, 1),
+        Upload::Rgba8(d) => (if srgb { F::Rgba8UnormSrgb } else { F::Rgba8Unorm }, d, 1),
+        Upload::Bc7(d) => (if srgb { F::Bc7RgbaUnormSrgb } else { F::Bc7RgbaUnorm }, d, 4),
+        Upload::Bc1(d) => (if srgb { F::Bc1RgbaUnormSrgb } else { F::Bc1RgbaUnorm }, d, 4),
+        Upload::Bc3(d) => (if srgb { F::Bc3RgbaUnormSrgb } else { F::Bc3RgbaUnorm }, d, 4),
+        Upload::R8(d) => (F::R8Unorm, d, 1),
     };
     let (pw, ph) = (width.div_ceil(block) * block, height.div_ceil(block) * block);
     let texture = device.create_texture_with_data(

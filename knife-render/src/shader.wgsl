@@ -52,7 +52,7 @@ fn haze_uv(i: VsOut) -> vec2<f32> {
 
 @group(1) @binding(0) var soft_lut: texture_2d<f32>;
 
-// Clip inset mask (sub_32E30): 1 inside the inner rectangle s0 (relative to the pivot s1.xy, turned by
+// Clip inset mask (sub_32E30): 1 - s2.w inside the inner rectangle s0 (relative to the pivot s1.xy, turned by
 // asin(s1.z)), fading over s2.x target pixels past it along an alphagradation texture's radial profile (LUT row
 // s2.y of s2.z + 1 texels, edge first), sampled bilinearly as the scaled 9-slice draws it.
 fn soft_mask(i: VsOut) -> f32 {
@@ -63,7 +63,7 @@ fn soft_mask(i: VsOut) -> f32 {
     let q = vec2<f32>(p.x * i.s1.w + p.y * i.s1.z, p.y * i.s1.w - p.x * i.s1.z);
     let d = max(max(i.s0.xy - q, q - i.s0.zw), vec2<f32>(0.0));
     if (d.x <= 0.0 && d.y <= 0.0) {
-        return 1.0;
+        return 1.0 - i.s2.w;
     }
     let n = i.s2.z;
     let t = clamp((1.0 - length(d) / i.s2.x) * n - 0.5, 0.0, n);
@@ -99,6 +99,13 @@ fn fs_sprite(i: VsOut) -> @location(0) vec4<f32> {
 fn fs_noalpha(i: VsOut) -> @location(0) vec4<f32> {
     let t = sample_img(i);
     return vec4<f32>(t.rgb * i.color.rgb, 1.0);
+}
+
+// shader forcealpha: the texture's rgb times the colour, alpha the colour's alone
+@fragment
+fn fs_forcealpha(i: VsOut) -> @location(0) vec4<f32> {
+    let t = sample_img(i);
+    return vec4<f32>(t.rgb * i.color.rgb * i.color.a, i.color.a);
 }
 
 // Sprite whose rgb is replaced by a solid color, keeping the texture alpha
@@ -234,23 +241,53 @@ fn fs_rule(i: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
 
-// One pass of a separable gaussian blur: params = (dir x, dir y, sigma, half tap count). As sub_A0A90 /
-// sub_9CCD0 build it: taps -n..n (n = ceil(3 sigma)), each weighted exp(-k^2 / 2 sigma^2) / sqrt(2 pi sigma^2)
-// and summed additively, not renormalised.
+// One pass of a separable gaussian blur: params = (step x, step y in px, sigma, half tap count), params2.x = mode.
+// As sub_A0A90 / sub_9CCD0 build it: taps -n..n (n = ceil(3 sigma)), each weighted exp(-k^2 / 2 sigma^2) /
+// sqrt(2 pi sigma^2) and summed additively, not renormalised.
+// Mode 0 (overseas sub_9CCD0's meshes): the taps offset the uv, edge texels clamp, alpha 1.
+// Modes 1 / 2 (sub_A0A90): each tap is a full-target quad shifted by k steps into a cleared target, colour alpha w
+// (sub_BACF8(.., 3, w)), blend state 1 (colour SrcAlpha / One, alpha One / One), so pixels a shifted quad leaves
+// uncovered take nothing from it. Mode 1 is shader 3 fulladd (texture * colour: rgb += rgb a w, a += a w); mode 2
+// is shader 51 whiteness (white, texture alpha * colour alpha: rgb = a += a w), its coverage read from the red
+// channel (knife's text targets hold white premultiplied by coverage and no alpha; a pass's output has r = a).
 @fragment
 fn fs_blur(i: VsOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(tex0));
-    let stp = tu.params.xy / dims;
     let sigma = max(tu.params.z, 0.01);
     let n = i32(tu.params.w);
+    let mode = i32(tu.params2.x + 0.5);
     let norm = sqrt(2.0 * sigma * sigma * 3.1416);
-    var acc = vec3<f32>(0.0);
+    var acc = vec4<f32>(0.0);
     for (var k = -n; k <= n; k++) {
         let x = f32(k);
         let w = exp(-x * x / (2.0 * sigma * sigma)) / norm;
-        acc += textureSampleLevel(tex0, samp, i.uv + stp * x, 0.0).rgb * w;
+        if (mode == 0) {
+            acc += vec4<f32>(textureSampleLevel(tex0, samp, i.uv + tu.params.xy / dims * x, 0.0).rgb * w, 0.0);
+            continue;
+        }
+        let p = i.pos.xy - tu.params.xy * x;
+        if (any(p < vec2<f32>(0.0)) || any(p > dims)) {
+            continue;
+        }
+        let t = textureSampleLevel(tex0, samp, p / dims, 0.0);
+        if (mode == 1) {
+            acc += vec4<f32>(t.rgb * t.a, t.a) * w;
+        } else {
+            acc += vec4<f32>(t.r * w);
+        }
     }
-    return vec4<f32>(acc, 1.0);
+    if (mode == 0) {
+        return vec4<f32>(acc.rgb, 1.0);
+    }
+    return clamp(acc, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+// pre_alter (shader 44) as sub_A3180 builds a sprite texture without a grade: pow(x, 1 / 2.2) on the sample
+// (an sRGB source decodes first), alpha kept; the sRGB target encodes the result.
+@fragment
+fn fs_alter(i: VsOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex0, samp, i.uv);
+    return vec4<f32>(pow(t.rgb, vec3<f32>(1.0 / 2.2)), t.a);
 }
 
 // The final blit (sub_D7BD0): shader noalpha_srgb raises the frame to 2.2 and the sRGB swapchain encodes it.

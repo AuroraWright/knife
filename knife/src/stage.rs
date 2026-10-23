@@ -137,12 +137,20 @@ pub struct Layer {
     /// 0.41481) to the drawn position in the 640x448 draw space, i.e. (a, b) 1920x1080 pixels
     pub soxy: (i16, i16),
     /// Pivot (render floats 25 / 26, 640x362 units; None = `Image::anchor`, the centre cut to whole units):
-    /// STPV and motion fields 6 / 7.
-    /// Zoom and rotation turn about it, and SBAS children anchor to it.
+    /// STPV and motion fields 6 / 7. Zoom and rotation turn about it.
     pub pivot: Option<[f32; 2]>,
     /// Quad offset (render floats 18 / 19; None = minus `Image::anchor`). The image is drawn shifted by
-    /// pivot + shift: STPV moves only the pivot, motion fields 6 / 7 set shift = -pivot as well.
+    /// pivot + shift; motion fields 6 / 7 set shift = -pivot as well.
     pub shift: Option<[f32; 2]>,
+    /// The stage anchor (floats 221 / 261; None = `Image::anchor`) and shift word (2923 / 2924, whole units;
+    /// None = minus the anchor) that sub_5D3A0 makes the render pivot and shift at the next commit or load.
+    /// STPV sets both (the word to (int)-pivot) but only the render pivot at once; SBAS children anchor to
+    /// the stage anchor (sub_892B0).
+    pub stage_pivot: Option<[f32; 2]>,
+    pub stage_shift: Option<[f32; 2]>,
+    /// STPV arg 3 sets only the stage rotation (dword 161), which sub_5D3A0 makes the render rotation target
+    /// (sub_32BF0) at the next commit; STRT and motion rotation keys write both.
+    pub stage_rot: Option<f32>,
     /// quake slots 0 (SQK2) and 1 (SHK2 / SSW2)
     pub quake: [Quake; 2],
     /// SNX2 brightness (1 + v / 255) and SNX3 contrast (1 + v / 100) as the stage holds them (floats
@@ -157,12 +165,37 @@ pub struct Layer {
     pub base: Option<usize>,
     /// SACL: placed in absolute coordinates and not clipped despite having a parent
     pub absolute: bool,
-    /// STTR: alpha fades of this layer wipe through a rule image (number, texture)
-    pub rule: Option<(i32, TexRef)>,
+    /// STTR's rule number as the stage holds it (word 1142, what saves keep; cmd_STCH_impl resets it). The
+    /// draw uses `Stage::rules`.
+    pub rule: Option<i32>,
     /// STTR arg 2 (b, stage word bits 12..14): 1 mirrors the rule in x, 2 in y, 3 both
     pub rule_flip: u8,
+    /// What STBR / STCP / STRR / SACL / SBAS / SOXY wrote to the stage block since the last commit
+    pub staged: Staged,
     /// STNS: film-grain value; the layer draws the NOISE_PARTS texture instead of its image
     pub noise: Option<i32>,
+}
+
+/// Stage-block values STBR (byte 124), STCP (word 282), STRR (word 1522), SACL (byte 84), SBAS (word 1182) and
+/// SOXY (words 1222 / 1262) wrote; those commands touch only the stage, so the drawn layer keeps its values
+/// until sub_5D3A0 (`Stage::commit`) hands them over (sub_322E0 / sub_32450 / sub_322C0, render +276 / +284 /
+/// +328 through sub_3C970). None = the stage holds what is drawn.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Staged {
+    /// the STBR mode and what it renders as
+    pub stbr: Option<(i32, Blend)>,
+    pub prio: Option<i32>,
+    pub rot2: Option<i16>,
+    pub absolute: Option<bool>,
+    pub base: Option<Option<usize>>,
+    pub soxy: Option<(i16, i16)>,
+}
+
+/// A slot's render rule (render +280): the rule texture and its mirror mode.
+#[derive(Clone)]
+pub struct RenderRule {
+    pub tex: TexRef,
+    pub flip: u8,
 }
 
 /// STRA haze state of a layer (render words +284..+288, sub_645F0), stepped per frame by sub_3C970
@@ -272,8 +305,6 @@ struct Resolved {
     clip: Option<ClipRect>,
     zoom: (f32, f32),
     rot: f32,
-    /// rotation of an inherited clip (the parent's STRR) the layer is composited with, degrees
-    spin: f32,
 }
 
 /// Rotated clip rectangle in 1920x1080 canvas pixels.
@@ -309,13 +340,16 @@ impl ClipRect {
         c
     }
 
-    /// sub_32E30: with an inset, a clip of mode 0 or 7.. is masked by a rounded rectangle (drawn into render
-    /// target 1 from BORDER_PARTS) whose corners and edges fade out over the radius: (inset + odd) / 2 in
-    /// 960x540 units (twice that for mode 7, with the sharper `_2` textures), at most half the clip's extent.
-    /// Unrotated, a side reaching past the screen (or a clip spanning the whole width / height) gets no fade.
-    /// Modes 1..6 shrink the scissor by the inset instead, which cuts the faded band away.
+    /// sub_32E30: with an inset, a clip is masked by a rounded rectangle (drawn into render target 1 from
+    /// BORDER_PARTS) whose corners and edges fade out over the radius: (inset + odd) / 2 in 960x540 units
+    /// (twice that for mode 7, with the sharper `_2` textures), at most half the clip's extent. Unrotated, a side
+    /// reaching past the screen (or a clip spanning the whole width / height) gets no fade, and with a mode of
+    /// 1..6 the scissor shrinks by the inset, which cuts the faded band away. Turned, the pieces are centred on
+    /// the band (sub_B0710(0.5, 0.5), anchor 4) at r + 0.5 (r for modes 1..6), so the fade runs from 0.25 outside
+    /// the clip to 0.25 past the inner rectangle.
     pub fn soft(&self) -> Option<SoftClip> {
-        if self.inset == 0 || (1..=6).contains(&self.mode) {
+        let band = (1..=6).contains(&self.mode);
+        if self.inset == 0 || band && self.rot == 0.0 {
             return None;
         }
         let half = f32::from((self.inset & 1) + self.inset) * 0.5;
@@ -326,7 +360,9 @@ impl ClipRect {
         if r <= 0.0 {
             return None;
         }
-        let [mut rl, mut rr, mut rt, mut rb] = [r; 4];
+        // the turned pieces' overhang past each side of the band
+        let over = if self.rot == 0.0 || band { 0.0 } else { 0.25 };
+        let [mut rl, mut rr, mut rt, mut rb] = [r + over; 4];
         if self.rot == 0.0 {
             rl = if l + r <= 0.0 { 0.0 } else { r };
             rr = if rx - r >= 960.0 { 0.0 } else { r };
@@ -349,10 +385,151 @@ impl ClipRect {
             inner: [(l + rl) * s - cx, (t + rt) * s - cy, (rx - rr) * s - cx, (by - rb) * s - cy],
             pivot: [cx, cy],
             rot: self.rot.to_radians(),
-            radius: r * s,
+            radius: (r + 2.0 * over) * s,
             row,
             texels: RADII[k],
+            // a turned clip fills the inner rectangle with texture slot 343 (alphagradation512)'s centre texels
+            // 250..260 (sub_B7010, a flat white at alpha 252) instead of sub_B1580's opaque rect
+            fill: if self.rot == 0.0 { 1.0 } else { 252.0 / 255.0 },
         })
+    }
+
+    /// sub_34A70 (a2 = 2 into a lone clipped layer's target 2, -3 into the group pixel surface from sub_37EA0):
+    /// with a mode of 1..6 a ridge of the mode's colour (1 black, 2 white, 3 red, 4..6 tints; alpha 1, draw
+    /// mode 27 = blend state 0) along the clip's edges, r = inset / 2 in 960x540 units (at most half the clip's
+    /// extent) to each side of its crest, from BORDER_PARTS (`border`: alphagradation020..512 then their
+    /// `_inv`; texture and pieces qword_572990 by r as for the soft mask). Unrotated (sides zeroed as for the
+    /// soft mask) the outer half is solid (sub_B1580) and lies in the strip the shrunk scissor cuts away, and
+    /// the inner half fades out over the next r inside it: the gradation's centre-to-edge column along the
+    /// sides, the `_inv` quadrants around the corners. Turned (no scissor) the pieces hang off points r / 2 inside
+    /// the clip: rising corner quadrants outside, `_inv` ones inside, and along each side a rising strip 2r deep
+    /// (piece 1 / 3, anchored at its far end) and a falling one r deep (piece 6 / 4) that sub_34A70 places the
+    /// same way on opposite sides, so the bottom and right ridges rise inward. Quads in canvas pixels, `clip` the
+    /// scissor.
+    pub fn band(&self, border: &[TexRef], white: &TexRef) -> Vec<Quad> {
+        let half = f32::from(self.inset) * 0.5;
+        if half < 1.0 || !(1..=6).contains(&self.mode) || border.len() < 12 {
+            return Vec::new();
+        }
+        let (l, t) = (self.x * 0.5, self.y * 0.5);
+        let (rx, by) = ((self.x + self.w) * 0.5, (self.y + self.h) * 0.5);
+        let (w, h) = (rx - l, by - t);
+        let r = half.min(w * 0.5).min(h * 0.5);
+        if r <= 0.0 {
+            return Vec::new();
+        }
+        const RADII: [u32; 6] = [10, 32, 40, 64, 128, 256];
+        let k = RADII.iter().position(|&n| r < n as f32).unwrap_or(5);
+        let n = RADII[k] as f32;
+        let rgb = match self.mode {
+            2 => [1.0; 3],
+            3 => [1.0, 0.0, 0.0],
+            4 => [45.0 / 255.0, 19.0 / 255.0, 0.0],
+            5 => [246.0 / 255.0, 244.0 / 255.0, 232.0 / 255.0],
+            6 => [1.0, 232.0 / 255.0, 210.0 / 255.0],
+            _ => [0.0; 3],
+        };
+        let s = CANVAS_W as f32 / 960.0;
+        let (cx, cy) = ((l + rx) * 0.5 * s, (t + by) * 0.5 * s);
+        let (sin, cos) = self.rot.to_radians().sin_cos();
+        let clip = (self.rot == 0.0).then(|| self.corners());
+        let mut out = Vec::new();
+        // a rect of texture `tex` (texels x0, y0, x1, y1) or of the plain colour, top-left (x, y), size (w, h) in
+        // 960x540 units, turned about the clip centre
+        let mut quad = |tex: Option<usize>, x: f32, y: f32, w: f32, h: f32| {
+            let p = |x: f32, y: f32| {
+                let (dx, dy) = (x * s - cx, y * s - cy);
+                [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
+            };
+            let (tex, uv) = match tex {
+                Some(j) => {
+                    // qword_572990: corners, then the 1-texel edge strips beside the centre
+                    let m = n as u32;
+                    let [x0, y0, x1, y1] = match j & 15 {
+                        0 => [0, 0, m, m],
+                        1 => [m - 1, 0, m, m],
+                        2 => [m, 0, 2 * m, m],
+                        3 => [0, m - 1, m, m],
+                        4 => [m, m - 1, 2 * m, m],
+                        5 => [0, m, m, 2 * m],
+                        6 => [m - 1, m, m, 2 * m],
+                        _ => [m, m, 2 * m, 2 * m],
+                    };
+                    (j >> 4, [x0, y0, x1, y1].map(|v| v as f32 / (2.0 * n)))
+                }
+                None => (usize::MAX, [0.0, 0.0, 1.0, 1.0]),
+            };
+            let tex = border.get(tex).unwrap_or(white).clone();
+            let [u0, v0, u1, v1] = uv;
+            out.push(Quad {
+                pos: [p(x, y), p(x + w, y), p(x + w, y + h), p(x, y + h)],
+                uv: [[u0, v0], [u1, v0], [u1, v1], [u0, v1]],
+                clip,
+                blend: Blend::Over,
+                ..Quad::rect(tex, [0.0; 4], [rgb[0], rgb[1], rgb[2], 1.0])
+            });
+        };
+        // texture (normal k, `_inv` k + 6) and piece, packed for `quad`
+        let (gr, inv) = (k << 4, (k + 6) << 4);
+        if self.rot == 0.0 {
+            let rl = if l + r <= 0.0 || l == 0.0 && w == 960.0 { 0.0 } else { r };
+            let rr = if rx - r >= 960.0 || l == 0.0 && w == 960.0 { 0.0 } else { r };
+            let rt = if t + r <= 0.0 || t == 0.0 && h == 540.0 { 0.0 } else { r };
+            let rb = if by - r >= 540.0 || t == 0.0 && h == 540.0 { 0.0 } else { r };
+            for (on, x, y, piece, ix, iy) in [
+                (rt > 0.0 && rl > 0.0, l, t, 0, l + r, t + r),
+                (rb > 0.0 && rl > 0.0, l, by - r, 5, l + r, by - 2.0 * r),
+                (rr > 0.0 && rt > 0.0, rx - r, t, 2, rx - 2.0 * r, t + r),
+                (rb > 0.0 && rr > 0.0, rx - r, by - r, 7, rx - 2.0 * r, by - 2.0 * r),
+            ] {
+                if on {
+                    quad(None, x, y, r, r);
+                    quad(Some(inv | piece), ix, iy, r, r);
+                }
+            }
+            let (along, down) = (w - 2.0 * rl - 2.0 * rr, h - 2.0 * rt - 2.0 * rb);
+            if rt > 0.0 {
+                quad(None, l + rl, t, w - rl - rr, rt);
+                quad(Some(gr | 6), l + 2.0 * rl, t + rt, along, r);
+            }
+            if rb > 0.0 {
+                quad(None, l + rl, by - rb, w - rl - rr, rb);
+                quad(Some(gr | 1), l + 2.0 * rl, by - 2.0 * rb, along, r);
+            }
+            if rl > 0.0 {
+                quad(None, l, t + rt, rl, h - rt - rb);
+                quad(Some(gr | 4), l + rl, t + 2.0 * rt, r, down);
+            }
+            if rr > 0.0 {
+                quad(None, rx - rr, t + rt, rr, h - rt - rb);
+                quad(Some(gr | 3), rx - 2.0 * rr, t + 2.0 * rt, r, down);
+            }
+        } else {
+            // sub_B2040 anchors (unk_3C9810 / 3C9840): the piece's fraction placed on the point
+            let (x0, x1, y0, y1) = (l + r * 0.5, rx - r * 0.5, t + r * 0.5, by - r * 0.5);
+            let mut at = |piece: usize, (px, py): (f32, f32), (ax, ay): (f32, f32), w: f32, h: f32| {
+                quad(Some(piece), px - ax * w, py - ay * h, w, h);
+            };
+            for (p, g, ga, i, ia) in [
+                ((x0, y0), 0, (1.0, 1.0), 0, (0.0, 0.0)),
+                ((x0, y1), 5, (1.0, 0.0), 5, (0.0, 1.0)),
+                ((x1, y0), 2, (0.0, 1.0), 2, (1.0, 0.0)),
+                ((x1, y1), 7, (0.0, 0.0), 7, (1.0, 1.0)),
+            ] {
+                at(gr | g, p, ga, r, r);
+                at(inv | i, p, ia, r, r);
+            }
+            let mid = ((l + rx) * 0.5, (t + by) * 0.5);
+            for y in [y0, y1] {
+                at(gr | 1, (mid.0, y), (0.5, 1.0), w - 2.0 * r, 2.0 * r);
+                at(gr | 6, (mid.0, y), (0.5, 0.0), w - 4.0 * r, r);
+            }
+            for x in [x0, x1] {
+                at(gr | 3, (x, mid.1), (1.0, 0.5), 2.0 * r, h - 2.0 * r);
+                at(gr | 4, (x, mid.1), (0.0, 0.5), r, h - 4.0 * r);
+            }
+        }
+        out
     }
 
     pub fn corners(&self) -> [[f32; 2]; 4] {
@@ -362,6 +539,20 @@ impl ClipRect {
         let p = |dx: f32, dy: f32| [cx + dx * cs - dy * s, cy + dx * s + dy * cs];
         let (hw, hh) = (c.w / 2.0, c.h / 2.0);
         [p(-hw, -hh), p(hw, -hh), p(hw, hh), p(-hw, hh)]
+    }
+}
+
+/// The angle (degrees) sub_36520 turns a clip by for ROT2 `rot2`: -32768 follows the layer's own rotation `rot`
+/// (with its base's), normalised to +-180.
+fn clip_spin(rot2: i16, rot: f32) -> f32 {
+    match rot2 {
+        0 => 0.0,
+        i16::MIN => {
+            let d = (rot * 100.0) as i32 % 36000;
+            let d = if d > 18000 { d - 36000 } else if d <= -18001 { d + 36000 } else { d };
+            d.min(35999) as f32 / 100.0
+        }
+        v => f32::from(v) / 100.0,
     }
 }
 
@@ -520,6 +711,7 @@ impl Layer {
             noise: None,
             rule: None,
             rule_flip: 0,
+            staged: Staged::default(),
             pending: true,
             blend: Blend::Alpha,
             stbr: -1,
@@ -538,11 +730,40 @@ impl Layer {
             soxy: (0, 0),
             pivot: None,
             shift: None,
+            stage_pivot: None,
+            stage_shift: None,
+            stage_rot: None,
             quake: [Quake::default(); 2],
             snx: [1.0; 2],
             haze: Haze::default(),
             clip: None,
         }
+    }
+
+    /// The stage block's priority, STBR mode, ROT2, SACL flag, SBAS base and SOXY offset: what the next commit
+    /// draws, what saves keep and what the commands that read the stage see.
+    pub fn stage_prio(&self) -> i32 {
+        self.staged.prio.unwrap_or(self.prio)
+    }
+
+    pub fn stage_blend(&self) -> (i32, Blend) {
+        self.staged.stbr.unwrap_or((self.stbr, self.blend))
+    }
+
+    pub fn stage_rot2(&self) -> i16 {
+        self.staged.rot2.unwrap_or(self.rot2)
+    }
+
+    pub fn stage_absolute(&self) -> bool {
+        self.staged.absolute.unwrap_or(self.absolute)
+    }
+
+    pub fn stage_base(&self) -> Option<usize> {
+        self.staged.base.unwrap_or(self.base)
+    }
+
+    pub fn stage_soxy(&self) -> (i16, i16) {
+        self.staged.soxy.unwrap_or(self.soxy)
     }
 
     pub fn advance(&mut self, ms: f32) {
@@ -624,6 +845,12 @@ pub struct Stage {
     pub noise_rt: Option<TexRef>,
     /// What STCC left in the stage block of each layer it cleared (only saves show it)
     pub kept: Vec<Option<crate::save::Kept>>,
+    /// Render +280 per slot, the rule alpha fades wipe through: only the STTR handler writes it, and only into
+    /// a slot that shows an image (`shown`); STCC and a start or load through sub_3C550 reset it, while STCH,
+    /// the commit, a rewind and the seek leave it
+    pub rules: Vec<Option<RenderRule>>,
+    /// Render +12 per slot: the slot held an image at the last commit (sub_3C970)
+    pub shown: Vec<bool>,
     /// the quake slots' random source and unspent time for their 60 Hz steps
     quake_rng: crate::fx::Rng,
     frame_acc: f32,
@@ -639,6 +866,8 @@ impl Stage {
             noise: None,
             noise_rt: None,
             kept: vec![None; LAYERS],
+            rules: vec![None; LAYERS],
+            shown: vec![false; LAYERS],
             quake_rng: crate::fx::Rng::default(),
             frame_acc: 0.0,
             group: Group::default(),
@@ -692,11 +921,29 @@ impl Stage {
         }
     }
 
-    /// sub_5D3A0 (FADS, the end of the next-scene seek): the stage becomes what is drawn, and sub_31F30(layer,
-    /// target, target, 0 frames) lands each layer's zoom tween on the stage's zoom target (kind 0).
+    /// sub_5D3A0 (FADS, the end of the next-scene seek): the stage becomes what is drawn (sub_32300 / sub_32BB0:
+    /// the render shift and pivot from the stage word and anchor), and sub_31F30(layer, target, target, 0
+    /// frames) lands each layer's zoom tween on the stage's zoom target (kind 0).
     pub fn commit(&mut self) {
+        for (shown, l) in self.shown.iter_mut().zip(&self.layers) {
+            *shown = l.is_some();
+        }
         for l in self.layers.iter_mut().flatten() {
             l.pending = false;
+            let s = std::mem::take(&mut l.staged);
+            if let Some((m, b)) = s.stbr {
+                (l.stbr, l.blend) = (m, b);
+            }
+            l.prio = s.prio.unwrap_or(l.prio);
+            l.rot2 = s.rot2.unwrap_or(l.rot2);
+            l.absolute = s.absolute.unwrap_or(l.absolute);
+            l.base = s.base.unwrap_or(l.base);
+            l.soxy = s.soxy.unwrap_or(l.soxy);
+            l.pivot = l.stage_pivot;
+            l.shift = l.stage_shift;
+            if let Some(r) = l.stage_rot.take() {
+                l.rotation.to = r;
+            }
             for t in [&mut l.zoom_x, &mut l.zoom_y] {
                 *t = Tween::new(t.to, t.to, 0, 0);
             }
@@ -801,19 +1048,18 @@ impl Stage {
             }),
             zoom: (l.zoom_x.value() * l.motion_zoom.0, l.zoom_y.value() * l.motion_zoom.1),
             rot: l.rotation.value_rot(),
-            spin: 0.0,
         };
         if let Some(b) = l.base.filter(|&b| b != i && b < LAYERS)
             && depth < 8
             && let Some(bl) = self.layers[b].as_ref()
         {
             let br = self.resolved(b, depth + 1);
-            // anchor: the base's pivot (its stage anchor, the image centre unless STPV / a motion moved it) in
+            // anchor: the base's stage anchor (floats 221 / 261, the image centre unless STPV / a motion moved it) in
             // its own unzoomed script space; children of a sized-down image (level 1..3) scale by its level
             // (sub_89190 / sub_892B0)
             let (ax, ay, k) = match &bl.source {
                 Source::Image(img) => {
-                    let [px, py] = bl.pivot.unwrap_or(img.anchor());
+                    let [px, py] = bl.stage_pivot.unwrap_or(img.anchor());
                     (px * SCRIPT_W / UNIT_W, py * SCRIPT_H / UNIT_H, img.level)
                 }
                 Source::Color(_) => (SCRIPT_W / 2.0, SCRIPT_H / 2.0, 1.0),
@@ -832,6 +1078,10 @@ impl Stage {
             r.zoom = (r.zoom.0 * br.zoom.0, r.zoom.1 * br.zoom.1);
             r.rot += br.rot;
             r.clip = r.clip.or(br.clip);
+        }
+        // sub_32E30 / sub_36520 turn the layer's clip mask by its ROT2 (word +316) about the clip centre
+        if let Some(c) = &mut r.clip {
+            c.rot = clip_spin(l.rot2, r.rot);
         }
         if let Some(p) = l.parent.filter(|&p| p != i && p < LAYERS)
             && depth < 8
@@ -858,17 +1108,7 @@ impl Stage {
                     let rot2 = pl.rot2;
                     c.inset = pl.clip_inset;
                     c.mode = pl.clip_mode;
-                    c.rot = match rot2 {
-                        0 => 0.0,
-                        i16::MIN => {
-                            // follows the child's own rotation (with its base's), normalised to +-180
-                            let d = (r.rot * 100.0) as i32 % 36000;
-                            let d = if d > 18000 { d - 36000 } else if d <= -18001 { d + 36000 } else { d };
-                            d.min(35999) as f32 / 100.0
-                        }
-                        v => f32::from(v) / 100.0,
-                    };
-                    r.spin = c.rot;
+                    c.rot = clip_spin(rot2, r.rot);
                     c
                 });
             }
@@ -916,7 +1156,7 @@ impl Stage {
     /// clipped layer whose clip lies off screen draws nothing and does not end one. sub_37EA0 first paints the
     /// parent's clip inset band (sub_34A70(layer, -3), clip modes 1..6) into the pixel surface; it lies outside
     /// the inset scissor the mask was drawn in, so the composite never shows it.
-    pub fn draws(&mut self, white: &TexRef) -> Vec<Draw> {
+    pub fn draws(&mut self, white: &TexRef, border: &[TexRef]) -> Vec<Draw> {
         let order = self.order();
         // v69: each shown layer's parent; a parent with children maps to itself
         let mut key = [-1i32; LAYERS];
@@ -953,7 +1193,7 @@ impl Stage {
             }
             self.group.mode = mode;
             let Some(quad) = self.layer_quad(i, white) else {
-                self.end_group(&mut out);
+                self.end_group(&mut out, i, white, border);
                 if trace && mode != 0 {
                     log.push(format!("{i} (mode {mode}): alpha 0{}", if out.len() > before { ", composite" } else { "" }));
                 }
@@ -965,11 +1205,16 @@ impl Stage {
             // sub_37F50 passes 2 (a child) when the parent is shown
             let parent = l.parent.filter(|&b| b != i && b < LAYERS && self.layers[b].as_ref().is_some_and(|b| !b.pending));
             // case 2 clips to the parent's clip, the default path to the layer's own
+            let shake = self.clip_shake(l);
             let clip = match parent {
                 Some(b) => self.resolved(b, 0).clip,
                 None => self.resolved(i, 0).clip,
             }
-            .filter(|c| c.w != 0.0 && c.h != 0.0);
+            .filter(|c| c.w != 0.0 && c.h != 0.0)
+            .map(|mut c| {
+                (c.x, c.y) = (c.x + shake.0, c.y + shake.1);
+                c
+            });
             let on_screen = clip.is_none_or(|c| c.x < CANVAS_W as f32 && c.y < CANVAS_H as f32 && c.x + c.w > 0.0 && c.y + c.h > 0.0);
             if !on_screen {
                 if trace && mode != 0 {
@@ -985,10 +1230,13 @@ impl Stage {
                 continue;
             }
             match (parent.is_some(), clip.is_some()) {
-                (_, true) if flag => self.clip_draw(&mut out, quad, l.blend, abyte, parent.is_none(), haze),
+                (_, true) if flag => {
+                    let c = clip.unwrap_or_default();
+                    self.clip_draw(&mut out, quad, l.blend, abyte, parent.is_none(), haze, c, white);
+                }
                 (true, false) | (false, false) if !flag => out.push(Draw::Stage(quad)),
                 // the per-layer rule fade (sub_A6E90) bypasses the group
-                (false, false) if l.rule.is_some() && alpha < 1.0 && quad.blend == Blend::Alpha => out.push(Draw::Stage(quad)),
+                (false, false) if self.rules[i].is_some() && alpha < 1.0 && quad.blend == Blend::Alpha => out.push(Draw::Stage(quad)),
                 (_, false) if quad.blend != Blend::Alpha || haze => {
                     let inset = if haze { l.clip_inset } else { 0 };
                     self.surface_draw(&mut out, quad, l.blend, abyte, inset);
@@ -998,10 +1246,16 @@ impl Stage {
                     out.push(Draw::Mask { quad: footprint(&quad, quad.color[3]), clear: first });
                     out.push(Draw::Stage(quad));
                 }
-                (_, true) => out.push(Draw::Stage(quad)),
+                (_, true) => {
+                    let c = clip.unwrap_or_default();
+                    match c.band(border, white) {
+                        band if band.is_empty() => out.push(Draw::Stage(quad)),
+                        band => band_draw(&mut out, quad, c, band, white),
+                    }
+                }
             }
             if parent.is_some() || clip.is_some() {
-                self.end_group(&mut out);
+                self.end_group(&mut out, i, white, border);
             }
             for d in out[before..].iter().filter(|_| trace) {
                 match d {
@@ -1025,7 +1279,7 @@ impl Stage {
     fn surface_draw(&mut self, out: &mut Vec<Draw>, mut quad: Quad, blend: Blend, abyte: u8, inset: i16) {
         if std::mem::take(&mut self.group.first) {
             quad.color[3] = 1.0;
-            (quad.blend, quad.shade) = if inset < 1 { (Blend::Alpha, Shade::Sprite) } else { (Blend::Opaque, Shade::NoAlpha) };
+            (quad.blend, quad.shade) = if inset < 1 { (Blend::Over, Shade::Sprite) } else { (Blend::Opaque, Shade::NoAlpha) };
             self.group.blend = blend;
             self.group.alpha = abyte;
             out.push(Draw::Mask { quad: footprint(&quad, 1.0), clear: true });
@@ -1036,11 +1290,26 @@ impl Stage {
     }
 
     /// sub_A6570 under the group flag (and sub_A74B0 after a clipped layer that is not a child).
-    fn clip_draw(&mut self, out: &mut Vec<Draw>, mut quad: Quad, blend: Blend, abyte: u8, own: bool, haze: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn clip_draw(
+        &mut self,
+        out: &mut Vec<Draw>,
+        mut quad: Quad,
+        blend: Blend,
+        abyte: u8,
+        own: bool,
+        haze: bool,
+        clip: ClipRect,
+        white: &TexRef,
+    ) {
         let first = std::mem::take(&mut self.group.first);
-        // a layer's own clipped draw passes alpha 1 (sub_36520: v101 = 1 in the group branch; sub_A74B0 saves its
-        // alpha afterwards), a child its alpha
-        let drawn = if own { 255 } else { u32::from(abyte) };
+        // sub_36520 LABEL_101: the target 1 redraw below runs at colour alpha v280 (the layer's alpha), or 1 when
+        // sub_3C10 finds a render colour (+460: a multiply colour other than white or an add colour)
+        let tinted = quad.shade != Shade::Fill && quad.color[..3] != [1.0; 3];
+        let mask_alpha = if tinted { 1.0 } else { quad.color[3] };
+        // that colour also reaches the pixel draw (a child's is its alpha times the parent's; sub_A74B0 saves the
+        // layer's alpha afterwards)
+        let drawn = if own && tinted { 255 } else { u32::from(abyte) };
         let a = if first {
             1.0
         } else if self.group.alpha == 0 {
@@ -1056,10 +1325,48 @@ impl Stage {
         if quad.blend == Blend::Alpha {
             quad.blend = Blend::Ps(knife_render::PsOp::Normal);
         }
-        // a rule fade only shapes target 1 (sub_A7190), i.e. the mask; the group branch has no soft clip mask
-        // (sub_32E30), only the scissor
+        // a rule fade and the soft clip only shape target 1 (sub_A7190, sub_32E30), i.e. the mask; the pixels get
+        // the scissor alone
         let rule = quad.rule.take();
-        quad.soft = None;
+        let soft = quad.soft.take();
+        // with ROT2 (word +316) sub_36520 sets no scissor: the turned mask alone shapes the layer; a child's
+        // target 1 is then texture slot 343 (alphagradation512)'s centre texels 250..260, a flat white at alpha
+        // 252, stretched over the clip and turned by ROT2 (sub_B7010; sub_B0480 gets ROT2 in 1/65536 turns)
+        let turned = (clip.rot != 0.0).then(|| quad.clip.take());
+        let first_mask = match turned {
+            Some(clip) if !own => {
+                let mut f = footprint(&quad, 252.0 / 255.0);
+                f.clip = clip;
+                f
+            }
+            _ => footprint(&quad, 1.0),
+        };
+        // sub_36520 then redraws target 1 for sub_A74B0 to copy into the mask: with a clip inset sub_32E30's soft
+        // inset rectangle (a clip of the whole screen at 0, 0 skips that and sub_A74B0), else the layer's image
+        // through the default shader (id 40, blend state 4, so its alpha; 38 on the haze path) or the rule wipe
+        let mask = match own {
+            false => None,
+            true if clip.inset != 0 => {
+                let r = clip.inset_rect();
+                let whole = r.x == 0.0 && r.y == 0.0 && r.w >= CANVAS_W as f32 && r.h >= CANVAS_H as f32;
+                (!whole).then(|| {
+                    let mut rect = Quad::rect(white.clone(), [0.0; 4], [1.0; 4]);
+                    rect.pos = clip.corners();
+                    rect.clip = quad.clip;
+                    rect.soft = soft;
+                    rect.blend = Blend::Opaque;
+                    rect
+                })
+            }
+            true => {
+                // sub_A7190's rule wipe already takes the alpha as its colour (RuleMask)
+                let mut rect = footprint(&quad, if rule.is_some() { 1.0 } else { mask_alpha });
+                rect.haze = quad.haze;
+                rect.blend = Blend::Opaque;
+                rect.rule = rule;
+                Some(rect)
+            }
+        };
         // the layer's own image goes into target 2 through noalpha (id 8; 38 on the haze path)
         if own && !haze {
             quad.shade = Shade::NoAlpha;
@@ -1067,33 +1374,60 @@ impl Stage {
         if first {
             self.group.blend = blend;
             self.group.alpha = abyte;
-            out.push(Draw::Mask { quad: footprint(&quad, 1.0), clear: true });
+            out.push(Draw::Mask { quad: first_mask, clear: true });
         }
-        if own {
-            let mut rect = footprint(&quad, 1.0);
-            rect.tex = quad.tex.clone();
-            rect.shade = Shade::NoAlpha;
-            rect.blend = Blend::Opaque;
-            rect.rule = rule;
+        if let Some(rect) = mask {
             out.push(Draw::Mask { quad: rect, clear: true });
             self.group.alpha = abyte;
         }
         out.push(Draw::Pixel { quad, clear: first });
     }
 
-    /// sub_37EA0
-    fn end_group(&mut self, out: &mut Vec<Draw>) {
+    /// sub_37EA0, at the group's last layer `i`: its clip band (ClipRect::band) into the pixel surface, then the
+    /// composite
+    fn end_group(&mut self, out: &mut Vec<Draw>, i: usize, white: &TexRef, border: &[TexRef]) {
         if self.group.mode == 2 && !self.group.first {
+            let band = self.band_clip(i).map(|c| c.band(border, white)).unwrap_or_default();
+            out.extend(band.into_iter().map(|quad| Draw::Pixel { quad, clear: false }));
             out.push(Draw::Composite { blend: self.group.blend, alpha: f32::from(self.group.alpha) / 255.0 });
             self.group.mode = 0;
         }
+    }
+
+    /// The screen shake sub_32050 adds to layer `l`'s clip (none for an exempt image or a colour fill), in canvas
+    /// pixels: sub_34440's twice the 640x448 offset.
+    fn clip_shake(&self, l: &Layer) -> (f32, f32) {
+        match &l.source {
+            Source::Image(img) if !img.no_shake => {
+                (2.0 * self.shake.0 * CANVAS_W as f32 / 640.0, 2.0 * self.shake.1 * CANVAS_H as f32 / 448.0)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// sub_37EA0's clip for the band of a group's last layer `i`: its parent's clip (+276) and STRR (+316) copied
+    /// over, with the inset and mode sub_37F50 left it (the parent's unless SACL-absolute), shaken by sub_32050.
+    fn band_clip(&self, i: usize) -> Option<ClipRect> {
+        let l = self.layers[i].as_ref()?;
+        let parent = l.parent.filter(|&p| p != i && p < LAYERS && self.layers[p].is_some());
+        let mut c = match parent {
+            Some(p) if l.absolute => {
+                let mut c = self.resolved(p, 0).clip?;
+                (c.inset, c.mode) = (l.clip_inset, l.clip_mode);
+                c
+            }
+            _ => self.resolved(i, 0).clip?,
+        };
+        let (sx, sy) = self.clip_shake(l);
+        (c.x, c.y) = (c.x + sx, c.y + sy);
+        (c.w != 0.0 && c.h != 0.0).then_some(c)
     }
 
     /// Layer `i` as drawn onto the stage, or None while its alpha is 0.
     fn layer_quad(&self, i: usize, white: &TexRef) -> Option<Quad> {
         {
             let l = self.layers[i].as_ref()?;
-            let Resolved { x, y, alpha, clip, zoom: (zx, zy), rot, spin } = self.resolved(i, 0);
+            let Resolved { x, y, alpha, clip, zoom: (zx, zy), rot } = self.resolved(i, 0);
             if alpha <= 0.0 {
                 return None;
             }
@@ -1107,7 +1441,7 @@ impl Stage {
                 Source::Color(_) => true,
             };
             let full = (2.0 * self.shake.0 * CANVAS_W as f32 / 640.0, 2.0 * self.shake.1 * CANVAS_H as f32 / 448.0);
-            let shake = if exempt(l) { (0.0, 0.0) } else { full };
+            let shake = self.clip_shake(l);
             let clip = clip.map(|mut c| {
                 c.x += shake.0;
                 c.y += shake.1;
@@ -1161,18 +1495,11 @@ impl Stage {
                 uv = [0.0, 0.0, 1.0, 1.0];
             }
             let (sin, cos) = rot.sin_cos();
-            // a child of a rotated clip is drawn into the clip rect and composited turned about its centre
-            let (ssin, scos) = spin.to_radians().sin_cos();
-            let (scx, scy) = clip.map_or((0.0, 0.0), |c| (c.x + c.w / 2.0, c.y + c.h / 2.0));
+            // ROT2 turns only the clip mask (sub_32E30 / sub_36520), never the layer or its children
             let corner = |px: f32, py: f32| {
                 let dx = (px - ox) * zx;
                 let dy = (py - oy) * zy;
-                let (qx, qy) = (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
-                if spin == 0.0 {
-                    return [qx, qy];
-                }
-                let (rx, ry) = (qx - scx, qy - scy);
-                [scx + rx * scos - ry * ssin, scy + rx * ssin + ry * scos]
+                [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
             };
             // sub_37F50 -> sub_32C70: a layer that is not a colour fill is multiplied by its render colour
             // (+460: white unless a motion's colour keys set it)
@@ -1192,10 +1519,10 @@ impl Stage {
             };
             // with a rule, sub_36520 draws the layer at colour 1 into target 2 and that through the rule with
             // sub_A7190: the draw alpha is both the wipe progress and the colour, so it also fades
-            let rule = l.rule.as_ref().map(|(_, t)| knife_render::RuleMask {
+            let rule = self.rules[i].as_ref().map(|r| knife_render::RuleMask {
                 // the shader compares c3[0x3c] with 1 / 2 / 3: 1 and 3 mirror x, 2 and 3 mirror y
-                flip: if l.rule_flip <= 3 { l.rule_flip } else { 0 },
-                ..knife_render::RuleMask::new(t.clone(), alpha.clamp(0.0, 1.0))
+                flip: if r.flip <= 3 { r.flip } else { 0 },
+                ..knife_render::RuleMask::new(r.tex.clone(), alpha.clamp(0.0, 1.0))
             });
             // STRA: the layer's texture (slot 393 + layer) is drawn through the haze shader
             let haze = match &l.source {
@@ -1221,6 +1548,33 @@ impl Stage {
             })
         }
     }
+}
+
+/// sub_36520 for a clipped layer outside a group whose clip has a band: the layer into target 2 at alpha 1,
+/// sub_34A70(layer, 2) over it, sub_32E30's mask into target 1 and target 2 composited through it at the layer's
+/// alpha with its blend. A rule wipe or haze layer goes onto the stage with the band at its alpha over it.
+fn band_draw(out: &mut Vec<Draw>, mut quad: Quad, clip: ClipRect, band: Vec<Quad>, white: &TexRef) {
+    let alpha = quad.color[3];
+    if quad.rule.is_some() || quad.haze[0][3] > 0.5 {
+        out.push(Draw::Stage(quad));
+        out.extend(band.into_iter().map(|mut q| {
+            q.color[3] *= alpha;
+            Draw::Stage(q)
+        }));
+        return;
+    }
+    let mut rect = Quad::rect(white.clone(), [0.0; 4], [1.0; 4]);
+    rect.pos = clip.corners();
+    rect.clip = quad.clip;
+    rect.soft = quad.soft.take();
+    rect.blend = Blend::Opaque;
+    out.push(Draw::Mask { quad: rect, clear: true });
+    // the default shader through blend state 4: a straight copy
+    let blend = std::mem::replace(&mut quad.blend, Blend::Opaque);
+    quad.color[3] = 1.0;
+    out.push(Draw::Pixel { quad, clear: true });
+    out.extend(band.into_iter().map(|quad| Draw::Pixel { quad, clear: false }));
+    out.push(Draw::Composite { blend, alpha });
 }
 
 /// A quad's alpha as the group mask takes it: the default shader (texture alpha times `alpha`), no rule.
@@ -1255,6 +1609,44 @@ mod tests {
         assert!(!t.done());
         t.step();
         assert!(t.done() && t.value() == 1.0);
+    }
+
+    #[test]
+    fn commit_gives_the_render_layer_the_stage_anchor_shift_and_rotation() {
+        // STPV leaves the render offset and rotation as they are; sub_5D3A0 then takes the shift word (int)-pivot
+        // and the stage rotation, so the pivot lands on the layer's position
+        let mut s = Stage::new();
+        let mut l = Layer::new("WHITE".into(), Source::Color([1.0; 3]), 240.0, 136.0, 10);
+        l.stage_pivot = Some([317.33, 179.67]);
+        l.pivot = l.stage_pivot;
+        l.stage_shift = Some([-317.0, -179.0]);
+        l.stage_rot = Some(12.0);
+        s.set(0, l);
+        let l = s.get(0).unwrap();
+        assert_eq!((l.shift, l.rotation.to), (None, 0.0));
+        s.commit();
+        let l = s.get(0).unwrap();
+        assert_eq!((l.pivot, l.shift), (Some([317.33, 179.67]), Some([-317.0, -179.0])));
+        assert_eq!((l.rotation.to, l.stage_rot), (12.0, None));
+    }
+
+    #[test]
+    fn stage_only_commands_reach_the_drawn_layer_at_the_commit() {
+        // STCP / STBR / STRR write only the stage block: the layer is drawn as before until sub_5D3A0
+        let mut s = Stage::new();
+        let mut l = Layer::new("WHITE".into(), Source::Color([1.0; 3]), 240.0, 136.0, 10);
+        l.pending = false;
+        s.set(3, l);
+        let l = s.get(3).unwrap();
+        l.staged.prio = Some(0);
+        l.staged.stbr = Some((17, Blend::Add));
+        l.staged.rot2 = Some(-500);
+        assert_eq!((l.prio, l.stbr, l.rot2, l.stage_prio()), (10, -1, 0, 0));
+        assert!(!s.shown[3]);
+        s.commit();
+        let l = s.get(3).unwrap();
+        assert_eq!((l.prio, l.stbr, l.blend, l.rot2), (0, 17, Blend::Add, -500));
+        assert!(l.staged.prio.is_none() && s.shown[3]);
     }
 
     #[test]
