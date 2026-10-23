@@ -22,7 +22,8 @@ language =
 
 ; Save file (the Switch's savedata000 format). Defaults to knife/savedata000
 ; (knife/overseas/savedata000 for the overseas release) in the system app data
-; folder (~/Library/Application Support on macOS, %APPDATA% on Windows).
+; folder (~/Library/Application Support on macOS, %APPDATA% on Windows,
+; ~/.local/share on Linux).
 save-file =
 
 ; Serve displayed text over WebSocket at HOST:PORT, e.g. 127.0.0.1:6677.

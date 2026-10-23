@@ -50,13 +50,23 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 |---|---|
 | `-a`, `--assets-dir DIR` | the game data folder |
 | `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (overseas release only; by default the config's setting) |
-| `-s`, `--save-file PATH` | the save file (by default `knife/savedata000` in the system's app data folder, `knife/overseas/savedata000` for the overseas release) |
+| `-s`, `--save-file PATH` | the save file (see below for the default) |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
 | `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |
 
 With `--text-websocket`, every client receives each message as plain text and each choice's options one per
 line; a client that connects late first gets the most recent text.
+
+The default save file is in:
+
+- macOS: `~/Library/Application Support/knife/savedata000`
+- Windows: `%APPDATA%\knife\savedata000`
+- Linux: `~/.local/share/knife/savedata000` (or `$XDG_DATA_HOME/knife/savedata000`)
+
+The overseas release uses `knife/overseas/savedata000` in the same folder. Settings, unlocks, read text and save
+slots are all stored in this one file, in the Switch game's own format, so a save copied from a Switch loads as
+is, and the reverse also works.
 
 ### knife.ini
 
