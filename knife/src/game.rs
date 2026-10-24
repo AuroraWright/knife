@@ -4386,7 +4386,10 @@ impl Game {
                 // last one stopped
                 self.icon_ticks = (self.icon_ticks + (self.frame_ms * 0.06).min(2.0)) % (2 * frames) as f32;
                 if let Some(t) = self.disp.get(slot - usize::from(DISP_SLOT0)) {
-                    let frame = ((self.icon_ticks / 2.0) as u32 % frames) as f32;
+                    let frame = (self.icon_ticks / 2.0) as u32 % frames;
+                    // the frame rects (dword_572B48, both builds) step one cell a frame, except the page icon's
+                    // last, which repeats frame 103: pageBreak_a's 105th cell is empty
+                    let frame = if slot == 55 && frame == 104 { 103.0 } else { frame as f32 };
                     let tw = t.texture.size().width as f32;
                     let th = t.texture.size().height as f32;
                     let (w, h) = (fw * ICON_SCALE.0, fh * ICON_SCALE.1);
