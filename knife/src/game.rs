@@ -744,6 +744,9 @@ pub struct Game {
     /// byte_146E648: a ZL rewind restored a message; until the next ring push, the message / MSAD / ATSV
     /// paths do not refresh the save point
     ring_restored: bool,
+    /// a load ended with the ring indices back at 0 (sub_82330 after sub_5D950 / jp_82330 after sub_3E8D0:
+    /// AE0460 = AE04D0 = 0): the next push takes slot 0, the record's own
+    ring_reuse: bool,
     /// voice of the message being shown (mode panel voice replay)
     last_voice: Option<String>,
     /// VPLY's voice until the next message takes it (off_AE08B0)
@@ -1031,6 +1034,7 @@ impl Game {
             seek_ended: false,
             seek_defer: false,
             ring_restored: false,
+            ring_reuse: false,
             last_voice: None,
             pending_voice: None,
             stage_dirty: false,
@@ -1964,6 +1968,9 @@ impl Game {
             let oldest = self.history.front().map_or(0, |h| h.serial);
             self.backlog_pages.retain(|p| p.last.is_some_and(|l| l >= oldest));
         }
+        if std::mem::take(&mut self.ring_reuse) {
+            self.history.pop_back();
+        }
         let serial = self.ring_serial;
         self.ring_serial += 1;
         self.ring_restored = false;
@@ -2121,6 +2128,7 @@ impl Game {
             Some(i) => self.rewind_to(r, i, Back::Point),
             None => {
                 self.history.clear();
+                self.ring_reuse = false;
                 self.backlog_pages.clear();
                 self.page_ring = (None, None);
                 let d = point.data.clone();
@@ -2162,6 +2170,8 @@ impl Game {
             }
         }
         self.history.truncate(i + 1);
+        // sub_5BAF0 sets AE04D0 to the slot after the restored one
+        self.ring_reuse = false;
         self.node_seq = tag;
         self.seek_node = false;
         self.restore_with(r, &d, how != Back::Point);
@@ -6645,9 +6655,9 @@ impl Game {
         self.history.clear();
         self.backlog_pages.clear();
         self.page_ring = (None, None);
-        // sub_5D950 starts the page ring over with the record in slot 0 (sub_5BAF0(0, 0) makes it the newest),
-        // and its message pushes a second entry as it replays, so a held rewind goes back to the record at once
-        // (Switch: ZL right after a load replays the page)
+        // sub_5D950 starts the page ring over with the record in slot 0 (sub_5BAF0(0, 0) makes it the newest);
+        // sub_82330 then sets AE0460 = AE04D0 = 0, so the replayed message's push takes slot 0 again and the
+        // ring (and the backlog) holds the page once
         let key = (d.scene, d.pc, usize::MAX - 1);
         self.push_ring(crate::save::SaveData { prev: None, ..d.clone() }, key, false, d.kind);
         self.scene_ring.clear();
@@ -6663,6 +6673,7 @@ impl Game {
         self.restore_save_point(d, false, d.kind);
         self.scene_ring.pop();
         self.scene_msgs = 0;
+        self.ring_reuse = true;
     }
 
     /// `rewind`: the BGM keeps playing when the snapshot has the same one, the window stays hidden until the
@@ -6867,6 +6878,7 @@ impl Game {
         // sub_57240 clears the queued SE commands
         self.se_delayed.clear();
         self.history.clear();
+        self.ring_reuse = false;
         self.backlog_pages.clear();
         self.read_key = None;
         self.node_seq = 0;
