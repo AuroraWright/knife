@@ -596,18 +596,23 @@ impl ApplicationHandler for App {
                     ui.mouse_move(g, x, y);
                     match button {
                         MouseButton::Left => ui.mouse_down(g, r),
-                        MouseButton::Right => ui.cancel(g, r),
+                        // a right click is the B button on every screen
+                        MouseButton::Right => ui.pad(g, r, Pad::B, true, false),
                         _ => {}
                     }
                 }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
-                button: MouseButton::Left,
+                button,
                 ..
             } => {
                 if let (Some(g), Some(ui), Some(r)) = (&mut self.game, &mut self.ui, &self.renderer) {
-                    ui.mouse_up(g, r);
+                    match button {
+                        MouseButton::Left => ui.mouse_up(g, r),
+                        MouseButton::Right => ui.pad(g, r, Pad::B, false, false),
+                        _ => {}
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

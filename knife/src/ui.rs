@@ -3964,7 +3964,7 @@ impl Ui {
         }
     }
 
-    /// Right click / escape.
+    /// B off the story's own keys; in the story, the system menu (Y, a right flick from the left edge).
     pub fn cancel(&mut self, game: &mut Game, r: &Renderer) {
         if self.popup_input() || self.dlg_holding() {
             return;

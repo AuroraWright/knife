@@ -103,7 +103,7 @@ the controller labels them, Plus / Minus as Start / Back).
 | Arrow keys | D-pad |
 | W / A / S / D | left stick |
 | Enter | A (confirm, advance text) |
-| Escape | B (cancel, back) |
+| Escape, right click | B (cancel, back) |
 | B | X |
 | M | Y |
 | H / J | L / R |
@@ -125,8 +125,8 @@ the controller labels them, Plus / Minus as Start / Back).
 | Y | system menu |
 | L | auto mode on / off |
 | R | skip mode on / off |
-| ZL (hold) | rewind, faster the longer it is held |
-| ZR (hold) | fast forward, faster the longer it is held |
+| ZL (hold) | rewind |
+| ZR (hold) | fast forward |
 | D-pad / right stick up | open the mode panel |
 | D-pad / right stick down | advance text, close the mode panel |
 | D-pad up / down | move between choices |
@@ -137,7 +137,7 @@ the controller labels them, Plus / Minus as Start / Back).
 | drag left / right from the middle | rewind / fast forward, faster the further it is dragged |
 | flick down from the top edge, or pointer at the top edge | open the mode panel |
 | flick up, or tap below the panel | close the mode panel |
-| flick right from the left edge, or right click | system menu |
+| flick right from the left edge | system menu |
 | flick left from the right edge | backlog |
 | pointer at the bottom edge | hide the message window |
 
