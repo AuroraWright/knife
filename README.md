@@ -1,26 +1,30 @@
 # knife
 
-A Rust reimplementation of the engine of Tsukihime -A piece of blue glass moon- for Nintendo Switch. It plays
-the game from the Switch release's data and aims to behave exactly like the original: it is heavily based on a
-decompilation of the original Switch executable, and its behaviour is checked against the Switch game running in
-an emulator.
+A Rust reimplementation of the engine of Tsukihime -A piece of blue glass moon- and Witch on the Holy Night for
+Nintendo Switch. It plays the games from their Switch releases' data and aims to behave exactly like the
+originals: it is heavily based on a decompilation of the original Switch executables, and its behaviour is
+checked against the Switch games running in an emulator.
 
-![The title screen of the overseas release in knife](screenshot.png)
+![The title screen of Tsukihime's overseas release in knife](screenshot.png)
 
-Both releases are supported: the Japanese one and the overseas one (English, Simplified and Traditional
-Chinese besides Japanese).
+![The title screen of Witch on the Holy Night in English in knife](screenshot_woh.png)
+
+Both releases of Tsukihime are supported: the Japanese one and the overseas one (English, Simplified and
+Traditional Chinese besides Japanese). So is the Switch release of Witch on the Holy Night (Japanese, English,
+Simplified and Traditional Chinese). knife tells the games apart by their data.
 
 knife is inspired by [shin](https://github.com/DCNick3/shin), DCNick3's reimplementation of the engine of
 the Switch visual novels by Entergram, and shares some of its code.
 
 [engine-writeup.md](engine-writeup.md) describes how the original engine works: the game data, the script
-machine and its frame loop, text, the stage, sound, saves and the full instruction set.
+machine and its frame loop, text, the stage, sound, saves and the full instruction set, and what Witch on the
+Holy Night does differently.
 
 ## Game data
 
 knife needs the game data from your own copy of the game:
 
-1. Extract the romfs of the Switch release.
+1. Extract the romfs of the game's Switch release.
 2. Add the Switch's shared system font, which the menus and help lines use. Dump
    `nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (system title 0100000000000811)
    and copy it into the extracted romfs folder, for example:
@@ -30,10 +34,10 @@ knife needs the game data from your own copy of the game:
    cp fontstandard/nintendo_udsg-r_std_003.bfttf <romfs folder>/
    ```
 
-   The Chinese languages of the overseas releases also use the Chinese system fonts: copy the `.bfttf` files
-   of FontChineseSimplified (0100000000000814: `nintendo_udsg-r_org_zh-cn_003.bfttf`,
-   `nintendo_udsg-r_ext_zh-cn_003.bfttf`) and FontChineseTraditional (0100000000000813:
-   `nintendo_udjxh-db_zh-tw_003.bfttf`) into the same folder.
+   The Chinese languages of Tsukihime's overseas release and of Witch on the Holy Night also use the Chinese
+   system fonts: copy the `.bfttf` files of FontChineseSimplified (0100000000000814:
+   `nintendo_udsg-r_org_zh-cn_003.bfttf`, `nintendo_udsg-r_ext_zh-cn_003.bfttf`) and FontChineseTraditional
+   (0100000000000813: `nintendo_udjxh-db_zh-tw_003.bfttf`) into the same folder.
 
 By default knife looks for this folder as `assets` next to the executable (inside a macOS app bundle, also
 `Contents/Resources/assets`).
@@ -54,7 +58,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | Option | |
 |---|---|
 | `-a`, `--assets-dir DIR` | the game data folder |
-| `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (overseas release only; by default the config's setting) |
+| `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (Tsukihime's overseas release and Witch on the Holy Night; by default the config's setting) |
 | `-s`, `--save-file PATH` | the save file (see below for the default) |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
@@ -69,9 +73,9 @@ The default save file is in:
 - Windows: `%APPDATA%\knife\savedata000`
 - Linux: `~/.local/share/knife/savedata000` (or `$XDG_DATA_HOME/knife/savedata000`)
 
-The overseas release uses `knife/overseas/savedata000` in the same folder. Settings, unlocks, read text and save
-slots are all stored in this one file, in the Switch game's own format, so a save copied from a Switch loads as
-is, and the reverse also works.
+Tsukihime's overseas release uses `knife/overseas/savedata000` in the same folder, Witch on the Holy Night
+`knife/witch/savedata000`. Settings, unlocks, read text and save slots are all stored in this one file, in the
+Switch game's own format, so a save copied from a Switch loads as is, and the reverse also works.
 
 ### knife.ini
 
@@ -127,6 +131,8 @@ the controller labels them, Plus / Minus as Start / Back).
 | R | skip mode on / off |
 | ZL (hold) | rewind |
 | ZR (hold) | fast forward |
+| Plus or L3 | quick save (Witch on the Holy Night) |
+| Minus | quick load (Witch on the Holy Night) |
 | D-pad / right stick up | open the mode panel |
 | D-pad / right stick down | advance text, close the mode panel |
 | D-pad up / down | move between choices |
@@ -137,8 +143,8 @@ the controller labels them, Plus / Minus as Start / Back).
 | drag left / right from the middle | rewind / fast forward, faster the further it is dragged |
 | flick down from the top edge, or pointer at the top edge | open the mode panel |
 | flick up, or tap below the panel | close the mode panel |
-| flick right from the left edge | system menu |
-| flick left from the right edge | backlog |
+| flick right from the left edge | system menu (Witch on the Holy Night: backlog) |
+| flick left from the right edge | backlog (Witch on the Holy Night: system menu) |
 | pointer at the bottom edge | hide the message window |
 
 The mode panel holds previous scene, rewind, auto, skip, next scene, quick save, quick load and voice replay.

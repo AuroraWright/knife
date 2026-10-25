@@ -57,8 +57,9 @@ struct Cli {
     language: Option<i16>,
     /// Read and write saves in this file (the Switch's savedata000 format).
     ///
-    /// Defaults to "knife/savedata000" ("knife/overseas/savedata000" for the overseas data) in the OS
-    /// application data directory (e.g. ~/Library/Application Support on macOS, %APPDATA% on Windows).
+    /// Defaults to "knife/savedata000" ("knife/overseas/savedata000" for the overseas data,
+    /// "knife/witch/savedata000" for Witch on the Holy Night) in the OS application data directory (e.g.
+    /// ~/Library/Application Support on macOS, %APPDATA% on Windows).
     #[arg(short, long)]
     save_file: Option<PathBuf>,
     /// Serve displayed text over WebSocket at HOST:PORT (e.g. 127.0.0.1:6677)
