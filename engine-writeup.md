@@ -1,6 +1,6 @@
 # The Tsukihime Engine
 
-How the Switch release of Tsukihime: A Piece of Blue Glass Moon runs its game, as reverse engineered for knife, the Rust reimplementation: data formats, the script machine, the frame loop, and the full instruction set.
+How the Switch release of Tsukihime: A Piece of Blue Glass Moon runs its game, as reverse engineered for knife, the Rust reimplementation: data formats, the script machine, the frame loop, and the full instruction set. The last section covers Witch on the Holy Night, which runs on the same engine, and what it does differently.
 
 ## At a glance
 
@@ -465,17 +465,137 @@ The overseas release (Tsukihime -A piece of blue glass moon-, with English and C
 | Endings gallery | Unlocked by the node bit | Unlocked by its completed nodes (G300 bits) |
 | Save file |  | Same format, so saves are interchangeable apart from the language setting |
 
+## Witch on the Holy Night
+
+The Switch release of Witch on the Holy Night (executable project `witch`, NintendoSDK 14.3.0) runs on the same nexl engine as Tsukihime, with the same script syntax, frame loop, stage, sound system and history ring. Around that core it has its own script, menus and executable tables, and it changes many details. knife recognises its data by `jallpac.nam` and runs it from the same code as the two Tsukihime builds. The game-specific parts live in a `witch` module and in `Build::Witch` branches next to the Tsukihime code they replace.
+
+The port started by matching the two executables function by function: 5,159 of the Japanese Tsukihime's functions have a counterpart in WoH, found directly or through the overseas build. Then each pair was compared for changed constants, call arguments and control flow, and only those were reverse engineered again. The results were checked against the Switch game running in an emulator.
+
+### Game data
+
+| File | Size | Holds |
+| --- | --- | --- |
+| `jallpac.mrg` | 6.3 GB | Story images: backgrounds, the character sprites (`AOK_`, `SOU_`, `ARI_`, ...), effects, rule masks |
+| `jallpachd.mrg` | 12.8 GB | The same pictures at full 1920 × 1080 size, which the CG viewer reads |
+| `allpacml`, `allpachdml` | 36 / 70 MB | Multi-language image sets (157 and 80 images), normal and HD |
+| `allui.mrg` | 140 MB | UI atlases per language (Japanese, English, both Chinese and an unused Korean set) and system text |
+| `allscr.mrg` | 4.9 MB | 249 scene scripts |
+| `script_text.mrg` | 7.4 MB | Message text in four languages (the Korean slot is empty) |
+| `witch.bfsar` | 219 MB | Sound effects and the BGM index |
+| `stream/` | 728 MB | 9,470 `.opus` files: BGM (`M01` ...) and voices |
+| `movie/` | 925 MB | The logo and the opening, in a copy per language |
+| `ja`, `en`, `zc`, `zt` |  | One story font per language: FOT-Matisse, Helvetica Neue, AR ShangHaiSong, Sung |
+
+There is no separate CG archive: the gallery finds its pictures in the HD set. The image table in the executable holds 10,821 names, and the motion tables 8,372 motion ids, 585 of them looping.
+
+**Languages.** The game picks the language from the config, or else from the console: Japanese, English, Simplified Chinese or Traditional Chinese, with any other system language (Korean too) treated as English. The menus draw with the Switch's shared system font, which differs by language: the Standard font for Japanese and English, the Simplified Chinese pair (`nintendo_udsg-r_org_zh-cn_003` and `_ext_zh-cn_003`) or the Traditional Chinese font (`nintendo_udjxh-db_zh-tw_003`), each falling back to the Standard one. These have to be dumped from the console firmware like the Standard font. Changing the language in the config reloads every UI atlas, the title's included.
+
+### The script
+
+The 249 scenes hold 469,299 commands and 22,845 messages:
+
+- the story chapters (`001_1_0` onward), the `NZ` scenes and the opening;
+- the 13 TeaTime episodes (`TEATIME1` to `TEATIMEC`), which end in their own menu;
+- the `WIK_` bonus scenes, the only ones with choices;
+- `246_ARCHIVE` (scene id 3000), which plays a chapter scene for the Archive;
+- `247_STAFFROLL`.
+
+Messages use far more inline codes than Tsukihime's (`@x` 528 times, `@e` 208, `@n` 205, `@k` 166).
+
+WoH's scripts use 19 commands that the Japanese Tsukihime's do not. `IFLA` comes from the overseas build, and `SPAB` (1 use) and `SPIA` (29) fall through to the default case like the PS4 leftovers. The other 17:
+
+| Command | Arguments | Effect | Uses |
+| --- | --- | --- | --- |
+| `STQK` | layer, ax, ay, period, ms, delay, type | Layer quake in a single slot per layer, replacing Tsukihime's `SQK2` / `SHK2` / `SSW2`: by type a random jitter (faded out or not), a sine shake, or a jitter that ends with the voice. A negative amplitude follows layers 0 and 1, and layer −1 covers every drawn layer | 614 |
+| `STSW` | layer | Slow random sway (the quake slot's type 1) | 1 |
+| `STQS` | layer | Stop a layer's quake (−1: all of them, and the screen shake) | 295 |
+| `SEAC` | ch, sound, loop, volume, end volume, pan, end pan, ms | Play an SE and ramp its volume and pan to the end values: an `SEPL`, `SEVL` and `SEPN` in one | 114 |
+| `CKDP` | layer, hour, minute, x, y, zoom, grade | Build a clock on five layers: the face, both hands and their shadows, the hands turned to the time | 21 |
+| `CKTT` | layer, hour, minute | Turn the clock's hands to a new time over 18 frames | 12 |
+| `CLO6` | ms | What Tsukihime's `CLO5` does: window on, content fades in | 12 |
+| `MSTP` |  | Fade the BGM out over 0.4 s | 5 |
+| `VLOG` | voice | Attach a voice to the next message for replay and the backlog, without playing it | 18 |
+| `TTCT` | episode | Open the TeaTime menu and wait for it | 13 |
+| `SEWI` | var | The WIK figure picker: 14 silhouettes, the focused one in colour | 2 |
+| `WTIN` | ms, ms fast | A timed wait that takes the second time in auto or skip mode | 1 |
+| `XSKR` | n, label | While set, holding any controller button for 3 s skips the staff roll to the label (a bar fills meanwhile) | 4 |
+| `XSOF` |  | Turn off skip, auto and fast forward, and end a scene seek | 8 |
+| `FLNT`, `FLOP`, `FLSP` | (n) | Falling sprites (banknotes in WoH): `FLNT` and `FLOP` start one of three kinds, `FLSP` stops them over 48 frames | 1 / 2 / 1 |
+| `IFLA` | language, label | Go on in that language, else jump | 1 |
+
+It drops 20 that Tsukihime has, all falling through to the default case: the quake commands `SQK2` `SHK2` `SSW2` `SQS2` `SHS2` `SSS2`, `CLO3`, `MSQK`, `SBAS`, `SELA`, `SELS`, `RDAS`, `RDED`, `RTST`, `RTM2`, `IFUR`, `IFNX`, `FANX`, `TRPY` and `WTSV`. `FANX` (154 uses), `IFNX` (28) and `TRPY` (35) still appear in WoH scripts and cost nothing. `SNX4` (9,470 uses) now stores two values per layer that nothing reads.
+
+Changed commands:
+
+- **`WTTM(ms, click, since)`.** `WTTM(0)` does nothing, not even end the frame. With a third argument it waits only until `ms` have passed since the last load or rewind.
+- **`CLO4`** lets the dispatch go on instead of ending the frame.
+- **`CLO5(n)`.** `CLO5(0)` hides the text across messages, until a `CLO5(1)` lets the next message show it again. TeaTime scenes use it around their title card.
+- **`FADS`** and **`STTR`** take the rule wipe's soft-edge width as an extra argument (64 by default, 25 and 45 in the scripts) where Tsukihime fixes it at 128.
+- **`SELR`** stores only the value and the text: no "1." prefix and no greyed-out options. `SELD` draws the options as bars over the page, fading in at 0.08 a frame.
+- **`MPLY`** and **`MVOL`** keep the BGM volume as 255 × percent / 100, and `MVOL` reaches its target in ms × 100 / 255.
+- **`VPLY`** keeps no voice progress.
+
+### What the engine does differently
+
+| Area | Tsukihime | Witch on the Holy Night |
+| --- | --- | --- |
+| Text speed | Separate speeds for read and unread text, in ms a character | One 0–255 slider (127 at first, about 30.5 ms a character; 255 instant); the newest six characters fade in behind the head |
+| Read fade | Earlier lines dim over 1.2 × the text speed | Over a fixed 30 frames |
+| Window types | 0–2 bands, 3–32 bubbles at 78% alpha | 0–2 bands, 3–98 speech bubbles at full alpha, in brown text and the shared system font, with their own origin table |
+| Text colour | White | An option: white, read text in light orange, or a per-speaker table; an option for the edge and shadow |
+| ASCII runs | Fixed half-width cells | The font's own advances at 0.725 × the size, kerned |
+| Layer anchor | Position + the image's shift | The image's centre sits on the position; zoom and rotation turn about the pivot |
+| Quakes | Two slots per layer, three commands | One slot per layer (`STQK`), its type picking the behaviour |
+| Grain | A new offset every frame, at 0.6 × | A new offset and mirroring every 3, 6 or 9 frames, at 0.9375 × |
+| Blend modes | Its own table | Modes 1, 4, 6, 7, 9, 26, 29 and 30 map to other shaders or blend states (add, darken, lighten, screen, multiply, plain copy) |
+| Colour grades | Its own 83-entry table | The same shader with WoH's own table: 51 of the entries differ |
+| Sprite size | From the image table | From the texture itself (the table can disagree) |
+| Gallery unlocks | Images shown by `STCH` | Images present when the stage is committed |
+| Focus effects | Several blur and focus effects | Effect 4 only: 20 focus lines flickering around the centre |
+| Story keys | X backlog, Y menu, up mode panel | Also Plus quick save and Minus quick load; the flick gestures are mirrored (from the left edge for the backlog, the right for the menu) |
+
+### Saves
+
+The save file is `savedata000` (0x3FB800 bytes): a 7,168-byte system block, then 138 record slots of 28,112 bytes. knife reads and writes it byte for byte, so saves move freely between knife and the Switch.
+
+| Records | Role |
+| --- | --- |
+| 0–119 | Six pages of twenty slots in the save / load list |
+| 120 | Quick save (Plus) |
+| 122 | The resume record, which the TeaTime menu's Title button also writes; Continue loads it |
+
+A record holds the page's ring entry as in Tsukihime: the position, its message, the 40-layer stage and backup, BGM and SE state with any queued SE, and a subset of F words (35 words, 17 bit bytes, 291 low bytes). It also holds the previous scene point and the date. Unlike Tsukihime, a load resumes at the entry's own command, so a record made at an `ATSV` runs that `ATSV` again. The system block has room for 330 G words, the seen-image and heard-BGM bitmaps, the read keys and the save list's last position.
+
+### Menus
+
+All menus are new code, drawn from per-language atlases at 1/3 × 0.41481 scale through a system of 374 sprite objects.
+
+- **Boot and title.** The first title visit of each launch plays the logo movie over white, then the TYPE-MOON logo and the caution screen. A fresh profile instead shows a splash and starts the story at once. The title offers Continue (when the resume record is in use), Start, Load, Config and Extra. Finishing the game switches it to its second background, logo and BGM (42 instead of 65).
+- **Extra.** Three modes:
+  - **Archive:** a bookshelf of the 20 chapters. A book opens a panel listing the chapter's scenes four at a time, with thumbnails, and plays the chosen scene through `246_ARCHIVE`.
+  - **CG:** 21 pages of 5 × 4 cards and a viewer with zoom and panning.
+  - **Sound:** 56 tracks on three pages, with play, stop, skip and a repeat mode.
+- **System menu** (Y): Save, Load, Config, Title and Back over the blurred scene, under black at 80%. Going to the title fades the BGM out and the screen to black at 0.02 a frame.
+- **Save / load.** Six pages of twenty slots with thumbnails, and the message of the slot under the cursor. It fades in and out at 0.024 a frame.
+- **Config.** Five pages: sound, voices (a toggle and volume per character), text, behaviour, and the controls help. Changes apply at once and are written when the config closes. With auto BGM volume, the BGM ducks while a voice plays.
+- **Backlog.** Eight panels 116 units apart over the blurred scene. A page's first message has a quick-jump tab with a thumbnail of its stage, and a tap replays an entry's voice.
+- **Mode panel.** Tsukihime's state machine, with WoH's look and five-state buttons.
+- **TeaTime menu.** After each TeaTime episode four buttons fade in on the right: Archive (opens the Archive; leaving it plays the episode again), Save, Title (writes the resume record), and Next episode. Some episodes also announce a new book in the Archive. ZL rewinds into the episode.
+- **Dialogs and popups.** Two slots that take turns, so a new dialog can open while the last one fades out.
+
 ## Sources
 
 This document summarises the knife repository. The details, with executable addresses and the Switch captures behind each number, are there:
 
 - `re/NOTES.md`: reverse-engineering notes on the Japanese executable (`main.elf`, build f4b3318d561e0345), about 2,500 lines.
 - `re/NOTES_EN.md`: what the overseas build (d10d239aade1d526) changes.
+- `re/NOTES_WOH.md`: what Witch on the Holy Night's executable (`witch_na.nss`) changes, with WoH addresses; `re/woh/` has the function matching against the Japanese executable.
 - `knife-core`: formats (archives, MZX, BNTX, fonts) and the script parser.
 - `knife/src/game.rs`: the interpreter, with one commented arm per command.
 - `knife/src/stage.rs`, `motion.rs`, `grade.rs`: the stage, motions and colour grades.
 - `knife/src/savedata.rs`: the save file layout.
 - `knife-audio`, `knife-render`: sound playback and the wgpu renderer.
-- Use counts: a scan of all 548 decompressed scenes from the Japanese `allscr.mrg`.
+- `knife/src/witch.rs`, `knife/src/ui/witch/`, `knife/src/game/teatime.rs`, `witch_log.rs`: Witch on the Holy Night's tables, screens, TeaTime menu and backlog entries.
+- Use counts: a scan of all 548 decompressed scenes from the Japanese `allscr.mrg`, and of WoH's 249.
 
-The function names (`sub_...`) are addresses in the Japanese executable as loaded by `tools/nso2elf.py`.
+The function names (`sub_...`) are addresses in the Japanese executable as loaded by `tools/nso2elf.py`. In `re/NOTES_WOH.md` they are WoH's own, with matched functions named `jp_` after their Japanese address.
