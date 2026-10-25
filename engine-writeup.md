@@ -33,7 +33,7 @@ Everything the game reads lives in its romfs as a handful of big archives, a sou
 | `allpachd`, `allpacml`, `allpachdml` | small | Extra and multi-language image sets (empty or tiny in the JP data, filled in the overseas one) | same triple |
 | `allui.mrg` | 71 MB | UI atlases, system message text (SYSMES), button guide cells | same triple |
 | `parts.mrg` | 260 KB | Boot logo and caution screens | archive with no name table, read by index |
-| `allscr.mrg` | 9 MB | The 548 scene scripts plus the scene name and label tables | `mrgd00` container; scenes are MZX-compressed and bit-inverted |
+| `allscr.mrg` | 9 MB | The 549 scene scripts plus the scene name and label tables | `mrgd00` container; scenes are MZX-compressed and bit-inverted |
 | `script_text.mrg` | 5 MB | Every message line, per language | `mrgd00`: an offset table and a UTF-8 text block per language |
 | `knife1.bfsar` | 386 MB | Sound effects, and the index that maps BGM ids to streams | NintendoSDK sound archive; waves in DSP-ADPCM or PCM16 |
 | `stream/` | 1.1 GB | 16,601 `.opus` files: BGM and every voice line | Nintendo Opus |
@@ -61,7 +61,7 @@ _SEPL(0,1,MOON_SE03001,,`001:4000,,`017:50);_ZM01801($000107);_IF__(F077,lt,4,LV
 
 ### Scenes
 
-The game has 548 scenes, from `000_START_SCRIPT` and `001_00_00` (the prologue) to the gallery's `528_ARCHIVE`. A table in the executable maps each scene's script id to its archive index. `JUMP(id, label)` leaves for another scene, optionally at a label. The program counter is simply the index of the command in the scene's `;`-separated list. Save records store byte offsets into the decompressed text instead.
+The game has 549 scenes, from `000_START_SCRIPT` and `001_00_00` (the prologue) through the story to the gallery's `528_ARCHIVE`, then `529_QACALL` (the Q&A scenes), `530_STAFFROLL`, a test scene and the archive's jump tables (`532_JUMP00` to `548_JUMPQA`). They hold 1,035,614 commands besides the `_Z` macros, and 42,601 messages; the inline codes appear as `@n` 607 times, `@k` 443, `@e` 443 and `@x` 287. A table in the executable maps each scene's script id to its archive index. `JUMP(id, label)` leaves for another scene, optionally at a label. The program counter is simply the index of the command in the scene's `;`-separated list. Save records store byte offsets into the decompressed text instead.
 
 ### Command syntax
 
@@ -297,7 +297,7 @@ Loading clears every F word, restores the subset, rebuilds the stage, restarts t
 
 ## Instruction set
 
-The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 commands in all. Six of the names are PS4 leftovers that the Switch dispatcher drops. Arguments are listed in order; `=` gives the default for an empty argument, and `` `NN `` marks a keyed argument. Use counts are across all 548 scenes.
+The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 commands in all. Six of the names are PS4 leftovers that the Switch dispatcher drops. Arguments are listed in order; `=` gives the default for an empty argument, and `` `NN `` marks a keyed argument. Use counts are across all 549 scenes.
 
 ### Flow and variables
 
@@ -500,7 +500,7 @@ The 249 scenes hold 469,299 commands and 22,845 messages:
 - `246_ARCHIVE` (scene id 3000), which plays a chapter scene for the Archive;
 - `247_STAFFROLL`.
 
-Messages use far more inline codes than Tsukihime's (`@x` 528 times, `@e` 208, `@n` 205, `@k` 166).
+Messages use `@x` far more often than Tsukihime's (528 times against 287), and `@i` (25), `@a` (7), `@o` (5) and `@z` (1), which Tsukihime never uses; `@e` (208), `@n` (205) and `@k` (166) are rarer.
 
 WoH's scripts use 19 commands that the Japanese Tsukihime's do not. `IFLA` comes from the overseas build, and `SPAB` (1 use) and `SPIA` (29) fall through to the default case like the PS4 leftovers. The other 17:
 
@@ -597,6 +597,6 @@ This document summarises the knife repository. The details, with executable addr
 - `knife/src/savedata.rs`: the save file layout.
 - `knife-audio`, `knife-render`: sound playback and the wgpu renderer.
 - `knife/src/witch.rs`, `knife/src/ui/witch/`, `knife/src/game/teatime.rs`, `witch_log.rs`: Witch on the Holy Night's tables, screens, TeaTime menu and backlog entries.
-- Use counts: a scan of all 548 decompressed scenes from the Japanese `allscr.mrg`, and of WoH's 249.
+- Use counts: a scan of all 549 decompressed scenes from the Japanese `allscr.mrg`, and of WoH's 249.
 
 The function names (`sub_...`) are addresses in the Japanese executable as loaded by `tools/nso2elf.py`. In `re/NOTES_WOH.md` they are WoH's own, with matched functions named `jp_` after their Japanese address.
