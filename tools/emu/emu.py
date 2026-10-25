@@ -34,6 +34,7 @@ EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh, switch_emu_save_woh) ins
 """
 
 import io
+import json
 import os
 import shutil
 import socket
@@ -63,6 +64,9 @@ GAMES = {
     "woh": (0x0100751018DBA000, lambda t: t.startswith(("WITCH ON THE HOLY NIGHT", "魔法使いの夜")), (200, 306),
             "switch_emu_save_woh", "switch_romfs_woh"),
 }
+# the Library's rows (window-relative pt); the order changes, see restart
+LIBRARY_ROWS = [(200, 114), (200, 210), (200, 306)]
+GAMES_ROOT = os.path.join(os.path.dirname(SAVE_ROOT), "..", "..", "games")
 GAME = os.environ.get("EMU_GAME", "ja")
 if GAME not in GAMES:
     raise SystemExit(f"EMU_GAME: {GAME}: expected one of {', '.join(GAMES)}")
@@ -120,6 +124,7 @@ def window():
 
 # the toolbar above the game picture (measured: the letterbox bars start 104 px down a 2x window capture)
 TOOLBAR_PT = 52
+ROWS_CACHE = os.path.join(OUT, "library_rows.json")
 
 
 def grab(win, path):
@@ -258,20 +263,69 @@ def restart(save):
         for dst in (os.path.join(live, "0", "savedata000"), os.path.join(live, "1", "savedata000"),
                     os.path.join(ROOT, SAVE_COPY, "savedata000")):
             shutil.copyfile(save, dst)
-    # the Stop leaves Astris without focus, and the list ignores a double-click then
-    subprocess.run(["osascript", "-e", 'tell application id "V380-Ori.Astris" to activate'], check=False)
-    time.sleep(1)
-    click((lib[0] + CLICK_GAME[0], lib[1] + CLICK_GAME[1]), 2)
-    time.sleep(33)
+    # the Library's order changes (and both Tsukihime builds title their window alike), so the game that started
+    # is told by its metadata.json, which a launch stamps; a wrong one is stopped and the next row tried, and the
+    # row that worked is remembered
     try:
-        window()
-    except SystemExit:
-        # another game started (the Library order changed): stop it before it plays on
+        with open(ROWS_CACHE) as f:
+            cached = json.load(f).get(GAME)
+    except (OSError, ValueError):
+        cached = None
+    rows = [tuple(cached)] if cached else []
+    rows += [r for r in [CLICK_GAME] + LIBRARY_ROWS if r not in rows]
+    for row in rows:
+        lib = astris_window("Library")
+        if not lib:
+            raise SystemExit("no Astris Library window")
+        # a Stop stamps the stopped game too, a few seconds late: wait for the stamps to settle first
+        before = launch_stamps()
+        for _ in range(20):
+            time.sleep(1)
+            now = launch_stamps()
+            if now == before:
+                break
+            before = now
+        # the Stop leaves Astris without focus, and the list ignores a double-click then
+        subprocess.run(["osascript", "-e", 'tell application id "V380-Ori.Astris" to activate'], check=False)
+        time.sleep(1)
+        click((lib[0] + row[0], lib[1] + row[1]), 2)
+        started = None
+        for _ in range(40):
+            time.sleep(0.5)
+            changed = [t for t, v in launch_stamps().items() if before.get(t) != v]
+            if changed:
+                started = changed[0]
+                break
+        if started == TITLE_ID:
+            try:
+                with open(ROWS_CACHE) as f:
+                    c = json.load(f)
+            except (OSError, ValueError):
+                c = {}
+            c[GAME] = list(row)
+            with open(ROWS_CACHE, "w") as f:
+                json.dump(c, f)
+            time.sleep(28)
+            print("restarted")
+            return
+        print(f"row {row} started {started if started is None else f'{started:016X}'}, not {GAME}", file=sys.stderr)
         if game_running():
             subprocess.run(["osascript", "-e", 'tell application "System Events" to tell process "Astris" to click '
                             'menu item "Stop" of menu "Emulation" of menu bar 1'], check=False)
-        raise SystemExit(f"the Library row {CLICK_GAME} did not start {GAME}; stopped (check GAMES)")
-    print("restarted")
+            time.sleep(4)
+    raise SystemExit(f"no Library row started {GAME}")
+
+
+def launch_stamps():
+    """Each title's last_played_utc (Ryujinx/games/<id>/gui/metadata.json), stamped at a launch and at a stop."""
+    out = {}
+    for d in os.listdir(GAMES_ROOT):
+        try:
+            with open(os.path.join(GAMES_ROOT, d, "gui", "metadata.json")) as f:
+                out[int(d, 16)] = json.load(f).get("last_played_utc")
+        except (OSError, ValueError):
+            pass
+    return out
 
 
 def parse_keys(keys):

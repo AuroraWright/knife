@@ -3,7 +3,8 @@
 //! - Ripples (sub_AD4E0 -> sub_1034, updated / drawn by sub_E00): every touch-down once the game task runs
 //!   (sub_AFA40 draws them), i.e. from the title or the fresh-profile prologue on; the launch task
 //!   (sub_B5650: TM_CI logo, caution2 notice) draws none.
-//! - Story drag arrow (sub_40ED0, drawn by sub_3C510): a horizontal drag fast-forwards or rewinds.
+//! - Story drag arrow (sub_40ED0, drawn by sub_3C510): a horizontal drag fast-forwards or rewinds (Tsukihime
+//!   only: Witch on the Holy Night's jp_40ED0 dropped it, and its sub_1D670 draws a spinner instead).
 //! - Message window hiding at the bottom edge (sub_40ED0).
 //! - Mode panel at the top edge (sub_4E170 state machine, drawn by sub_4DE10).
 //!
@@ -18,6 +19,8 @@ const W: f32 = CANVAS_W as f32;
 const H: f32 = CANVAS_H as f32;
 const UX: f32 = W / 640.0;
 const UY: f32 = H / 448.0;
+/// Float error allowed in a count of 60 Hz frames (a 60 Hz display's frame is 0.99999994 of one)
+const FRAME_EPS: f32 = 1e-4;
 
 /// sub_1034: 16 slots, a new touch takes the first free one (none when all are busy)
 const RIPPLES: usize = 16;
@@ -34,6 +37,43 @@ const PANEL_BTN_Y: f32 = 6.637;
 /// 224x64 from (8 + 232 column, 8 + 72 row), drawn from the object's position
 const BTN_W: f32 = 224.0;
 const BTN_H: f32 = 64.0;
+
+/// knife: the pointer once a 60 Hz frame since the press, newest first, for the release's flick. The touch panel
+/// judges a flick by the move over its last two frames, which a mouse or trackpad drag rarely makes: the finger
+/// slows down before it lifts. As shin does for its desktop gestures (`desktop_gesture_vector`), a drag that
+/// went 64 canvas pixels from its start flicks by that whole move, and a shorter one by its speed over the last
+/// 80 ms (5 frames), scaled to the two frames the exe compares.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Trail {
+    pts: [[f32; 2]; 6],
+    n: usize,
+}
+
+impl Trail {
+    pub(crate) fn reset(&mut self, p: [f32; 2]) {
+        self.pts = [p; 6];
+        self.n = 0;
+    }
+
+    pub(crate) fn push(&mut self, p: [f32; 2]) {
+        self.pts.copy_within(0..5, 1);
+        self.pts[0] = p;
+        self.n = (self.n + 1).min(5);
+    }
+
+    /// The release's move in 640x448 units, as the exe's two-frame flick test reads it.
+    pub(crate) fn flick(&self, start: [f32; 2], end: [f32; 2]) -> [f32; 2] {
+        let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+        if (dx * CANVAS_W as f32 / 640.0).hypot(dy * CANVAS_H as f32 / 448.0) >= 64.0 {
+            return [dx, dy];
+        }
+        // at least the exe's two frames (the press point fills the older ones), so a quick tap is not scaled up
+        let k = self.n.max(2);
+        let o = self.pts[k];
+        let f = 2.0 / k as f32;
+        [(end[0] - o[0]) * f, (end[1] - o[1]) * f]
+    }
+}
 
 /// The exe's drag tracker (the object at 0xAE2EE8, stepped once a frame by sub_40C) for a list's vertical drag:
 /// a touch that starts inside the screen's rect is followed in the 1280x720 touch space. Each frame the speed
@@ -134,6 +174,14 @@ pub struct Touch {
     rewind: u32,
     /// 60 Hz frames towards the next rewind step
     rewind_t: f32,
+    /// the last rewind step went back (AE05F8, jp_814C0's sub_3B410)
+    rewound: bool,
+    /// Witch on the Holy Night: 60 Hz frames left of the normal frame after a rewind step (off_AE05B8 = 2)
+    rewind_rest: f32,
+    /// what holds the rewind: ZL (0), the mode panel's button (1) or the drag (2)
+    rewind_by: u8,
+    /// Witch on the Holy Night's mode display (sub_1D670)
+    wspin: super::witch::WSpin,
     /// message window hidden at the bottom edge (off_AE0690)
     pub hidden: bool,
     /// mode panel (dword_B35A10), its slide (dword_B35A28), its hovered button, the button held
@@ -155,8 +203,9 @@ pub struct Touch {
     /// which the next opening starts on (LODWORD)
     pub panel_key: Option<usize>,
     pub panel_last: usize,
-    /// pointer two frames back (units): the release flick compares against it (sub_AD4E0 slot fields 7 / 9)
-    trail: [[f32; 2]; 2],
+    /// the pointer each frame since the press (units): the release flick reads it (sub_AD4E0 slot fields 7 / 9,
+    /// knife's desktop policy in `Trail`)
+    trail: Trail,
     trail_t: f32,
     /// ZL / ZR held (frames)
     pub zl: Option<f32>,
@@ -187,6 +236,10 @@ impl Touch {
             arrow_dx: 0.0,
             drag_skip: false,
             rewind: 0,
+            rewound: false,
+            rewind_rest: 0.0,
+            rewind_by: 0,
+            wspin: Default::default(),
             hidden: false,
             panel: Panel::Closed,
             panel_t: 0.0,
@@ -199,7 +252,7 @@ impl Touch {
             panel_key: None,
             // sub_4DCC0: the panel's cursor starts on fast forward
             panel_last: 3,
-            trail: [[0.0; 2]; 2],
+            trail: Trail::default(),
             trail_t: 0.0,
             zl: None,
             zr: None,
@@ -309,7 +362,7 @@ impl Ui {
     /// on the touch screen, so a drag can become a gesture instead; elsewhere it clicks at once.
     pub fn mouse_down(&mut self, game: &mut Game, r: &Renderer) {
         let (x, y) = self.mouse;
-        self.touch.trail = [self.units(); 2];
+        self.touch.trail.reset(self.units());
         if !matches!(self.intro, Some(super::Intro::Logo { .. } | super::Intro::Notice { .. })) {
             self.touch.spawn(x, y);
         }
@@ -391,14 +444,12 @@ impl Ui {
             return;
         }
         if matches!(self.screen, Screen::CgView { .. }) {
-            self.cg_flick(game);
+            self.cg_flick(game, start);
             return;
         }
         // sub_4CEA0: a left or up swipe (+0x54 bits 1 / 4) closes the system menu like B
         if self.screen == Screen::Menu && self.touch.dragged && !self.busy() {
-            let [x, y] = self.units();
-            let [px, py] = self.touch.trail[1];
-            let (dx, dy) = (x - px, y - py);
+            let [dx, dy] = self.touch.trail.flick(start, self.units());
             let horiz = dx.abs() > dy.abs();
             if (horiz && dx <= -7.0) || (!horiz && dy <= -7.0) {
                 self.cancel(game, r);
@@ -448,10 +499,9 @@ impl Ui {
     }
 
     /// Release of a drag (sub_AD4E0 swipe bits, from the move over the last two frames: >= 7 units, the
-    /// stronger axis wins) acted on in the story (sub_40ED0 / sub_4E170).
+    /// stronger axis wins; `Trail::flick`) acted on in the story (sub_40ED0 / sub_4E170).
     fn flick(&mut self, game: &mut Game, r: &Renderer, start: [f32; 2], end: [f32; 2]) {
-        let [px, py] = self.touch.trail[1];
-        let (dx, dy) = (end[0] - px, end[1] - py);
+        let [dx, dy] = self.touch.trail.flick(start, end);
         let horiz = dx.abs() > dy.abs();
         let (left, right) = (horiz && dx <= -7.0, horiz && dx >= 7.0);
         let (up, down) = (!horiz && dy <= -7.0, !horiz && dy >= 7.0);
@@ -487,10 +537,8 @@ impl Ui {
 
     /// CG viewer release (sub_C56C, swipe bits of sub_AD4E0 at 13+ units): right (0x20) the previous
     /// picture, left (0x10) the next, up or down (0xC0) closes.
-    fn cg_flick(&mut self, game: &mut Game) {
-        let [x, y] = self.units();
-        let [px, py] = self.touch.trail[1];
-        let (dx, dy) = (x - px, y - py);
+    fn cg_flick(&mut self, game: &mut Game, start: [f32; 2]) {
+        let [dx, dy] = self.touch.trail.flick(start, self.units());
         if dx.abs() > dy.abs() {
             if dx >= 13.0 {
                 self.cg_step(game, -1);
@@ -502,7 +550,7 @@ impl Ui {
         }
     }
 
-    /// TeaTime state 10 (ZL or the drag to the left): the menu returns 2 and sub_40ED0 starts the rewind
+    /// TeaTime state 10 (ZL): the menu returns 2 and sub_40ED0 starts the rewind
     /// (off_AE05B8 = 1) with a step that frame (sub_814C0); it goes on while ZL or the drag holds.
     pub(super) fn teatime_rewind(&mut self, game: &mut Game, r: &Renderer) {
         if !game.teatime_rewind() {
@@ -510,11 +558,52 @@ impl Ui {
         }
         self.touch.rewind = 1;
         self.touch.rewind_t = 0.0;
+        self.touch.rewind_rest = 0.0;
         game.speed = 1;
-        game.rewind_frame();
+        game.start_rewind(false);
         game.rewinding = true;
         if game.settled() {
-            game.rewind_step(r);
+            game.rewind_frame();
+            self.rewind_step(game, r);
+        }
+    }
+
+    /// Witch on the Holy Night, before the frame's script: the frame after a step (off_AE05B8 = 2) is an ordinary
+    /// one while the rewind is still held (jp_40ED0 decides it first). Held ZL is no input to jp_802C0, so a
+    /// restored message keeps its click wait at head 0 (nothing shows); after a step that restored nothing (the
+    /// oldest entry already current) the wait is gone and the script goes on into the next message, which shows
+    /// the restored one whole above it and pushes a ring entry for the next step to take back.
+    pub fn rewind_before_script(&mut self, game: &mut Game) {
+        game.rest_hold = false;
+        if self.touch.rewind == 0 {
+            return;
+        }
+        let held = match self.touch.rewind_by {
+            0 => self.touch.zl.is_some(),
+            1 => self.touch.press.is_some() || self.enter_held,
+            _ => self.touch.press.is_some(),
+        };
+        if !held {
+            return;
+        }
+        if self.touch.rewind_rest >= 1.0 - FRAME_EPS {
+            game.end_rewind();
+        } else {
+            // (after the frame between two steps: its script ran once, the next step comes in the touch handling)
+            game.rest_hold = !game.rewinding;
+        }
+    }
+
+    /// One rewind step (sub_814C0). Witch on the Holy Night's jp_40ED0 then sets off_AE05B8 to 2 unless a choice
+    /// was up (AE04B8 & 0x10 as the frame began): the next frame clears it and runs like any other, so a held
+    /// rewind alternates its steps with frames that show the restored page and run the script (once a step has
+    /// nothing to restore and cleared the click wait, the script goes on into the next message, which the next
+    /// step takes back: the Switch blinks the loaded page while ZL holds right after a load).
+    fn rewind_step(&mut self, game: &mut Game, r: &Renderer) {
+        let choice = game.in_choice();
+        self.touch.rewound = game.rewind_step(r);
+        if crate::assets::witch() && !choice {
+            self.touch.rewind_rest = 1.0;
         }
     }
 
@@ -757,7 +846,7 @@ impl Ui {
         self.touch.trail_t += f;
         if self.touch.trail_t >= 1.0 {
             self.touch.trail_t = (self.touch.trail_t - 1.0).min(1.0);
-            self.touch.trail = [[x, y], self.touch.trail[0]];
+            self.touch.trail.push([x, y]);
         }
         for h in [&mut self.touch.zl, &mut self.touch.zr].into_iter().flatten() {
             *h += f;
@@ -778,9 +867,12 @@ impl Ui {
         }
 
         // drag arrow (sub_40ED0): a touch that started in the middle of the screen; the stretch is
-        // clamped to 260 units, and past 45 it sets the speed (dx / 5 - 8, or dx / 5 + 8 to the left)
+        // clamped to 260 units, and past 45 it sets the speed (dx / 5 - 8, or dx / 5 + 8 to the left).
+        // Witch on the Holy Night's jp_40ED0 has no such gesture: the stretch its TeaTime menu, choices and
+        // mode display read (dword_64987C) and the arrow's alpha (AE0600, only zeroed by jp_3B5C0) stay 0
         let mut speed = 0i32;
         let arrow_on = in_game
+            && !crate::assets::witch()
             && self.touch.panel == Panel::Closed
             && self.touch.press.is_some_and(|p| (121.0..=519.0).contains(&p[0]) && (125.0..=383.0).contains(&p[1]));
         if arrow_on {
@@ -798,16 +890,6 @@ impl Ui {
             };
         } else {
             self.touch.arrow_a = (self.touch.arrow_a - 0.03 * f).max(0.0);
-        }
-
-        // the TeaTime menu (sub_74190) reads the drag arrow's stretch (off_632508, x - start): 45 units to the
-        // left rewinds
-        if self.screen == Screen::Game
-            && game.teatime_active()
-            && self.touch.press.is_some_and(|p| (121.0..=519.0).contains(&p[0]) && (125.0..=383.0).contains(&p[1]))
-            && ((x - self.touch.press.unwrap()[0]).clamp(-260.0, 260.0) as i32) <= -45
-        {
-            self.teatime_rewind(game, r);
         }
 
         // mode panel buttons held: rewind (case 1, speed ramping over 8..107 frames up to 64) and
@@ -841,9 +923,10 @@ impl Ui {
             self.touch.held_frames = 0.0;
         }
 
-        // ZR / ZL held (sub_40ED0, masks [19] / [20] = 0x200 / 0x100): speed 1 for the first 4 frames held,
-        // then frames / 15 up to 64
-        let ramp = |t: f32| -> u32 { if t < 4.0 { 1 } else { (((t as u64 * 0x22_2222_2240) >> 32) >> 7).min(64) as u32 } };
+        // ZR / ZL held (sub_40ED0, masks [19] / [20] = 0x200 / 0x100): the speed comes from the trigger's
+        // pressure (qword_1935130, sub_B37D0: the pad's analog value x 255), 1 below 4, else p / 3.75 up to 64.
+        // The Switch's triggers are digital (255: speed 64 from the first frame, measured on the Switch)
+        let ramp = |p: u64| -> u32 { if p < 4 { 1 } else { ((p * 0x22_2222_2240) >> 39).min(64) as u32 } };
         // sub_40ED0: while a story movie or the staff roll runs (off_AE0650) skip mode is cleared every frame;
         // the staff roll takes ZR (its pressure past 71 of 255: any press of a digital ZR) at 32
         // (the inits set the drag arrow's alpha to 0 with sub_3B5C0, and nothing raises it while it is set)
@@ -855,7 +938,8 @@ impl Ui {
         let zr = if staff {
             self.touch.zr.map(|_| 32)
         } else if in_game && self.touch.panel == Panel::Closed {
-            self.touch.zr.map(ramp)
+            // (Witch on the Holy Night's jp_40ED0: held ZR, key 19, starts the fast skip, AE0670, at 64)
+            self.touch.zr.map(|_| if crate::assets::witch() { 64 } else { ramp(255) })
         } else {
             None
         };
@@ -863,7 +947,7 @@ impl Ui {
         if self.touch.zl.is_none() {
             self.w.zl_block = false;
         }
-        let zl = if in_game && self.touch.panel == Panel::Closed && !self.w.zl_block { self.touch.zl.map(ramp) } else { None };
+        let zl = if in_game && self.touch.panel == Panel::Closed && !self.w.zl_block { self.touch.zl.map(|_| ramp(255)) } else { None };
         // forward: skip at the speed (unread text still stops it unless the config allows it);
         // backward: rewind, one ring entry a frame without running the script
         let fwd = if panel_skip { 64 } else { zr.unwrap_or(speed.max(0) as u32) };
@@ -889,42 +973,65 @@ impl Ui {
         // (the held panel button rewinds from its first frame, at speed 0 for the first 8: sub_814C0 ignores
         // the speed)
         let back = if let Some(v) = zl {
+            self.touch.rewind_by = 0;
             Some(v)
         } else if let Some(v) = panel_rewind {
+            self.touch.rewind_by = 1;
             Some(v as u32)
         } else if speed < 0 && !self.touch.hidden {
+            self.touch.rewind_by = 2;
             Some((-speed) as u32)
         } else {
             None
         };
-        // (off_AE05B8 stays set while held, also once the ring has run out)
-        if let Some(back) = back.filter(|_| game.can_rewind() || game.rewinding) {
+        // (sub_40ED0 starts it whatever the ring holds, and off_AE05B8 stays set while held: sub_814C0 just finds
+        // nothing to go back to)
+        game.rewind_held = crate::assets::witch() && back.is_some();
+        if let Some(back) = back {
             self.touch.rewind = back.max(1);
             game.speed = back.max(1);
-            // sub_40ED0 runs sub_814C0 instead of the script: no message is shown while rewinding, and each
-            // 60 Hz frame restores the stage of the previous ring entry (whatever the display rate)
-            game.rewind_frame();
-            game.rewinding = true;
-            self.touch.rewind_t = (self.touch.rewind_t + f).min(1.0);
-            if self.touch.rewind_t >= 1.0 && game.settled() {
-                self.touch.rewind_t -= 1.0;
-                game.rewind_step(r);
+            if self.touch.rewind_rest > FRAME_EPS {
+                // Witch on the Holy Night: the frame after a step (off_AE05B8 = 2) is an ordinary one at the same
+                // speed (jp_40ED0 leaves v108 as it was), started before the script (`rewind_before_script`); the
+                // next starts the rewind again (off_AE05B8 = 1). The panel button's ramp (dword_649890) starts
+                // over in it, so that rewind stays at speed 0.
+                self.touch.rewind_rest -= f;
+                self.touch.rewind_t = 0.0;
+                self.touch.held_frames = 0.0;
+                game.end_rewind();
+            } else {
+                // sub_40ED0 runs sub_814C0 instead of the script: no message is shown while rewinding, and each
+                // 60 Hz frame restores the stage of the previous ring entry (whatever the display rate)
+                if !game.rewinding {
+                    game.start_rewind(zl.is_some() || panel_rewind.is_some());
+                }
+                game.rewinding = true;
+                self.touch.rewind_t = (self.touch.rewind_t + f).min(1.0);
+                // (sub_814C0 runs, clearing the click wait first, once per 60 Hz frame without a transition, v60)
+                if self.touch.rewind_t >= 1.0 - FRAME_EPS && game.settled() {
+                    self.touch.rewind_t = (self.touch.rewind_t - 1.0).max(0.0);
+                    game.rewind_frame();
+                    self.rewind_step(game, r);
+                }
             }
         } else if self.touch.rewind > 0 {
             // released: the script runs again from the restored message, which shows and types out
             self.touch.rewind = 0;
+            self.touch.rewind_rest = 0.0;
             game.end_rewind();
             game.speed = 1;
         }
+        // off_AE05B8 set this frame (not on Witch on the Holy Night's frames between steps)
+        let rewinding = self.touch.rewind > 0 && game.rewinding;
         // sub_3C510: the effect fade (dword_AFECA4) rises 0.05 per frame (x5 while rewinding) while rewinding,
-        // at speed 2 or more (a skip; ZR from its 30th frame), in auto mode (dword_AFEC98), or while the drag
+        // at speed 2 or more (a skip; ZR held), in auto mode (dword_AFEC98), or while the drag
         // gesture runs (off_AE0610), and falls otherwise
-        let rate = 0.05 * f * if self.touch.rewind > 0 { 5.0 } else { 1.0 };
+        let rate = 0.05 * f * if rewinding { 5.0 } else { 1.0 };
         let story = self.screen == Screen::Game && !game.in_choice();
-        let fx_on = self.touch.rewind > 0 || (story && (game.speed >= 2 || game.auto)) || arrow_on;
+        let fx_on = rewinding || (story && (game.speed >= 2 || game.auto)) || arrow_on;
         // the mode icon (sub_3B5B0, set each frame by sub_40ED0): 5 in skip mode, then 2 while rewinding or 3
         // while skipping fast (off_AE0670)
-        self.touch.mode_icon = if self.touch.rewind > 0 {
+        self.touch.mode_icon = if rewinding {
             2
         } else if self.touch.drag_skip && in_game {
             3
@@ -939,6 +1046,14 @@ impl Ui {
         } else {
             (self.touch.arrow_fx - rate).max(0.0)
         };
+        if crate::assets::witch() {
+            if self.screen == Screen::Witch && self.w.scr == super::witch::WScr::Backlog {
+                self.touch.wspin.hide();
+            } else {
+                let off = game.in_choice() || game.mode_task();
+                self.touch.wspin.step(f, game.speed as f32, game.auto, rewinding, self.touch.rewound, off);
+            }
+        }
 
         // message window (sub_40ED0): hidden while the last touch is in the bottom 40 units (y > 408 of 448),
         // back with a touch above them (that touch does not also tap)
@@ -1021,7 +1136,6 @@ impl Ui {
         }
     }
 
-    /// Story overlays: drag arrow and mode panel.
     /// Start a next (dialog 10, an RDAS hit) / previous (dialog 11) scene countdown of `frames`; the mode panel
     /// closes (sub_4E9A0) and the window comes back (off_AE0690 = 0).
     pub(super) fn start_scene_countdown(&mut self, next: bool, frames: i32) {
@@ -1067,36 +1181,18 @@ impl Ui {
         game.hold = self.touch.scene_cd.is_some();
     }
 
+    /// Story overlays: the countdown's black, the drag arrow and mode icon (WoH: the mode display), the mode
+    /// panel.
     pub(super) fn draw_touch_game(&self, r: &Renderer, out: &mut Vec<Quad>) {
         // sub_3EF20, first in sub_3C510: the countdown's black over the screen
         if self.touch.cd_black > 0.0 {
             out.push(Quad::rect(r.white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, self.touch.cd_black.min(1.0)]));
         }
-        // sub_3C510: mode_skip_0 anchored at its left middle on the touch start, x scale
-        // stretch / 88 * 0.5 (negative points left) and y scale 0.5 in the 640x448 space
-        let a = self.touch.arrow_a * self.touch.arrow_fx * 0.6;
-        if a > 0.0
-            && let Some(t) = self.tex.get("mode_skip_0")
-        {
-            let [sx, sy] = self.touch.arrow_at;
-            let len = t.width as f32 * self.touch.arrow_dx * UX / 176.0;
-            let h = t.height as f32 * 0.5 * UY;
-            let (x0, x1) = (sx * UX, sx * UX + len);
-            let mut q = Quad::rect(t.clone(), [x0.min(x1), sy * UY - h / 2.0, len.abs(), h], [1.0, 1.0, 1.0, a]);
-            let (tw, th) = (t.texture.size().width as f32, t.texture.size().height as f32);
-            let (u1, v1) = (t.width as f32 / tw, t.height as f32 / th);
-            q = if len < 0.0 { q.with_uv_rect(u1, 0.0, 0.0, v1) } else { q.with_uv_rect(0.0, 0.0, u1, v1) };
-            out.push(q);
-        }
-        // sub_3C510: the mode icon, mode_disp cell 88x88 centred (anchor 20) at (dword_34DBE4[icon], 38.16)
-        // units, alpha dword_AFECA4 (x 0.6 in skip mode)
-        let icon = self.touch.mode_icon;
-        if (1..=5).contains(&icon) && self.touch.arrow_fx > 0.0 {
-            const X: [f32; 6] = [589.333, 546.667, 546.667, 626.667, 626.667, 626.667];
-            const CELL: [f32; 6] = [176.0, 0.0, 88.0, 264.0, 352.0, 264.0];
-            let a = self.touch.arrow_fx * if icon == 5 { 0.6 } else { 1.0 };
-            let (x, y) = (X[icon] * UX, 38.163 * UY);
-            self.sprite_c(out, "mode_disp", [x - 44.0, y - 44.0, 88.0, 88.0], Some([CELL[icon], 0.0, 88.0, 88.0]), a, Blend::Alpha);
+        if crate::assets::witch() {
+            // Witch on the Holy Night's sub_1E770: sub_1D670's spinner and icons (no drag arrow)
+            self.wmode_draw(out, &self.touch.wspin, self.touch.mode_icon);
+        } else {
+            self.draw_arrow_icon(out);
         }
         if self.touch.panel_t > 0.0 && crate::assets::witch() {
             self.wmp_draw(out, self.panel_y(), &self.touch.wbtn);
@@ -1126,7 +1222,71 @@ impl Ui {
         }
     }
 
+    /// Tsukihime's sub_3C510 overlays: the drag arrow and the mode icon.
+    fn draw_arrow_icon(&self, out: &mut Vec<Quad>) {
+        // sub_3C510: mode_skip_0 anchored at its left middle on the touch start, x scale
+        // stretch / 88 * 0.5 (negative points left) and y scale 0.5 in the 640x448 space
+        let a = self.touch.arrow_a * self.touch.arrow_fx * 0.6;
+        if a > 0.0
+            && let Some(t) = self.tex.get("mode_skip_0")
+        {
+            let [sx, sy] = self.touch.arrow_at;
+            let len = t.width as f32 * self.touch.arrow_dx * UX / 176.0;
+            let h = t.height as f32 * 0.5 * UY;
+            let (x0, x1) = (sx * UX, sx * UX + len);
+            let mut q = Quad::rect(t.clone(), [x0.min(x1), sy * UY - h / 2.0, len.abs(), h], [1.0, 1.0, 1.0, a]);
+            let (tw, th) = (t.texture.size().width as f32, t.texture.size().height as f32);
+            let (u1, v1) = (t.width as f32 / tw, t.height as f32 / th);
+            q = if len < 0.0 { q.with_uv_rect(u1, 0.0, 0.0, v1) } else { q.with_uv_rect(0.0, 0.0, u1, v1) };
+            out.push(q);
+        }
+        // sub_3C510: the mode icon, mode_disp cell 88x88 centred (anchor 20) at (dword_34DBE4[icon], 38.16)
+        // units, alpha dword_AFECA4 (x 0.6 in skip mode)
+        let icon = self.touch.mode_icon;
+        if (1..=5).contains(&icon) && self.touch.arrow_fx > 0.0 {
+            const X: [f32; 6] = [589.333, 546.667, 546.667, 626.667, 626.667, 626.667];
+            const CELL: [f32; 6] = [176.0, 0.0, 88.0, 264.0, 352.0, 264.0];
+            let a = self.touch.arrow_fx * if icon == 5 { 0.6 } else { 1.0 };
+            let (x, y) = (X[icon] * UX, 38.163 * UY);
+            self.sprite_c(out, "mode_disp", [x - 44.0, y - 44.0, 88.0, 88.0], Some([CELL[icon], 0.0, 88.0, 88.0]), a, Blend::Alpha);
+        }
+    }
+
     pub(super) fn draw_ripples(&mut self, r: &Renderer, out: &mut Vec<Quad>) {
         self.touch.draw_ripples(r, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Trail;
+
+    /// A drag from `start` sampled once a frame at `pts`, released at the last one.
+    fn release(start: [f32; 2], pts: &[[f32; 2]]) -> [f32; 2] {
+        let mut t = Trail::default();
+        t.reset(start);
+        for &p in pts {
+            t.push(p);
+        }
+        t.flick(start, *pts.last().unwrap_or(&start))
+    }
+
+    #[test]
+    fn slow_long_drag_flicks_by_its_displacement() {
+        // 100 units left at 3 units a frame, then held still before the release (a trackpad's lift)
+        let mut pts: Vec<[f32; 2]> = (1..=34).map(|i| [600.0 - 3.0 * i as f32, 200.0]).collect();
+        pts.extend([[498.0, 200.0]; 10]);
+        assert_eq!(release([600.0, 200.0], &pts), [-102.0, 0.0]);
+    }
+
+    #[test]
+    fn short_drags_keep_the_two_frame_speed() {
+        // a tap, and a slow 15-unit drag that stops: no flick
+        assert_eq!(release([300.0, 200.0], &[]), [0.0, 0.0]);
+        let pts: Vec<[f32; 2]> = (1..=5).map(|i| [300.0 + 3.0 * i as f32, 200.0]).chain([[315.0, 200.0]; 6]).collect();
+        assert_eq!(release([300.0, 200.0], &pts), [0.0, 0.0]);
+        // a quick short flick: 6 units a frame over the window
+        let pts: Vec<[f32; 2]> = (1..=3).map(|i| [300.0 - 6.0 * i as f32, 200.0]).collect();
+        assert_eq!(release([300.0, 200.0], &pts), [-12.0, 0.0]);
     }
 }

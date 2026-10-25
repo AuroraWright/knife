@@ -421,6 +421,10 @@ impl App {
             g.skip = true;
             g.skip_all = true;
         }
+        if !g.paused {
+            ui.rewind_before_script(g);
+        }
+        ui.story_input(g, r, dt);
         g.update(r, dt.min(100.0));
         ui.update(g, r, dt);
         // nn::atk's update after the frame callback, then the present (sub_FC064)

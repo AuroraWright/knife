@@ -508,6 +508,8 @@ impl Ui {
                     c.p = 0.0;
                     c.st = 2;
                     c.shown = false;
+                    // the closing fade ending resets the per-message colour words
+                    game.reset_colour_words();
                     self.w.objs.group_flags(3, 0, 3);
                     for g in 4..9 {
                         self.w.objs.group_flags(g, 0, 1);
@@ -1067,6 +1069,9 @@ impl Ui {
             self.wc_language(game, r, l);
             if rw == 6 {
                 self.w.objs.help(118, false);
+            } else {
+                // sub_D700 case 4 resets the per-message colour words (a bubble's colour follows the language)
+                game.reset_colour_words();
             }
         }
         if sound {

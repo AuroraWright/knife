@@ -124,9 +124,9 @@ Some commands always end the frame's dispatch even with nothing to wait for: the
 
 ### Skip, auto and rewind
 
-- **Skip** passes at most one message per frame, because the click wait is cleared at the start of the script step. The speed (64 in skip mode, or ramping from 1 to 64 while ZR is held) only repeats the effects step and the wait countdowns. In practice a line passes every 2 or 3 frames, about 20 a second. Skip stops at the first unread message unless the player allows unread skipping.
+- **Skip** passes at most one message per frame, because the click wait is cleared at the start of the script step. The speed (64 in skip mode and while ZR is held) only repeats the effects step and the wait countdowns. In practice a line passes every 2 or 3 frames, about 20 a second. Skip stops at the first unread message unless the player allows unread skipping.
 - **Auto mode** waits, once the text is out and the voice has finished, for a fixed time set in the config: 3,000 ms by default at a page end, 2,200 ms at a click wait inside a page (each 0 to 10,000 ms).
-- **Rewind** (ZL) walks back through the history ring one entry per frame, putting back each entry's stage, with the text hidden while it runs. Letting go shows the message it landed on, typed out in full.
+- **Rewind** (ZL) walks back through the history ring one message per frame, putting back the stage of each entry on the way, with the text hidden while it runs. Letting go shows the message it landed on, typed out in full.
 - **Next-scene seek.** Jumping forward to the next scene, from the flowchart or the mode panel, runs the script at full speed inside one frame, with no drawing and no sound. It stops at the target's first message or save point, then puts back the BGM and looping sounds the target should have.
 
 ## Text and the message window
@@ -170,7 +170,7 @@ The window is drawn into its own layer, the text into another, and both are comp
 
 ### History and backlog
 
-Every message, choice and save point pushes an entry onto an 800-entry history ring. Each entry holds the scene position, the stage, the BGM, the looping sounds and the message text. The ring serves:
+Every message, choice and save point pushes an entry onto an 800-entry history ring, and so do the first stage change after a backup, each transition, the BGM commands and the SE commands that change a channel's state (a one-shot sound does not). Each entry holds the scene position, the stage, the BGM, the looping sounds and the message text. The ring serves:
 
 - the backlog (X), which lists the entries newest first, leaving out the page currently on screen;
 - rewind, which steps back through it;
@@ -552,6 +552,7 @@ Changed commands:
 | Sprite size | From the image table | From the texture itself (the table can disagree) |
 | Gallery unlocks | Images shown by `STCH` | Images present when the stage is committed |
 | Focus effects | Several blur and focus effects | Effect 4 only: 20 focus lines flickering around the centre |
+| Rewind | One step back every frame, with the text hidden | A step every other frame, walking back a page per step with the text hidden. The frames in between run normally, but held ZL never passes the restored message's click. On the oldest page a step finds nothing to restore every other time; the frame after it carries on into the next message, which the following step takes back, so the page blinks. Letting go types the restored message out again, or carries on into the next one |
 | Story keys | X backlog, Y menu, up mode panel | Also Plus quick save and Minus quick load; the flick gestures are mirrored (from the left edge for the backlog, the right for the menu) |
 
 ### Saves

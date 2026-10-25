@@ -110,7 +110,9 @@ impl Ui {
                     if !(0..=1).contains(&hit) {
                         self.w.objs.focus = d.answer;
                         moved = true;
-                    } else if self.w.inp.touch & 2 != 0 && d.answer != hit {
+                    } else if (self.w.inp.touch & 2 != 0 || self.w.inp.hovering()) && d.answer != hit {
+                        // (a tap on the other button only moves the answer there, the next tap answers;
+                        // knife: the mouse hovering onto a button moves it as the pad does)
                         game.play_sys_sound(2);
                         d.answer = hit;
                         moved = true;

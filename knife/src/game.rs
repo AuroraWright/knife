@@ -392,6 +392,14 @@ struct RingEntry {
     kind: u16,
 }
 
+impl RingEntry {
+    /// The entry of a page's first message: one its message pushed, or a record a load or scene point put back
+    /// in the ring (a message entry that was the save point, so F823 <= 1).
+    fn page_start(&self) -> bool {
+        self.key.2 == 1 || (self.key.2 == usize::MAX - 1 && self.kind == 0)
+    }
+}
+
 /// A scene-point ring entry: a copy of the page-ring entry ATSV pushed (or, when sub_5A910 held the push, of
 /// the newest entry), and that ATSV entry's serial, by which an undone ATSV entry drops it (sub_5BAF0 cases
 /// 6 / 7 compare the entry's ring slot).
@@ -605,6 +613,16 @@ pub struct Game {
     /// off_AE05B8: a held rewind runs sub_814C0 instead of the script step (sub_40ED0), so the restored
     /// messages are not shown until it stops
     pub rewinding: bool,
+    /// Witch on the Holy Night: a rewind is held. jp_40ED0 runs its steps at speed 0 (dword_649890 restarts on
+    /// every frame between them), so jp_81B30 does not move the text head until it is released.
+    pub rewind_held: bool,
+    /// Witch on the Holy Night's off_6327C0: a click passed the finished message (jp_802C0 clearing 0x100), so the
+    /// next message laid out (jp_6E0D0, or jp_5BAF0 case 0 for a restored one) flips the text slot pair (AE05D0)
+    /// and starts in a cleared slot
+    slot_flip: bool,
+    /// Witch on the Holy Night: the frame between two steps has run its script once; the further display frames
+    /// until the next step (a faster display) run no script, as jp_40ED0 runs one game frame between two steps
+    pub rest_hold: bool,
     /// XSTP's staff roll task (sub_3F600 slot 1 kind 1: start sub_40B70, frame sub_40C10, end sub_40C60): F36 = 1,
     /// auto and skip mode off (off_AE0660 & 3 kept in word_AFFC98 for the end), off_AE0650 = 1 (the story
     /// keeps only A and ZR, held ZR fast-forwarding at 32); it ends when F36 is 0 or on XRSM
@@ -965,6 +983,9 @@ impl Game {
             dispatch_return: false,
             hold: false,
             rewinding: false,
+            rewind_held: false,
+            slot_flip: false,
+            rest_hold: false,
             staff_task: false,
             task_modes: (false, false),
             task_lock: (false, false),
@@ -1279,13 +1300,9 @@ impl Game {
 
     fn finish_click(&mut self) {
         self.click_ms = 0.0;
+        self.slot_flip = true;
         self.adv_latch = true;
-        // sub_40ED0 LABEL_307 (leaving a click wait; sub_2C500 too) resets the 11 per-message colour words
-        let colour = i32::from(self.line_reset_colour());
-        for i in 0..11 {
-            self.set_var(&format!("F{}", 800 + i), colour >> 8);
-            self.set_var(&format!("F{}", 811 + i), colour & 0xFF);
-        }
+        // (the 11 per-message colour words stay: sub_40ED0 resets them only as a rewind starts, `start_rewind`)
         self.last_voice = None;
         self.page.waiting = false;
         self.wait = Wait::None;
@@ -1309,6 +1326,8 @@ impl Game {
 
     pub fn update(&mut self, r: &Renderer, dt: f32) {
         self.frame_no += 1;
+        // (the last frame's draw)
+        self.latch_read_colours();
         // sub_A59F0: the capture fades by its step per frame, gone at 0
         if let Some(f) = &mut self.freeze
             && !f.capture
@@ -1342,6 +1361,9 @@ impl Game {
         for _ in 0..self.speed.max(1) {
             self.update_step(r, dt);
         }
+        if !self.paused {
+            self.step_read_fades(dt);
+        }
         // the sound update (sub_9B7F0) runs once a frame after the script: sub_65E50 counts the queued SE
         // commands down (a key-68 SE queued by this frame's script already loses a frame: 500 ms is 29 frames
         // after the SEPL, 475 ms measured on the Switch), except while a rewind is held (off_AE05B8); then
@@ -1360,6 +1382,29 @@ impl Game {
         self.text_out_ms = if out { self.text_out_ms + dt } else { 0.0 };
         if self.page.alpha > 0.0 {
             self.icon_fade = if self.wait == Wait::Click && out { (self.icon_fade + dt * 0.006).min(1.0) } else { 0.0 };
+        }
+    }
+
+    /// The page's earlier messages fade towards READ_ALPHA (the trailing run of @k messages counts as current).
+    /// sub_391A0 counts once a drawn frame (jp_B0190's frames, not the speed), only while F1103 is 0 and the
+    /// content fade (off_AE05B0) is at 1, so a CLO4 / message-start fade holds them where they are.
+    fn step_read_fades(&mut self, dt: f32) {
+        let mut i = self.page.msgs.len();
+        while i > 0 && (i == self.page.msgs.len() || self.page.msgs[i - 1].1) {
+            i -= 1;
+        }
+        if self.var("F1103") != 0 || self.page.dim != 0.0 {
+            i = 0;
+        }
+        // the current message's fade length follows the text speed of its read state (dword_572B64, set by
+        // sub_6E0D0 / a rewind's layout); config byte 98 (fade out off) ends every fade at once
+        let fade_frames = self.read_fade_frames();
+        if let Some(m) = self.page.msgs.last_mut() {
+            m.3 = fade_frames;
+        }
+        let instant = !self.settings.text_fade_out;
+        for m in &mut self.page.msgs[..i] {
+            m.2 = if instant || m.3 <= 0.0 { 1.0 } else { (m.2 + dt * 0.06 / m.3).min(1.0) };
         }
     }
 
@@ -1409,26 +1454,6 @@ impl Game {
                 self.trans = None;
             }
         }
-        // earlier messages fade towards READ_ALPHA (the trailing run of @k messages counts as current); sub_391A0
-        // only counts while F1103 is 0 and the content fade (off_AE05B0) is at 1, so a CLO4 / message-start
-        // fade holds them where they are
-        let mut i = self.page.msgs.len();
-        while i > 0 && (i == self.page.msgs.len() || self.page.msgs[i - 1].1) {
-            i -= 1;
-        }
-        if self.var("F1103") != 0 || self.page.dim != 0.0 {
-            i = 0;
-        }
-        // the current message's fade length follows the text speed of its read state (dword_572B64, set by
-        // sub_6E0D0 / a rewind's layout); config byte 98 (fade out off) ends every fade at once
-        let fade_frames = self.read_fade_frames();
-        if let Some(m) = self.page.msgs.last_mut() {
-            m.3 = fade_frames;
-        }
-        let instant = !self.settings.text_fade_out;
-        for m in &mut self.page.msgs[..i] {
-            m.2 = if instant || m.3 <= 0.0 { 1.0 } else { (m.2 + dt * 0.06 / m.3).min(1.0) };
-        }
         // window fade / text reveal
         // sub_81B30 (before sub_38D40 steps the fades) holds the text head while the window is shown and still
         // fading in or the content fade (A8) runs, unless F1103 (Switch 499_QA_05's message after CLO3: the text
@@ -1468,7 +1493,7 @@ impl Game {
         }
         let k = usize::from(self.line_read);
         let rate = self.chars_per_frame(k);
-        if self.frame_no > self.reveal_hold && !head_held {
+        if self.frame_no > self.reveal_hold && !head_held && !self.rewind_held {
             match rate {
                 Some(rate) if !self.settings.page_at_once[k] && !fast => {
                     self.page.revealed = (self.page.revealed + rate * dt / FRAME_MS).min(self.page.order as f32);
@@ -1605,7 +1630,7 @@ impl Game {
             self.dispatch_ms = 0.0;
         }
         let mut budget = 20000;
-        while self.resume_ms <= 0.0 && self.wait == Wait::None && !self.ended && !self.hold && !self.rewinding && budget > 0 {
+        while self.resume_ms <= 0.0 && self.wait == Wait::None && !self.ended && !self.hold && !self.rewinding && !self.rest_hold && budget > 0 {
             // the next-scene seek runs whole in this frame (sub_802C0's AE0568 loop)
             if !self.seek_node {
                 budget -= 1;
@@ -1728,7 +1753,10 @@ impl Game {
         let rule = c.int_or(2, 0);
         self.commit_stage();
         self.stage_dirty = false;
-        // sub_60610 copies the committed stage into the backup
+        // sub_60610 pushes a type 1 ring entry (sub_5A910(.., 1); Witch on the Holy Night's jp_60610 too), then
+        // copies the committed stage into the backup (Switch: AE0460 steps in the frame AE04B8 gets 8, so a held
+        // ZR passes two more entries than messages and backing-up commands alone give)
+        self.push_ring_event(1);
         self.stage_backup = Some(self.stage_bytes());
         let rule_before = self.fads_rule;
         // Witch on the Holy Night's FADS (jp_60610) sets the rule wipe edge from its fifth argument (64 by default)
@@ -1970,9 +1998,10 @@ impl Game {
 
     /// The rewind takes its next step. sub_814C0 steps once a frame when no wait is pending; the script does
     /// not run while rewinding, so the restored entries never show their message (only the first step waits
-    /// for the current one).
+    /// for the current one). A FADS's capture hold sets no transition flag (AE04B8 8 comes with the start), so
+    /// it does not stop a step (Witch on the Holy Night: the frame between two steps can reach a FADS).
     pub fn settled(&self) -> bool {
-        (self.wait == Wait::Click || self.rewinding) && self.trans.is_none()
+        (self.wait == Wait::Click || self.rewinding) && self.trans.as_ref().is_none_or(|t| t.hold)
     }
 
     /// The held rewind stopped: the text shows again (sub_391A0 draws none while off_AE05B8 is set), and a
@@ -1984,24 +2013,58 @@ impl Game {
         }
     }
 
-    /// Back one page (sub_814C0).
+    /// Back one page (sub_814C0); false when there was nothing earlier to go back to (sub_3B410(0)).
     pub fn rewind_step(&mut self, r: &Renderer) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
         if !self.can_rewind() {
+            // the newest entry is the only one: it comes back itself unless it is a message's (Tsukihime: type 0,
+            // 12 or 13; Witch on the Holy Night: below 1), and nothing else
+            let kind = self.history[0].kind;
+            let own = if self.assets.build == Build::Witch { kind >= 1 } else { !matches!(kind, 0 | 12 | 13) };
+            if own {
+                self.rewind_to(r, 0, Back::Rewind);
+            }
             return false;
         }
         // sub_814C0: back to the newest earlier entry of a page's first message (type 0, F823 <= 1 when it was
         // recorded) taken outside a story movie / the staff roll (the entries between are undone on the way),
         // or the ring's oldest entry when there is none
+        // (Witch on the Holy Night's jp_814C0 also passes over entries whose command, copied up to its `;` (256
+        // bytes at most), holds `@e`: a page's first message that ends the page)
         let cur = self.history.len() - 1;
-        let target = (0..cur)
-            .rev()
-            .find(|&i| {
-                let h = &self.history[i];
-                h.kind == 0 && !h.locked && entry_f823(&h.data) <= 1
-            })
-            .unwrap_or(0);
+        let target = self.rewind_target(cur).unwrap_or(0);
         self.rewind_to(r, target, Back::Rewind);
         true
+    }
+
+    /// The newest page start before ring entry `before` that sub_814C0 steps back to.
+    fn rewind_target(&mut self, before: usize) -> Option<usize> {
+        for i in (0..before).rev() {
+            let h = &self.history[i];
+            if h.kind != 0 || h.locked || entry_f823(&h.data) > 1 {
+                continue;
+            }
+            let (scene, pc) = (h.data.scene, h.data.pc);
+            if self.assets.build == Build::Witch && self.ends_page(scene, pc) {
+                continue;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    /// The command at `pc` of scene `scene` holds `@e` within the 256 bytes jp_814C0 copies of it.
+    fn ends_page(&mut self, scene: usize, pc: usize) -> bool {
+        let script = if scene == self.scene_index { Some(self.script.clone()) } else { self.assets.scene(scene) };
+        script.and_then(|s| s.commands.get(pc).map(|c| format!("_{}({})", c.name, c.args.join(",")))).is_some_and(|t| {
+            let mut n = t.len().min(256);
+            while !t.is_char_boundary(n) {
+                n -= 1;
+            }
+            t[..n].contains("@e")
+        })
     }
 
     /// The mode panel's previous scene button is lit (sub_4E170 0x4e840): during a choice with two scene
@@ -2090,6 +2153,8 @@ impl Game {
     /// the entry is the save point again when it qualifies (LABEL_137).
     fn rewind_to(&mut self, r: &Renderer, i: usize, how: Back) {
         let RingEntry { data: d, node: tag, serial, locked, kind, .. } = self.history[i].clone();
+        // (the current message's slot as it was: its text and how far it is out)
+        let slot = self.page.texts.last().filter(|_| !self.slot_flip).cloned().map(|t| (t, self.page.revealed - self.page.last_start.1 as f32));
         while how != Back::Point && self.scene_ring.last().is_some_and(|p| p.serial.is_some_and(|s| s > serial)) {
             self.scene_ring.pop();
             if how == Back::Rewind {
@@ -2109,7 +2174,7 @@ impl Game {
         // sub_5BAF0 case 0 with a2 != 0 (the ZL rewind) sets byte_146E648 and lays the message out
         if how == Back::Rewind && kind == 0 {
             self.ring_restored = true;
-            self.lay_out_rewound(&d);
+            self.lay_out_rewound(&d, slot);
         }
         // a rewind that ends on an entry without a message (only the ring's oldest, a new game's first stage
         // command in START_SCRIPT) shows no window until the next message: Switch EN, rewound from the third
@@ -2122,17 +2187,18 @@ impl Game {
         self.backlog_pages.retain(|p| p.last.is_some_and(|l| l < serial));
         // (its first message: the newest page start up to here, unless that belongs to a kept page)
         let kept = self.backlog_pages.last().and_then(|p| p.last);
-        let start = self.history.iter().take(i + 1).rev().find(|h| h.key.2 == 1).map(|h| h.serial);
+        let start = self.history.iter().take(i + 1).rev().find(|h| h.page_start()).map(|h| h.serial);
         self.page_ring = (start.filter(|&s| kept.is_none_or(|l| s > l)), Some(serial));
     }
 
-    /// sub_5BAF0 case 0 with a2 != 0: the entry's message is laid out in full at once (sub_53CF0 on its script
+    /// sub_5BAF0 case 0 with a2 != 0: the entry's message is laid out in full at once (Witch on the Holy Night: at
+    /// head 0 unless its slot holds that text already) (sub_53CF0 on its script
     /// text) with no voice (AE04C8 / AE08B0 = -1; the replay voice AE0790 stays the entry's), and the script
     /// resumes past it (+16). Without `@n` it waits for a click (AE04B8 0x500, 0x140 for `@e` or a full
     /// page), which the next held frame's sub_814C0 clears again, so a rewind held past its step goes on into
     /// the next message once released; an `@n` message goes on at once and holds the next ring push
     /// (byte_146E644).
-    fn lay_out_rewound(&mut self, d: &crate::save::SaveData) {
+    fn lay_out_rewound(&mut self, d: &crate::save::SaveData, slot: Option<(String, f32)>) {
         let Some(c) = self.script.commands.get(self.pc).filter(|c| matches!(c.op, Op::Message)).cloned() else {
             return;
         };
@@ -2144,11 +2210,62 @@ impl Game {
         self.pc += 1;
         self.show_message(&message_end(raw).0, code != Some(b'n'));
         crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
-        self.page.revealed = self.page.order as f32;
+        // (Witch on the Holy Night's jp_5BAF0 zeroes the head and tail, so the message types out again once the
+        // rewind is released; jp_AB4D0 leaves a slot that holds the same text as it was (jp_A7790 returns before
+        // laying it out) and jp_AB710 takes the slot's progress back as the head, unless a click passed since the
+        // last message, off_6327C0 flipping to the cleared slot)
+        self.page.revealed = if self.assets.build != Build::Witch {
+            self.page.order as f32
+        } else {
+            let start = self.page.last_start.1 as f32;
+            let kept = slot.filter(|(t, _)| self.page.texts.last() == Some(t)).map_or(0.0, |(_, p)| p.max(0.0));
+            (start + kept).min(self.page.order as f32)
+        };
         self.ring_hold = code == Some(b'n');
         self.pending_voice = None;
         self.voice_to_play = None;
         self.last_voice = d.voice.clone();
+    }
+
+    /// A rewind starts (off_AE05B8 0 -> 1): the WTTM count (AE04A8) goes; ZL and the mode panel's button
+    /// (`colours`: sub_40ED0 LABEL_307, Witch on the Holy Night's LABEL_302) also reset the 11 per-message
+    /// colour words, the drag gesture and TeaTime's ZL do not.
+    pub fn start_rewind(&mut self, colours: bool) {
+        if matches!(self.wait, Wait::Time { .. }) {
+            self.wait = Wait::None;
+        }
+        if colours {
+            self.reset_colour_words();
+        }
+    }
+
+    /// The 11 per-message colour words F800.. / F811.. (hi / lo byte; each message sets its own as it starts)
+    /// take `line_reset_colour`: as a rewind starts, as the config closes (sub_2C500; Witch on the Holy
+    /// Night's sub_D700 state 8) and on Witch on the Holy Night's language row (sub_D700 case 4). Nothing else
+    /// resets them, a click neither.
+    pub fn reset_colour_words(&mut self) {
+        let colour = i32::from(self.line_reset_colour());
+        for i in 0..11 {
+            self.set_var(&format!("F{}", 800 + i), colour >> 8);
+            self.set_var(&format!("F{}", 811 + i), colour & 0xFF);
+        }
+    }
+
+    /// jp_391A0 draws the page's earlier messages in colour mode 1 with the read colour while the current
+    /// message is read, and writes it into their words (31200 in a bubble), so they keep it under a later unread
+    /// message of the page.
+    fn latch_read_colours(&mut self) {
+        if self.assets.build != Build::Witch || self.settings.text_colour != 1 || !self.line_read {
+            return;
+        }
+        if !self.page.visible || self.rewinding {
+            return;
+        }
+        let colour = if self.witch_bubble_text() { 31200 } else { 0xDC6D };
+        for i in 0..self.page.msgs.len().saturating_sub(1).min(11) {
+            self.set_var(&format!("F{}", 800 + i), colour >> 8);
+            self.set_var(&format!("F{}", 811 + i), colour & 0xFF);
+        }
     }
 
     /// sub_814C0 starts every held frame by clearing the click wait (AE04B8 0x500) a step left.
@@ -3304,12 +3421,19 @@ impl Game {
             },
 
             // audio
-            "SEPL" | "SEFD" | "SESP" | "SEVL" | "SEPN" | "SEAC" => self.cmd_se(c),
+            "SEPL" | "SEFD" | "SESP" | "SEVL" | "SEPN" | "SEAC" => {
+                if self.se_pushes(c) {
+                    self.push_ring_event(3);
+                }
+                self.cmd_se(c);
+            }
             // MPLY(n, key 17 volume = 100, key 1 fade-in ms, key 11 fade-out ms, key 69 start sample) (sub_649E0):
             // a track already playing is left alone; with a fade-in the old track fades out at 1666.7 / (key 11
             // or key 1) volume points a frame while the new one rises at 1666.7 / key 1 (so key 1 ms at full
             // volume); without one the old track stops at once
             "MPLY" => {
+                // a type 2 ring entry first (sub_649E0 / sub_64FA0 / MSTP 0x78e84 / sub_653B0)
+                self.push_ring_event(2);
                 let n = c.int_or(0, 0);
                 let vol = c.keyed_int(17).unwrap_or(100);
                 let fade_in = c.keyed_int(1).unwrap_or(0);
@@ -3355,6 +3479,8 @@ impl Game {
             }
             // MFAD(key 1 ms) (sub_64FA0): out at word_146E650 * 1000 / 60 / ms points a frame (ms), else at once
             "MFAD" => {
+                // a type 2 ring entry first (sub_649E0 / sub_64FA0 / MSTP 0x78e84 / sub_653B0)
+                self.push_ring_event(2);
                 let ms = c.keyed_int(1).unwrap_or(0);
                 if let Some(sa) = &mut self.seek_audio {
                     sa.bgm = None;
@@ -3365,6 +3491,8 @@ impl Game {
             // MSTP() (Witch on the Holy Night): outside the next-scene seek (AE0568) the BGM fades out at 4.17 points
             // a frame (jp_9C9B0: 0.4 s from full volume); the BGM word clears
             "MSTP" => {
+                // a type 2 ring entry first (sub_649E0 / sub_64FA0 / MSTP 0x78e84 / sub_653B0)
+                self.push_ring_event(2);
                 if let Some(sa) = &mut self.seek_audio {
                     sa.bgm = None;
                 } else {
@@ -3375,6 +3503,8 @@ impl Game {
             // Witch on the Holy Night's jp_653B0 keeps 255 x volume / 100 and steps the player to word x 100 / 255
             // percent at |word - old word| x 1000 / 60 / ms a frame (that is, in ms x 100 / 255)
             "MVOL" => {
+                // a type 2 ring entry first (sub_649E0 / sub_64FA0 / MSTP 0x78e84 / sub_653B0)
+                self.push_ring_event(2);
                 let ms = c.keyed_int(1).unwrap_or(0).max(1);
                 let pct = c.keyed_int(17).unwrap_or(0);
                 let witch = crate::assets::witch();
@@ -3862,6 +3992,19 @@ impl Game {
     /// config, off_AE03D8 + 6 / + 0x24); a key outside the rows reads off.
     fn se_speaker_on(&self, key70: i32) -> bool {
         usize::try_from(key70 - 1).is_ok_and(|r| r < 19 && self.settings.voice_on && self.settings.char_mute >> r & 1 == 0)
+    }
+
+    /// Whether an SE command from the script pushes a type 3 ring entry before it acts: SEFD, SEVL, SESP, SEPN
+    /// and SEAC always (sub_6B310 / sub_6AE10 / 0x7a734 / sub_6B820 / sub_6C0A0; a delayed one when sub_66200
+    /// queues it), SEPL only when queued, when it stops its channel (no sound) or when it starts a loop
+    /// (sub_6A340; a one-shot pushes nothing). The SEPL / SEVL / SEPN that SEAC runs push nothing (no script
+    /// position). Witch on the Holy Night's jp_ handlers are the same.
+    fn se_pushes(&self, c: &Command) -> bool {
+        if c.name != "SEPL" {
+            return true;
+        }
+        let queued = self.seek_audio.is_none() && c.keyed_int(68).is_some();
+        queued || c.arg(2).is_none_or(str::is_empty) || c.int_or(1, 0) == 1
     }
 
     /// SEPL / SEFD / SEVL / SESP (sub_6A340 / sub_6B310 / sub_6AE10 / 0x7a6f4). With a delay (key 68, ms, past
@@ -4693,8 +4836,8 @@ impl Game {
         }
     }
 
-    /// The per-message colour words after a click (jp_40ED0): mode 1 makes the page's messages read (0xDC6D),
-    /// bubbles 31200.
+    /// The value `reset_colour_words` gives the per-message colour words: mode 1 makes the page's messages read
+    /// (0xDC6D), bubbles 31200.
     fn line_reset_colour(&self) -> u16 {
         match self.assets.build {
             Build::Witch if self.witch_bubble_text() => 31200,
@@ -5067,6 +5210,7 @@ impl Game {
     /// Lay out a message (`text` as the script has it: `$` references resolve in the game language, and the
     /// page keeps it unresolved, as the exe's history records do) at the page pen.
     fn show_message(&mut self, text: &str, wait: bool) {
+        self.slot_flip = false;
         let shown = self.resolve_text(text);
         let runs = text::parse_markup(&shown);
         self.page.visible = true;
@@ -5135,6 +5279,9 @@ impl Game {
             self.page.order = order;
         }
         self.page.last_start = from;
+        // the page's earlier messages are drawn whole from their ring entries (sub_391A0 at 768 / jp_391A0 at 800),
+        // only the new message's slot types out (a rewound message restored at head 0 included)
+        self.page.revealed = self.page.revealed.max(from.1 as f32);
         self.arm_wobbles(&mut placed, &[]);
         let fade_frames = self.read_fade_frames();
         self.page.msgs.push((self.page.chars.len(), shown.trim_end().ends_with("@k"), 0.0, fade_frames));
@@ -6497,6 +6644,12 @@ impl Game {
         self.menu_lock = true;
         self.history.clear();
         self.backlog_pages.clear();
+        self.page_ring = (None, None);
+        // sub_5D950 starts the page ring over with the record in slot 0 (sub_5BAF0(0, 0) makes it the newest),
+        // and its message pushes a second entry as it replays, so a held rewind goes back to the record at once
+        // (Switch: ZL right after a load replays the page)
+        let key = (d.scene, d.pc, usize::MAX - 1);
+        self.push_ring(crate::save::SaveData { prev: None, ..d.clone() }, key, false, d.kind);
         self.scene_ring.clear();
         if let Some(p) = d.prev.as_deref() {
             let mut p = p.clone();

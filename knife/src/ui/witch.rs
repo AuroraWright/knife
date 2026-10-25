@@ -25,7 +25,7 @@ mod save;
 mod sound;
 mod title;
 
-pub use modepnl::{HELP as PANEL_HELP, WBtn};
+pub use modepnl::{HELP as PANEL_HELP, WBtn, WSpin};
 pub use objs::{Pen, WObjs};
 pub use title::WitchTitle;
 
@@ -113,8 +113,8 @@ pub struct WIn {
 #[derive(Debug, Clone, Copy)]
 struct Finger {
     start: [f32; 2],
-    /// the pointer in the last three frames with the finger down (slot fields 9, 7, 3)
-    trail: [[f32; 2]; 3],
+    /// the pointer each frame with the finger down (slot fields 9, 7, 3; knife's desktop policy in `Trail`)
+    trail: super::touch::Trail,
     /// moved 13 units from the start (slot field 11 -> +0x78)
     moved: bool,
     frames: u32,
@@ -137,7 +137,9 @@ impl WIn {
     pub fn touch_down(&mut self, x: f32, y: f32) {
         self.pos = [x, y];
         self.start = [x, y];
-        self.finger = Some(Finger { start: [x, y], trail: [[x, y]; 3], moved: false, frames: 0 });
+        let mut trail = super::touch::Trail::default();
+        trail.reset([x, y]);
+        self.finger = Some(Finger { start: [x, y], trail, moved: false, frames: 0 });
         self.released = false;
     }
 
@@ -223,7 +225,7 @@ impl WIn {
         self.wheel = self.take_wheel();
         if let Some(f) = &mut self.finger {
             if std::mem::take(&mut self.released) {
-                let (dx, dy) = ((f.trail[2][0] - f.trail[0][0]) as i32, (f.trail[2][1] - f.trail[0][1]) as i32);
+                let [dx, dy] = f.trail.flick(f.start, self.pos).map(|d| d as i32);
                 let mut v = 0;
                 v |= if dx < -6 { 1 } else if dx >= 7 { 2 } else { 0 };
                 v |= if dy < -6 { 4 } else if dy >= 7 { 8 } else { 0 };
@@ -247,7 +249,7 @@ impl WIn {
             } else {
                 self.began = f.frames == 0;
                 f.frames += 1;
-                f.trail = [f.trail[1], f.trail[2], self.pos];
+                f.trail.push(self.pos);
                 self.active = true;
                 self.touch |= 0x8001;
             }

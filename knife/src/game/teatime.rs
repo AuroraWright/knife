@@ -2,7 +2,7 @@
 //! the right (sub_74010 / sub_745E0 / sub_74190, drawn by sub_74B40 after the choices): archive, save, title,
 //! next episode (objects 357..360, group 40, teatime_parts). The script waits until the menu returns (sub_40ED0
 //! runs sub_745E0 instead of the script while byte_F4763C is set): next episode goes on with the script, title
-//! and archive end the story, ZL (or a drag to the left) rewinds. The exe steps every timer per 60 Hz frame.
+//! and archive end the story, ZL rewinds. The exe steps every timer per 60 Hz frame.
 
 use knife_render::{Quad, Renderer, TexRef};
 
@@ -339,8 +339,9 @@ impl Game {
         }
     }
 
-    /// ZL or a drag 45 units to the left while the menu takes input, with something to go back to
-    /// (AE0470 | AE0460): state 10, the menu returns 2 and the rewind starts.
+    /// ZL while the menu takes input, with something to go back to (AE0470 | AE0460): state 10, the menu
+    /// returns 2 and the rewind starts. (sub_74190 also takes a drag stretch of 45 units to the left,
+    /// dword_64987C, which nothing in WoH writes.)
     pub fn teatime_rewind(&mut self) -> bool {
         let ok = self.can_rewind();
         let Some(tt) = &mut self.teatime else { return false };

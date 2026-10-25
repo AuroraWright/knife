@@ -104,6 +104,26 @@ impl Pen {
         out.push(q);
     }
 
+    /// `spr` turned by `angle` radians about its anchor point (flag 0x20: jp_B0920 reads jp_B0480's rotation,
+    /// a 16-bit angle x pi / 32768).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spr_rot(&self, out: &mut Vec<Quad>, tex: &TexRef, flags: u32, src: Option<[f32; 4]>, x: f32, y: f32, angle: f32) {
+        let n = out.len();
+        self.spr(out, tex, flags, src, x, y);
+        if flags & 0x20 == 0 || angle == 0.0 {
+            return;
+        }
+        let [kx, ky] = self.k();
+        let (cx, cy) = (self.space[2] + kx * x, self.space[3] + ky * y);
+        let (sin, cos) = angle.sin_cos();
+        for q in &mut out[n..] {
+            for p in &mut q.pos {
+                let (dx, dy) = (p[0] - cx, p[1] - cy);
+                *p = [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+            }
+        }
+    }
+
     /// jp_B1260: a filled rect (x, y, w, h in the space) in the pen colour.
     pub fn fill(&self, out: &mut Vec<Quad>, white: &TexRef, x: f32, y: f32, w: f32, h: f32) {
         if self.color[3] <= 0.0 {

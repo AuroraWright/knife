@@ -2520,6 +2520,10 @@ impl Ui {
     /// The fade-out finished: leave the screen; back on the title or in game the backdrop fades out.
     fn finish_close(&mut self, game: &mut Game, r: &Renderer) {
         let from = self.screen;
+        // sub_2C500, the config's closing fade ending, resets the per-message colour words
+        if from == Screen::Config {
+            game.reset_colour_words();
+        }
         if std::mem::take(&mut self.load_cut) {
             self.closing = false;
             self.enter_loaded();
@@ -6182,6 +6186,14 @@ impl Ui {
         if self.screen == Screen::Game && game.ended && self.black_then.is_none() {
             self.end_story(game);
         }
+    }
+
+    /// The story's input (sub_40ED0: the touch gestures, ZL / ZR, the mode panel, the rewind), before the frame's
+    /// script as the exe runs it, so a press or a release acts on the script of its own frame.
+    pub fn story_input(&mut self, game: &mut Game, r: &Renderer, dt: f32) {
+        let secs = dt / 1000.0;
+        let title_wait = self.screen == Screen::Title && self.title_movie && game.movie_active() && !game.movie_ready();
+        let f = if title_wait { 0.0 } else { secs * 60.0 };
         self.touch_update(game, r, secs, f);
     }
 
