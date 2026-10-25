@@ -31,6 +31,8 @@ pub enum Pad {
     ZR,
     /// right stick press (R3)
     R3,
+    /// left stick press (L3)
+    L3,
     /// left stick directions (past 80 of ±128)
     LUp,
     LDown,
@@ -44,13 +46,30 @@ impl Ui {
     /// A controller button went down (`pressed`) or up. Key repeat only moves cursors.
     pub fn pad(&mut self, game: &mut Game, r: &Renderer, b: Pad, pressed: bool, repeat: bool) {
         // held buttons
+        if pressed {
+            self.pads_held |= 1 << b as u32;
+        } else {
+            self.pads_held &= !(1 << b as u32);
+        }
         match b {
             Pad::A => self.enter_held = pressed,
             Pad::ZL => self.touch.zl = pressed.then_some(self.touch.zl.unwrap_or(0.0)),
             Pad::ZR => self.touch.zr = pressed.then_some(self.touch.zr.unwrap_or(0.0)),
             _ => {}
         }
+        if self.screen == Screen::Witch {
+            self.witch_pad(b, pressed, repeat);
+            return;
+        }
+        // the WoH title runs on the same input word (its popups and load screen read it)
+        if self.screen == Screen::Title && crate::assets::witch() {
+            self.witch_pad(b, pressed, repeat);
+        }
         if !pressed || (repeat && !matches!(b, Pad::Up | Pad::Down | Pad::Left | Pad::Right | Pad::LUp | Pad::LDown | Pad::LLeft | Pad::LRight)) {
+            return;
+        }
+        if self.screen == Screen::Title && crate::assets::witch() {
+            self.wt_pad(game, r, b, repeat);
             return;
         }
         if self.screen == Screen::Game && self.popup.is_none() {
@@ -105,6 +124,20 @@ impl Ui {
             }
             return;
         }
+        // the TeaTime menu (sub_745E0 runs instead of the story's keys, sub_74190 in its state 2): up (and ZR) /
+        // down (and R) step, left (and L) / right go to the top / bottom, A presses, ZL rewinds
+        if game.teatime_active() {
+            match b {
+                Pad::Up | Pad::ZR => game.teatime_move(-1, repeat),
+                Pad::Down | Pad::R => game.teatime_move(1, repeat),
+                Pad::Left | Pad::L => game.teatime_move(-2, repeat),
+                Pad::Right => game.teatime_move(2, repeat),
+                Pad::A if !repeat => game.teatime_press(),
+                Pad::ZL if !repeat => self.teatime_rewind(game, r),
+                _ => {}
+            }
+            return;
+        }
         // the staff roll task (off_AE0650 = 1): the system menu, backlog, panel, auto, skip and rewind wait; A
         // advances (ZR fast-forwards, see touch_update)
         if game.mode_task() && !game.in_choice() {
@@ -138,11 +171,17 @@ impl Ui {
                         self.close_panel_by_button();
                         None
                     }
+                    // Witch on the Holy Night's masks [19] / [20] (ZR / ZL) close it too
+                    Pad::ZR | Pad::ZL if crate::assets::witch() && !repeat => {
+                        self.close_panel_by_button();
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(k) = key {
-                    // sub_4E170: sound 0 as the selection moves; the pad takes the focus from the pointer
-                    game.play_sys_sound(0);
+                    // sub_4E170: sound 0 as the selection moves (Witch on the Holy Night: 2); the pad takes the
+                    // focus from the pointer
+                    game.play_sys_sound(if crate::assets::witch() { 2 } else { 0 });
                     self.touch.panel_hover = None;
                     self.touch.panel_key = Some(k);
                     self.touch.panel_last = k;
@@ -152,12 +191,13 @@ impl Ui {
         }
         if game.in_choice() {
             match b {
-                Pad::Up => game.choice_move(-1),
-                Pad::Down => game.choice_move(1),
-                Pad::Left => game.choice_side(false),
-                Pad::Right => game.choice_side(true),
+                Pad::Up => game.choice_move(-1, repeat),
+                Pad::Down => game.choice_move(1, repeat),
+                Pad::Left => game.choice_side(false, repeat),
+                Pad::Right => game.choice_side(true, repeat),
                 Pad::A => game.advance(),
                 Pad::Y => self.cancel(game, r),
+                Pad::Plus | Pad::L3 if crate::assets::witch() && !repeat => self.witch_quick_save(game, r),
                 _ => {}
             }
             return;
@@ -180,16 +220,28 @@ impl Ui {
                 self.show_window();
                 self.cancel(game, r);
             }
+            // Witch on the Holy Night: X (mask [17]) opens its backlog (jp_40ED0 -> sub_A0E0)
+            Pad::X if crate::assets::witch() => {
+                if self.wl_ok(game) {
+                    self.wl_open(game, r);
+                }
+            }
             Pad::X if game.backlog_len() > 0 => {
                 // sub_28950: the backlog opens with sound 3
                 self.snd(game, 3);
                 self.push(Screen::Backlog { scroll: 0 });
             }
             Pad::L => self.toggle_auto(game),
+            // Witch on the Holy Night: Plus / L3 quick save at a click wait, Minus quick load
+            Pad::Plus | Pad::L3 if crate::assets::witch() && game.wait == crate::game::Wait::Click => {
+                self.witch_quick_save(game, r)
+            }
+            Pad::Minus if crate::assets::witch() => self.witch_quick_load(game, r),
             // R toggles skip mode (off_AE0660 bit 1) unless the window is hidden
             Pad::R if !self.touch.hidden => game.skip_mode = !game.skip_mode,
             // mask [21] opens the mode panel on its last button
-            Pad::Up if !self.touch.hidden => {
+            // (Witch on the Holy Night: jp_40ED0 asks only outside a TeaTime scene, jp_83B00 and a story movie)
+            Pad::Up if !self.touch.hidden && (!crate::assets::witch() || self.panel_allowed(game)) => {
                 self.touch.panel = Panel::Opening;
                 self.touch.panel_key = Some(self.touch.panel_last);
             }
@@ -225,6 +277,21 @@ impl Ui {
     /// - save list (sub_50FC0): past ±12, v² adds up (dword_F1F478, cleared at |v| <= 11) and every 14401 steps
     ///   the cursor a save up / down like the d-pad without wrapping.
     pub(super) fn stick_frame(&mut self, game: &mut Game, r: &Renderer) {
+        // Witch on the Holy Night: in the story only a choice (jp_83E50) reads the wheel, as a fresh up / down
+        // press; the WoH screens take it with their input frame (`WIn::begin`)
+        if crate::assets::witch() && self.screen != Screen::Witch && self.screen != Screen::Title {
+            let n = self.w.inp.take_wheel();
+            if n != 0
+                && self.screen == Screen::Game
+                && self.popup.is_none()
+                && self.touch.scene_cd.is_none()
+                && self.touch.panel == Panel::Closed
+                && !game.teatime_active()
+                && game.in_choice()
+            {
+                game.choice_move(if n > 0 { -1 } else { 1 }, false);
+            }
+        }
         if self.busy() || self.popup.is_some() {
             self.wheel = 0.0;
             self.wheel_press = 0.0;

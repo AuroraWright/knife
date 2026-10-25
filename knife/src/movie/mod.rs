@@ -325,6 +325,23 @@ impl Movie {
         self.rx = mpsc::sync_channel(0).1;
     }
 
+    /// sub_15B0: playback jumps to `secs` (the player's seek, in ms there).
+    pub fn seek(&mut self, secs: f32) {
+        if self.finished {
+            return;
+        }
+        match spawn_video(&self.path, secs, self.fps) {
+            Ok((child, rx)) => {
+                self.kill();
+                self.child = child;
+                self.rx = rx;
+                self.elapsed = secs * 1000.0;
+                self.shown = (secs * self.fps).round() as u64;
+            }
+            Err(e) => tracing::warn!("movie seek: {e:#}"),
+        }
+    }
+
     /// sub_1A80: stops playback; the last frame then fades out.
     pub fn stop(&mut self) {
         self.kill();

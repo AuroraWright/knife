@@ -12,9 +12,13 @@ mod shake;
 mod ghost;
 mod records;
 mod story_movie;
+mod teatime;
+mod witch_log;
 
 pub use choice::{ChoiceKind, ChoiceOpt, DIALOG_BUTTON_Y, DIALOG_BUTTONS};
 use choice::Choice;
+pub use teatime::TeaReq;
+pub use witch_log::{LogEntry, WitchSlot};
 use story_movie::StoryMovie;
 
 use knife_core::exe::Build;
@@ -26,7 +30,7 @@ use crate::{
     motion::MotionTable,
     save::SeQueued,
     sound::Sound,
-    stage::{Layer, Source, Stage, Tween},
+    stage::{Layer, Source, Stage, Tween, WitchQuake},
     text::{self, FontAtlas, Layout, PlacedChar},
 };
 
@@ -54,6 +58,8 @@ pub enum Wait {
     Message { voice: bool },
     Movie,
     Halt,
+    /// TTCT: the TeaTime menu runs instead of the script (sub_40ED0 while byte_F4763C is set)
+    TeaTime,
 }
 
 struct Transition {
@@ -112,6 +118,10 @@ pub struct Page {
     choice_texts: Vec<String>,
     /// their F(847 + index), as `extras`
     choice_extras: Vec<i32>,
+    /// per message: Witch on the Holy Night's `@z` (`Game::z_cur`)
+    zs: Vec<Option<bool>>,
+    /// time towards the glyph wobbles' next 60 Hz step (`text::Wobble`)
+    wobble_ms: f32,
 }
 
 /// Message text (sub_391A0): text slots 464 units wide at glyph scale 0.76 of the W / 32 px font size
@@ -127,8 +137,10 @@ pub const LAYOUT: Layout = Layout {
     right: (88.0 + 464.0) * 3.0,
     size: 60.0 * 0.76,
     spacing: 4.0,
+    sx: 1.0,
     line_height: 0.0,
     ascent: ASCENT,
+    ruby_y: text::RUBY_Y,
 };
 /// English (overseas build, sub_391A0 with sub_2DF20, docked): page text from x 32 units, line 0's box at
 /// (int)(65 - 9.8824) = 55 units, the slot sub_39050 widens from 464 to 573 units, and every text slot's
@@ -138,9 +150,11 @@ pub const EN_LAYOUT: Layout = Layout {
     right: (32.0 + 573.0) * 3.0,
     size: EN_SIZE,
     spacing: 4.0,
+    sx: 1.0,
     line_height: 0.0,
     // the font's ascent applies at run time (`msg_layout`)
     ascent: ASCENT * 0.9,
+    ruby_y: text::RUBY_Y,
 };
 const EN_SIZE: f32 = 60.0 * 0.9 * 0.76;
 /// English message slot width in 640-wide units (sub_39050: 464 -> 573 for non-bubble windows)
@@ -148,13 +162,47 @@ const EN_WIDTH: f32 = 573.0;
 /// F822 != 1 (LABEL_135): the message alone (no earlier history entries) from x 169.58 units, line 0's box
 /// at 43.141 units (trainscene.mov: glyph tops y 116, first glyph x 562 after the indent).
 const WINDOW_LEFT: f32 = 169.58;
+/// Witch on the Holy Night's page layout (WoH jp_391A0, docked): text from x 92 units (30 for English, v239),
+/// line 0's box at F824 = 65 units (English 55), slot 28 436 units wide (English 556, sub_1AE20), glyphs at 0.74
+/// of the base size; the line spacing argument is 9 (Tsukihime 10).
+pub const WITCH_LAYOUT: Layout = Layout {
+    left: 92.0 * 3.0,
+    right: (92.0 + 436.0) * 3.0,
+    size: 60.0 * 0.74,
+    spacing: 4.0,
+    sx: 1.0,
+    line_height: 0.0,
+    ascent: ASCENT,
+    ruby_y: text::RUBY_Y,
+};
+/// Witch on the Holy Night in English: x 30, 556 units wide (sub_1AE20), and WoH's sub_A7790 also takes 0.9 of every
+/// English text slot's glyph size.
+pub const WITCH_EN_LAYOUT: Layout = Layout {
+    left: 30.0 * 3.0,
+    right: (30.0 + 556.0) * 3.0,
+    size: 60.0 * 0.9 * 0.74,
+    spacing: 4.0,
+    sx: 1.0,
+    line_height: 0.0,
+    ascent: ASCENT,
+    ruby_y: text::RUBY_Y,
+};
 /// The overseas build's message layout keeps the Japanese one for Japanese and Chinese; the docked game
 /// (sub_A59D0: the 1920x1080 display mode) never takes its handheld branch (box 46, 0.85 glyphs, 508 wide).
 pub fn msg_layout() -> Layout {
-    let lay = if text::english() { EN_LAYOUT } else { LAYOUT };
-    // the line spacing (a8 + 14) * H / 1080 = 24 px after the font set's line feed at the glyph size; the
-    // baseline at the pair font's ascent
-    Layout { line_height: text::line_feed() * lay.size / text::BASE_SIZE + 24.0, ascent: text::msg_ascent(ASCENT), ..lay }
+    let witch = crate::assets::witch();
+    let lay = match (witch, text::english()) {
+        (true, true) => WITCH_EN_LAYOUT,
+        (true, false) => WITCH_LAYOUT,
+        (false, true) => EN_LAYOUT,
+        (false, false) => LAYOUT,
+    };
+    // the line spacing (a8 + 14) * H / 1080 = 24 px (Witch on the Holy Night 23) after the font set's line feed
+    // at the glyph size; the baseline at the pair font's ascent
+    let spacing = if witch { 23.0 } else { 24.0 };
+    // the baseline scales with the glyph (Witch on the Holy Night: 0.74 of the W / 32 size, Tsukihime 0.76)
+    let ascent = text::msg_ascent(ASCENT) * if witch { 0.74 / 0.76 } else { 1.0 };
+    Layout { line_height: text::line_feed() * lay.size / text::BASE_SIZE + spacing, ascent, ..lay }
 }
 /// Baseline of the page's first line (box 65 units, English 55).
 pub fn top_baseline() -> f32 {
@@ -234,8 +282,9 @@ const WINDOW_DY: [f32; 37] = [
     -10.0, -100.0, -15.0, -150.0, -170.0, -180.0, -190.0, -20.0, -200.0, -210.0, -220.0, -230.0, -30.0, -300.0, -40.0,
     -45.0, -50.0, -55.0, -60.0,
 ];
-/// Image slots 52.. are DISP_PARTS_JA in order.
+/// Image slots 52.. are DISP_PARTS_JA in order (Witch on the Holy Night: 50.., its object table at 0x3AFBC0).
 const DISP_SLOT0: u16 = 52;
+const WITCH_DISP_SLOT0: u16 = 50;
 /// sub_38EC0 / the bubble cursor draw icons at 0.36 x 0.45 units per texture pixel.
 const ICON_SCALE: (f32, f32) = (0.36 * UX, 0.45 * UY);
 /// System sounds (sub_710: dword_3341A0[n] = sound 0x10040D4 + n): 0 cursor move, 1 confirm, 2 refusal / back,
@@ -261,6 +310,15 @@ const TEST_SES: [&str; 14] = [
 /// sub_710's sound ids (dword_3341A0): BFSAR items 0x10040d4.. in order. 0x10040d5 (1) and 0x10040db (7) have no
 /// name; the others are WSD_MOON_SE00001, 03, 04, 07, 10, 11 and 14.
 const SYS_SOUNDS: [u32; 9] = [0x10040d4, 0x10040d5, 0x10040d6, 0x10040d7, 0x10040d8, 0x10040d9, 0x10040da, 0x10040db, 0x10040dc];
+/// Witch on the Holy Night's system sounds (jp_710: jd_3341A0, 14 entries, 11 / 12 none).
+const WITCH_SYS_SOUNDS: [u32; 14] =
+    [0x10024fe, 0x10024ff, 0x1002500, 0x1002501, 0x1002502, 0x1002503, 0x1002504, 0x1002505, 0x1002506, 0x1002507, 0x1002508, 0, 0, 0x1002501];
+
+/// System sound n's BFSAR item (sub_ACEF0 / sub_ACFA0's table).
+fn sys_sound_id(n: usize) -> Option<u32> {
+    let table: &[u32] = if crate::assets::witch() { &WITCH_SYS_SOUNDS } else { &SYS_SOUNDS };
+    table.get(n).copied().filter(|&id| id != 0)
+}
 /// Voice name prefix -> speaker (sub_2360, table off_44D970).
 const VOICE_SPEAKERS: [(&str, usize); 55] = [
     ("ZZZ", 0), ("A00", 1), ("A10", 2), ("A11", 2), ("A12", 2), ("A20", 3), ("A21", 3), ("A22", 3), ("A23", 3),
@@ -276,13 +334,29 @@ const SPEAKER_ROW_BIT: [u32; 24] = [
     262144, 1, 2, 4, 512, 65536, 16, 32, 8, 128, 4096, 32768, 131072, 1, 1024, 8192, 16384, 2048, 64, 262144, 262144,
     256, 262144, 262144,
 ];
+/// Witch on the Holy Night's voice name prefixes -> speaker (sub_1D70, table 0x2E7698; exact letters, 0 when
+/// unlisted).
+const WITCH_VOICE_SPEAKERS: [(&str, usize); 22] = [
+    ("ZZZ", 0), ("A10", 1), ("A11", 1), ("A40", 2), ("A30", 3), ("B70", 4), ("B10", 5), ("B11", 5), ("B50", 6),
+    ("B60", 7), ("B40", 8), ("B41", 8), ("B30", 9), ("B20", 10), ("A20", 11), ("A21", 11), ("A50", 12), ("B80", 13),
+    ("B81", 13), ("B90", 14), ("BA0", 0), ("C70", 0),
+];
+/// Witch on the Holy Night's speaker -> config voice row bit (AE04D8 = 0x459270: speaker 0 row 14, k row k - 1).
+const WITCH_SPEAKER_ROW_BIT: [u32; 15] = [16384, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+
 /// Speaker of a voice file (sub_2360: its first three letters; 0 when unlisted).
 fn voice_speaker(name: &str) -> usize {
+    if crate::assets::witch() {
+        return name.get(..3).and_then(|p| WITCH_VOICE_SPEAKERS.iter().find(|s| s.0 == p)).map_or(0, |s| s.1);
+    }
     name.get(..3).map(str::to_ascii_uppercase).and_then(|p| VOICE_SPEAKERS.iter().find(|s| s.0 == p)).map_or(0, |s| s.1)
 }
 
 /// Config voice row of a voice file's speaker (sub_29390).
 fn voice_row(name: &str) -> usize {
+    if crate::assets::witch() {
+        return WITCH_SPEAKER_ROW_BIT[voice_speaker(name)].trailing_zeros() as usize;
+    }
     SPEAKER_ROW_BIT[voice_speaker(name)].trailing_zeros() as usize
 }
 
@@ -389,12 +463,29 @@ pub struct Settings {
     /// per character voice volume (rows of the voice settings, 0..1) and mute bits
     pub char_voice: Vec<f32>,
     pub char_mute: u32,
+    /// the message text's glyph edge and shadow (sub_A7790: config u16 20, Witch on the Holy Night's 0x26),
+    /// unless the slot's flags force them
+    pub text_edge: bool,
+    /// Witch on the Holy Night's text colour mode (config u16 0x2A, jp_6E0D0 / jp_391A0): 1 tints read text
+    /// 0xDC6D, 2 takes the speaker table (all 0xFFFF); 0 at first
+    pub text_colour: u16,
+    /// Witch on the Holy Night's message window opacity (config u16 0x10 / 255, jp_391A0: window types 0..2)
+    pub window_alpha: f32,
+    /// Witch on the Holy Night's BGM auto adjust (config u16 0x1C): the BGM ducks under a voice (jp_48AC0)
+    pub bgm_auto: bool,
+    /// Witch on the Holy Night's skip release at a choice (config u16 0x44, jp_83E50)
+    pub choice_skip_stop: bool,
+    /// the button help balloons (Witch on the Holy Night's config u16 0x34, jp_ADC40)
+    pub help_text: bool,
+    /// Witch on the Holy Night's config 0x32: the mode panel's previous / next scene buttons act (jp_4E170;
+    /// nothing in the config pages writes it, 1 by default)
+    pub scene_jump: bool,
 }
 
-/// The exe's initial config (0x46B080).
+/// The exe's initial config (0x46B080; Witch on the Holy Night's text speed, `savedata::config_defaults`).
 impl Default for Settings {
     fn default() -> Self {
-        Self::from_config(&crate::savedata::CONFIG_DEFAULTS)
+        Self::from_config(&crate::savedata::config_defaults())
     }
 }
 
@@ -407,6 +498,12 @@ pub struct Game {
     /// ja3 FOT-Seurat: the message text while the window is a bubble (see `msg_font`)
     font_bubble: Option<FontAtlas>,
     pub settings: Settings,
+    /// jp_48AC0's BGM ducking (Witch on the Holy Night): the level of 256 (dword_3CD650), the level the BGM
+    /// volume was last set for (dword_3CD648), the 60 Hz step's time and sub_FF70's BGM curve level
+    duck: i32,
+    duck_set: i32,
+    duck_ms: f32,
+    bgm_curve: i32,
 
     pub scene_index: usize,
     /// index of the last SELD option / SELS button picked (off_AE0AA0; not saved), read by `jump_special`
@@ -420,6 +517,10 @@ pub struct Game {
     choice: Option<Choice>,
     /// SELECT_PARTS_JA (texture ids 142..147), loaded with the first choice
     select_parts: Option<Vec<TexRef>>,
+    /// WIK_SEL_PARTS (Witch on the Holy Night's SEWI, image slots 4640..), loaded while the select shows
+    wik_parts: Option<Vec<TexRef>>,
+    /// TTCT's menu (Witch on the Holy Night)
+    teatime: Option<teatime::TeaTime>,
     /// choice option texts and their blur (texture 5)
     choice_text_rt: Option<RenderTarget>,
     choice_glow: Option<RenderTarget>,
@@ -471,6 +572,16 @@ pub struct Game {
     pub auto_choice: bool,
     /// a system screen is open: freeze the script and animations
     pub paused: bool,
+    /// Witch on the Holy Night's XSKR(n, label) staff roll skip: n (dword_459414, -1 off), the label (qword_E66AE8)
+    /// and the frames a button has been held (dword_E66AF0)
+    xskr: i32,
+    xskr_pc: Option<usize>,
+    xskr_hold: f32,
+    /// a controller button is held (the pad state's +8 word, sub_40ED0's v110)
+    pub pad_held: bool,
+    /// dword_E66B34: set when a click wait ends (jp_802C0 0x600c0), cleared at the start of the next script pass
+    /// while neither the advance buttons nor a touch are held; it holds the XSKR count back
+    adv_latch: bool,
     auto_timer: f32,
     /// the message being shown was already read (selects the read text speed)
     line_read: bool,
@@ -510,6 +621,9 @@ pub struct Game {
     /// a gallery replay (byte_B34AF0, sub_47B00): set when cGallery starts 528_ARCHIVE (sub_48AC0 case 4),
     /// cleared by every other start; `IFSC` tests it
     pub archive: bool,
+    /// off_632648 (Witch on the Holy Night): a TeaTime replayed from the Archive (jp_48AC0 mode 5 state 11) until
+    /// its TTCT (sub_73EB0) clears it; STGS takes its end at once meanwhile
+    pub teatime_replay: bool,
     /// dword_AFFCA4: set by a story start (sub_40CD0) or a load (sub_82330), cleared when a message starts
     /// (sub_6E0D0 / sub_6E950); while set Y does not open the system menu (sub_40ED0)
     pub menu_lock: bool,
@@ -583,6 +697,18 @@ pub struct Game {
     /// byte_146E644: a message or MSAD ending in `@n` holds the ring pushes (sub_5A910) until the next message
     /// or MSAD starts
     ring_hold: bool,
+    /// Witch on the Holy Night's `@z` (jp_BDC2C): the slot's text in font variant 3 (+101793, the shared system
+    /// font as flag 0x100000 gives a bubble) and, once a slot, its stored line spacing (+101780) less 8 more
+    /// with its spacing set from it (+101794 latched; the slots are only made at boot, jp_1C70 -> jp_B0280):
+    /// which page slots (4 + the message's index) have taken it, and for the current message Some(whether it
+    /// took it) when its text has the code (jp_A7790 stores the spacing and variant again for the next).
+    /// Switch: NZ6's 「アリス、明日、…」 (the only `@z`) in the gothic font, lines 82 px apart after a boot.
+    z_latch: u64,
+    z_cur: Option<bool>,
+    /// the `zs` of the page being laid out again (`relayout_page`)
+    relay_zs: Vec<Option<bool>>,
+    /// per text slot of the menus (`slot_z`): the text it was last given and its `@z`
+    slot_texts: HashMap<usize, (String, Option<bool>)>,
     /// byte_146E64D: RTMN / RTM2 keep the BGM playing when the script ends (sub_5F200)
     keep_bgm_at_end: bool,
     /// byte_146EC28: the current message's raw text up to its end code (MSAD appends; ATSV() clears it), the
@@ -609,6 +735,14 @@ pub struct Game {
     stage_dirty: bool,
     /// VPLY's voice waiting for the next message start (AE04C8)
     voice_to_play: Option<String>,
+    /// VLOG (Witch on the Holy Night): the pending voice only becomes the replay voice
+    log_voice: bool,
+    /// Witch on the Holy Night's word_E66AD6: ms since the last load or rewind (jp_5BAF0 zeroes it, jp_81B30
+    /// adds the frame's steps, at most 1200 frames); WTTM's third argument waits only what is left of its time
+    since_restore: f32,
+    /// off_632860 (Witch on the Holy Night): the last WTTM / WTIN wait could not be clicked through; CLO5's
+    /// seek-end wait keeps it
+    wait_no_click: bool,
     /// the shown message's voice and speaker (sub_6E0D0: page entry +13752 / +13756, off_AE0590)
     msg_voice: Option<String>,
     speaker: i16,
@@ -619,6 +753,11 @@ pub struct Game {
     menu_rt: Option<RenderTarget>,
     /// overseas sub_9EC50's half-size buffers ("filter Defocus" off_351DB0 and its pass target)
     menu_half: Option<[RenderTarget; 2]>,
+    /// Witch on the Holy Night's sub_7FDB0 buffers: the capture at a quarter of the screen ("backbuffer
+    /// Defocus" off_632A78 drawn at 0.25) and its pass target
+    menu_quarter: Option<[RenderTarget; 2]>,
+    /// Offscreen passes the UI queues for this frame (target, clear colour, quads), drawn before its quads
+    pub ui_passes: Vec<(RenderTarget, Option<[f32; 4]>, Vec<Quad>)>,
     /// overseas screen capture (sub_A2550: jd_18AFD94 / jd_18AFD98): the frame as it was, drawn over everything
     /// at `alpha` (sub_A59F0), which falls by `step` per frame once released (sub_A27F0)
     freeze: Option<Freeze>,
@@ -690,10 +829,31 @@ fn rgb(c: u32) -> [f32; 3] {
 /// STBR mode -> blend. The layer keeps the mode byte (0 stored as -1); sub_37F50 maps it through
 /// dword_34DD70 (identity for 1..39) to an effect index, and the draw (sub_B0640 -> sub_A27C0 / sub_A2790)
 /// takes the blend state from dword_3C9748[i - 1] and the shader from dword_3C9698[i - 1]. Blend state 7
-/// copies the framebuffer for the shader to read; multiply and screen equal fixed-function blends.
+/// copies the framebuffer for the shader to read; multiply and screen equal fixed-function blends. Mode 30 is
+/// the default shader through blend state 1 (SrcAlpha / One).
+///
+/// Witch on the Holy Night (jd_3C9698[i - 3], so modes 1 and 2 get the default shader; its nn::gfx state 3 is
+/// DstColor / 1-SrcAlpha): 1 and 30 add (state 1), 4 / 6 / 9 the non-ps darken / lighten / screen shaders, 7 the
+/// default shader through state 3, 26 and 29 the default shader with blending off; 5, 8, 10..25 and 28 as here.
 fn blend_mode(mode: i32) -> (Blend, Shade) {
     use knife_render::PsOp as P;
+    if crate::assets::witch() {
+        let b = match mode {
+            1 | 30 => Some(Blend::Add),
+            2 => Some(Blend::Alpha),
+            4 => Some(Blend::Ps(P::DarkenColorAlpha)),
+            6 => Some(Blend::Ps(P::LightenColorAlpha)),
+            7 => Some(Blend::Ps(P::MultiplyDst)),
+            9 => Some(Blend::Ps(P::ScreenColorAlpha)),
+            26 | 29 => Some(Blend::Ps(P::Copy)),
+            _ => None,
+        };
+        if let Some(b) = b {
+            return (b, Shade::Sprite);
+        }
+    }
     let b = match mode {
+        30 => Blend::Add,
         1 | 11 => Blend::Ps(P::Add),
         4 | 13 => Blend::Ps(P::Darken),
         5 => Blend::Ps(P::DodgeAlpha),
@@ -748,6 +908,10 @@ impl Game {
             font,
             font_bubble: None,
             settings: Settings::default(),
+            duck: 256,
+            duck_set: 256,
+            duck_ms: 0.0,
+            bgm_curve: 0,
             scene_index: 0,
             last_pick: 0,
             script,
@@ -758,6 +922,8 @@ impl Game {
             sel_opts: Vec::new(),
             choice: None,
             select_parts: None,
+            wik_parts: None,
+            teatime: None,
             choice_text_rt: None,
             choice_glow: None,
             sysmes: None,
@@ -803,6 +969,7 @@ impl Game {
             task_modes: (false, false),
             task_lock: (false, false),
             archive: false,
+            teatime_replay: false,
             menu_lock: true,
             se_delayed: Vec::new(),
             seek_audio: None,
@@ -832,6 +999,10 @@ impl Game {
             scene_ring: Vec::new(),
             scene_msgs: 0,
             ring_hold: false,
+            z_latch: 0,
+            z_cur: None,
+            relay_zs: Vec::new(),
+            slot_texts: HashMap::new(),
             keep_bgm_at_end: false,
             msg_text: String::new(),
             node_seq: 0,
@@ -843,11 +1014,21 @@ impl Game {
             pending_voice: None,
             stage_dirty: false,
             voice_to_play: None,
+            log_voice: false,
+            since_restore: 0.0,
+            xskr: -1,
+            xskr_pc: None,
+            xskr_hold: 0.0,
+            pad_held: false,
+            adv_latch: false,
+            wait_no_click: false,
             msg_voice: None,
             speaker: 0,
             menu_blur: None,
             menu_rt: None,
             menu_half: None,
+            menu_quarter: None,
+            ui_passes: Vec::new(),
             freeze: None,
             freeze_rt: None,
             menu_captured: false,
@@ -912,6 +1093,21 @@ impl Game {
 
     pub fn current_pc(&self) -> usize {
         self.pc
+    }
+
+    /// Present the stage (sub_5D3A0; Witch on the Holy Night's sub_3E130). Witch on the Holy Night's commit is
+    /// also where an image counts as seen: every layer's image word (and stage word 0, never set) through
+    /// jp_644A0, below 3200; its STCH marks nothing.
+    fn commit_stage(&mut self) {
+        self.stage.commit();
+        if crate::assets::witch() {
+            let names: Vec<String> = self.stage.layers.iter().flatten().map(|l| l.name.clone()).collect();
+            for n in names {
+                if let Some(b) = self.seen_bit(&n) {
+                    set_bit(&mut self.seen, b);
+                }
+            }
+        }
     }
 
     pub fn var(&self, name: &str) -> i32 {
@@ -1039,12 +1235,56 @@ impl Game {
         }
     }
 
+    /// Witch on the Holy Night's staff roll skip (jp_81B30): while XSKR has a label, a held controller button
+    /// (not the advance still held from the last click) counts frames; the one after 180 jumps to the label,
+    /// ending a timed wait (AE04A8) and a voice wait (AE04B8 bit 4, stopping the voice).
+    fn step_xskr(&mut self, dt: f32) {
+        let Some(pc) = self.xskr_pc.filter(|_| self.xskr >= 0) else {
+            return;
+        };
+        if self.adv_latch || !self.pad_held {
+            self.xskr_hold = 0.0;
+            return;
+        }
+        if self.xskr_hold < 180.0 - 0.01 {
+            self.xskr_hold = (self.xskr_hold + dt / FRAME_MS).min(180.0);
+            return;
+        }
+        self.pc = pc;
+        self.xskr_pc = None;
+        self.xskr_hold = 0.0;
+        match self.wait {
+            Wait::Time { .. } => self.wait = Wait::None,
+            Wait::Voice => {
+                self.sound.stop_voice();
+                self.wait = Wait::None;
+            }
+            _ => {}
+        }
+    }
+
+    /// sub_1DAE0's hold bar: frames held (0 hides it).
+    pub fn xskr_hold(&self) -> f32 {
+        if self.xskr >= 0 && self.xskr_pc.is_some() { self.xskr_hold } else { 0.0 }
+    }
+
+    /// Input for the frame, before `update` (the start of jp_802C0): `advance` = the advance buttons or a touch
+    /// are held.
+    pub fn set_held(&mut self, pad: bool, advance: bool) {
+        self.pad_held = pad;
+        if !advance {
+            self.adv_latch = false;
+        }
+    }
+
     fn finish_click(&mut self) {
         self.click_ms = 0.0;
+        self.adv_latch = true;
         // sub_40ED0 LABEL_307 (leaving a click wait; sub_2C500 too) resets the 11 per-message colour words
+        let colour = i32::from(self.line_reset_colour());
         for i in 0..11 {
-            self.set_var(&format!("F{}", 800 + i), Self::TEXT_COLOUR >> 8);
-            self.set_var(&format!("F{}", 811 + i), Self::TEXT_COLOUR & 0xFF);
+            self.set_var(&format!("F{}", 800 + i), colour >> 8);
+            self.set_var(&format!("F{}", 811 + i), colour & 0xFF);
         }
         self.last_voice = None;
         self.page.waiting = false;
@@ -1061,6 +1301,7 @@ impl Game {
         self.mouse = (x, y);
         if choice {
             self.choice_hover_at(x, y);
+            self.teatime_hover_at(x, y);
         }
     }
 
@@ -1095,16 +1336,21 @@ impl Game {
             self.white = 0.0;
         }
         self.sound.begin_frame(dt);
+        if self.assets.build == Build::Witch {
+            self.witch_duck(dt);
+        }
         for _ in 0..self.speed.max(1) {
             self.update_step(r, dt);
         }
         // the sound update (sub_9B7F0) runs once a frame after the script: sub_65E50 counts the queued SE
         // commands down (a key-68 SE queued by this frame's script already loses a frame: 500 ms is 29 frames
         // after the SEPL, 475 ms measured on the Switch), except while a rewind is held (off_AE05B8); then
-        // nn::atk's update
-        if !self.paused && !self.rewinding {
+        // nn::atk's update. The main loop (sub_B5FE0) runs it whatever screen is up, so a queued SE still plays
+        // (or ends a loop) under the system menu.
+        if !self.rewinding {
             self.tick_se_delayed(if self.skip && self.speed <= 1 { dt * 8.0 } else { dt });
         }
+        self.sound.step_se_pans(dt * 60.0 / 1000.0);
         self.sound.end_frame();
         // sub_391A0, once a frame while the window is up: the click icon fades in by 0.1 a frame once the slot's
         // text is all out (sub_AB8E0 -> sub_A8730) and the message waits for a click (AE04B8 0x400, set by
@@ -1136,8 +1382,11 @@ impl Game {
         // the speed already repeats the steps (sub_3FBD0); a skip at speed 1 (the debug skip) runs time 8x
         let step = if fast && self.speed <= 1 { dt * 8.0 } else { dt };
         let cut = fast && self.speed <= 1;
+        self.since_restore = (self.since_restore + dt).min(1200.0 * 1000.0 / 60.0);
 
         // layer tweens and motions
+        // Witch on the Holy Night's type 4 quake ends once no voice plays at a click wait (jp_3C970)
+        self.stage.talk_done = self.wait == Wait::Click && !self.sound.voice_playing();
         self.stage.advance(step);
         let (p, q) = (self.var("F1120") - 127, self.var("F1121"));
         self.ghost.advance(step, p, q);
@@ -1172,7 +1421,7 @@ impl Game {
         }
         // the current message's fade length follows the text speed of its read state (dword_572B64, set by
         // sub_6E0D0 / a rewind's layout); config byte 98 (fade out off) ends every fade at once
-        let fade_frames = self.settings.text_ms[usize::from(self.line_read)] * 1.2;
+        let fade_frames = self.read_fade_frames();
         if let Some(m) = self.page.msgs.last_mut() {
             m.3 = fade_frames;
         }
@@ -1208,16 +1457,27 @@ impl Game {
                 self.page.dim_vel = 0.0;
             }
         }
+        // the message slots' glyph wobbles (jp_C0684 in each slot's update): one step per 60 Hz frame
+        self.page.wobble_ms += dt;
+        while self.page.wobble_ms >= FRAME_MS {
+            self.page.wobble_ms -= FRAME_MS;
+            let rng = &mut self.app_rng;
+            for w in self.page.chars.iter_mut().filter_map(|pc| pc.wobble.as_mut()) {
+                w.step(|a, b| rng.uniform(a, b));
+            }
+        }
         let k = usize::from(self.line_read);
-        let ms = self.settings.text_ms[k];
+        let rate = self.chars_per_frame(k);
         if self.frame_no > self.reveal_hold && !head_held {
-            if ms <= 0.0 || self.settings.page_at_once[k] || fast {
-                self.page.revealed = self.page.order as f32;
-            } else {
-                self.page.revealed = (self.page.revealed + dt / ms).min(self.page.order as f32);
+            match rate {
+                Some(rate) if !self.settings.page_at_once[k] && !fast => {
+                    self.page.revealed = (self.page.revealed + rate * dt / FRAME_MS).min(self.page.order as f32);
+                }
+                _ => self.page.revealed = self.page.order as f32,
             }
         }
         self.update_choice(dt);
+        self.update_teatime(dt);
 
         // movie
         if let Some(m) = &mut self.movie {
@@ -1259,7 +1519,7 @@ impl Game {
                         layer.finish();
                     }
                 }
-                if !self.stage.animating(l, mask) || cut {
+                if !self.stage.animating(l, mask, &|id| self.motions.looping(id)) || cut {
                     self.wait = Wait::None;
                 }
             }
@@ -1297,6 +1557,7 @@ impl Game {
             }
             _ => {}
         }
+        self.step_xskr(dt);
 
         // debug aid: report long waits while skipping
         if fast {
@@ -1322,7 +1583,12 @@ impl Game {
         }
 
         // sub_391A0, the message layer's draw callback (sub_3B9A0: layer 15), set F824 = 65 last frame
-        self.set_var("F824", 65);
+        let f824 = self.witch_f824();
+        self.set_var("F824", f824);
+        // jp_48AC0: the backdrop colour word of the scene, every story frame
+        if self.assets.build == Build::Witch {
+            self.stage.backdrop = u8::from(!crate::savedata::witch_dark_scene(self.scene_index));
+        }
 
         // run the script. sub_802C0 dispatches once per 60 Hz frame, so under a skip each wait the script stops
         // at costs a frame (knife resolves the waits within the frame's speed steps); the next-scene seek
@@ -1357,7 +1623,11 @@ impl Game {
             let returns = matches!(
                 cmd.name.as_str(),
                 "CLO2" | "CLO3" | "CLO4" | "CLO5" | "STCF" | "NOP_" | "TOMW" | "MSAD" | "WTTM" | "SELA" | "SELD" | "SELS" | "END_" | "JUMP"
-            ) || std::mem::take(&mut self.dispatch_return);
+                    | "WTIN" | "SEWI"
+            ) && !(crate::assets::witch()
+                && (matches!(cmd.name.as_str(), "CLO3" | "CLO4" | "SELA" | "SELS")
+                    || cmd.name == "WTTM" && cmd.int_or(0, 0) == 0))
+                || std::mem::take(&mut self.dispatch_return);
             if self.seek_node {
                 // a pass of the seek loop ends where script_dispatch returns
                 if self.wait != Wait::None || returns {
@@ -1377,7 +1647,7 @@ impl Game {
         // sub_802C0: a stage an STCH / SCH2 changed with no FADS after it is presented as the dispatch returns
         // (sub_5D3A0(0, 0): sub_2E1B0(0, 0) ends any transition)
         if std::mem::take(&mut self.stage_dirty) && !self.seek_node {
-            self.stage.commit();
+            self.commit_stage();
             self.trans = None;
             if self.wait == Wait::Transition {
                 self.wait = Wait::None;
@@ -1447,20 +1717,30 @@ impl Game {
         }
         // arg 3 = 1 hides the text until the next message; 2 too when the fade lasts 2+ ms and no content fade
         // runs (config byte 99, 1 unless a whole-config copy changes it)
+        // (Witch on the Holy Night's jp_60610 has no such byte: none / -1 act as 2)
         let wnd = arg(3).unwrap_or(-1);
-        if wnd == 1 || (wnd == 2 && arg(1).unwrap_or(0) >= 2 && self.page.dim_vel == 0.0) {
+        let two = wnd == 2 || (wnd == -1 && crate::assets::witch());
+        if wnd == 1 || (two && arg(1).unwrap_or(0) >= 2 && self.page.dim_vel == 0.0) {
             self.set_var("F1103", 1);
         }
         let mode = c.int_or(0, 1);
         let dur = c.int_or(1, 0) as f32;
         let rule = c.int_or(2, 0);
-        self.stage.commit();
+        self.commit_stage();
         self.stage_dirty = false;
         // sub_60610 copies the committed stage into the backup
         self.stage_backup = Some(self.stage_bytes());
         let rule_before = self.fads_rule;
-        if !self.seek_node {
-            self.fads_rule = if rule >= 1 { rule - 1 } else { -1 };
+        // Witch on the Holy Night's FADS (jp_60610) sets the rule wipe edge from its fifth argument (64 by default)
+        if crate::assets::witch() {
+            self.stage.rule_soft = soft_width(c.int_or(4, 64) as f32);
+        }
+        // sub_4B4C0: no rule clears the mask even in the seek; a rule loads outside it (Witch on the Holy Night's
+        // jp_60610 also not under the fast skip, AE0670, or skip mode, AE0660 bit 1)
+        if rule < 1 {
+            self.fads_rule = -1;
+        } else if !self.seek_node && !(crate::assets::witch() && (self.skip || self.skip_mode)) {
+            self.fads_rule = rule - 1;
         }
         if mode == 1 || dur <= 0.0 || self.skip {
             // sub_60610 returns 0 when a rule was loaded before (mode 1: sub_4B570 >= 0), and FADS then draws its
@@ -1475,9 +1755,10 @@ impl Game {
             }
         } else {
             // sub_47DD0: only mode 2 draws the old frame through the rule (sub_A48C0); mode 0 is a crossfade
-            // (sub_A46F0) even with a rule loaded
-            let rule = (mode == 2 && rule > 0)
-                .then(|| self.assets.rule(r, &format!("RULE_{rule:02}")))
+            // (sub_A46F0) even with a rule loaded; it wipes through the loaded mask (7177), which Witch on the Holy
+            // Night's skip mode leaves as an earlier FADS loaded it
+            let rule = (mode == 2 && self.fads_rule >= 0)
+                .then(|| self.assets.rule(r, &format!("RULE_{:02}", self.fads_rule + 1)))
                 .flatten()
                 .map(|i| i.tex.clone());
             if self.seek_node || self.rewinding {
@@ -1604,7 +1885,7 @@ impl Game {
             l.y.diff = 0.0;
             l.alpha.diff = 0.0;
         }
-        self.stage.commit();
+        self.commit_stage();
         self.trans = None;
         if self.wait == Wait::Transition {
             self.wait = Wait::None;
@@ -1622,6 +1903,7 @@ impl Game {
         self.se_delayed.clear();
         self.sound.stop_se(-1);
         self.sound.se_word = [-1; 20];
+        self.sound.se_loop = [false; 20];
         self.sound.se_pan = [0; 20];
         self.sound.stop_voice();
         if !std::mem::take(&mut self.keep_bgm_at_end) {
@@ -1957,6 +2239,15 @@ impl Game {
                 self.sound.play_se(ch, name, pcm, *vol, 0.0, true, pan);
             }
         }
+        // Witch on the Holy Night's jp_5D7E0 ends by making the alpha the STGS start word of every layer whose
+        // image index is >= 1, so a later commit has nothing left to fade
+        if crate::assets::witch() {
+            for l in self.stage.layers.iter_mut().flatten() {
+                if self.assets.image_index_of(&l.name).is_some_and(|i| i >= 1) {
+                    l.wfade[0] = (l.alpha.to * 255.0).round() as i16;
+                }
+            }
+        }
     }
 
     /// Category volumes changed: the speaker rows' voice volumes (0 for a muted row or with voices off, the
@@ -2011,12 +2302,23 @@ impl Game {
                         self.page.dim_vel = -1.0 / (18.0 * FRAME_MS);
                     }
                 }
-                self.set_var("F1103", 0);
+                // Witch on the Holy Night's jp_6E0D0 ends only F1103 == 1 (CLO5's 2 stays)
+                if !crate::assets::witch() || self.var("F1103") == 1 {
+                    self.set_var("F1103", 0);
+                }
                 let raw = c.args.first().map(String::as_str).unwrap_or("");
                 self.note_read(&c.name);
                 // sub_6E0D0: VPLY's voice plays unless skipping (a fast skip into unread text with
                 // read-only skip has stopped by now, so it plays there too) and becomes the replay voice
                 let voiced = match self.voice_to_play.take() {
+                    Some(n) if std::mem::take(&mut self.log_voice) => {
+                        // the voices still stop (sub_9C3B0)
+                        if !self.skip && !self.seek_node && self.settings.voice_on && self.speaker_voice_on(&n) {
+                            self.sound.stop_voice();
+                            self.last_voice = Some(n);
+                        }
+                        false
+                    }
                     Some(n) => {
                         self.play_voice(&n, true);
                         true
@@ -2035,15 +2337,18 @@ impl Game {
                 if self.page_mode() {
                     let n = self.var("F823").clamp(0, 11);
                     let (f31, f32) = (self.var("F031"), self.var("F032"));
-                    for (base, v) in [(799, Self::TEXT_COLOUR >> 8), (810, Self::TEXT_COLOUR & 0xFF), (824, f31), (835, f32)] {
+                    let colour = i32::from(self.msg_colour());
+                    for (base, v) in [(799, colour >> 8), (810, colour & 0xFF), (824, f31), (835, f32)] {
                         self.set_var(&format!("F{}", base + n), v);
                     }
                 }
                 let (text, wait) = message_end(&text);
                 self.show_message(&message_end(raw).0, wait);
                 // sub_A7790 without 0x20000: the slot's 2 frame delay (none in the seek, 0x1000) costs the reveal
-                // the next frame's steps; MSAD keeps the progress and has none
-                if !self.seek_node {
+                // the next frame's steps; MSAD keeps the progress and has none. Witch on the Holy Night's jp_6E0D0
+                // sets 0x1000 for CLO5's F1103 == 2 instead, so its seek keeps the delay
+                let no_hold = if crate::assets::witch() { self.var("F1103") == 2 } else { self.seek_node };
+                if !no_hold {
                     self.reveal_hold = self.frame_no + 1;
                 }
                 crate::text_stream::message(&text, (self.scene_index as u64) << 32 | self.msg_pc as u64);
@@ -2180,13 +2485,33 @@ impl Game {
                 tracing::info!("{name}: scene finished");
                 self.script_end();
             }
-            // 0x7f4ac stores max(1, ms * 3 / 50) whole 60 Hz frames (AE04A8), so even WTTM(0) waits a frame
+            // 0x7f4ac stores max(1, ms * 3 / 50) whole 60 Hz frames (AE04A8), so even WTTM(0) waits a frame.
+            // Witch on the Holy Night (0x58520): WTTM(0) does nothing and the dispatch goes on; a third argument
+            // takes off the frames since the last load or rewind (word_E66AD6, at most 1200), so it only waits
+            // out what is left of its time after one.
             "WTTM" => {
-                let frames = (c.int_or(0, 0) * 3 / 50).max(1);
+                let ms = c.int_or(0, 0);
+                if crate::assets::witch() && ms == 0 {
+                    return;
+                }
+                let mut frames = ms * 3 / 50;
+                if crate::assets::witch() && c.arg(2).is_some() {
+                    frames = (frames - (self.since_restore * 0.06) as i32).max(1);
+                }
+                self.wait_no_click = c.int_or(1, 0) != 0;
                 self.wait = Wait::Time {
-                    left: frames as f32 * 50.0 / 3.0,
+                    left: frames.max(1) as f32 * 50.0 / 3.0,
                     click: c.int_or(1, 0) == 0,
                 };
+            }
+            // WTIN(ms, ms_fast) (Witch on the Holy Night, 0x5ee7c): WTTM's backup refresh, then a clickable wait of
+            // max(1, ms * 3 / 50) frames, ms_fast in auto mode or while the mode icon shows (sub_1D640: off_AE0660
+            // bit 0 / dword_AFEC9C: skip mode, fast forward, rewind)
+            "WTIN" => {
+                let fast = self.auto || self.skip_mode || self.skip;
+                let frames = (c.int_or(usize::from(fast), 0) * 3 / 50).max(1);
+                self.wait_no_click = false;
+                self.wait = Wait::Time { left: frames as f32 * 50.0 / 3.0, click: true };
             }
 
             // messages
@@ -2203,6 +2528,8 @@ impl Game {
                 self.page.alpha = 0.0;
                 self.set_var("F1103", 1);
             }
+            // Witch on the Holy Night's dispatcher has no CLO3 (default case)
+            "CLO3" if crate::assets::witch() => {}
             "CLO3" => {
                 // a shown window fades out in 64 ms; the page stays (drawn again from the next message)
                 if self.page.visible {
@@ -2210,6 +2537,60 @@ impl Game {
                     self.page.quick = true;
                     self.set_var("F1103", 1);
                 }
+            }
+            // Witch on the Holy Night's CLO4 (0x58294): as below, but a negative ms leaves a running fade-out
+            // alone, and the dispatch goes on
+            "CLO4" if crate::assets::witch() => {
+                let ms = c.int_or(0, 0) as f32;
+                let p = &mut self.page;
+                if self.skip || self.seek_node || ms <= 0.0 {
+                    if !(ms < 0.0 && p.dim_vel > 0.0) {
+                        p.dim = 1.0;
+                        p.dim_vel = 0.0;
+                    }
+                } else if p.dim_vel < 0.0 || p.dim == 0.0 {
+                    p.dim = 0.0;
+                    p.dim_vel = 1.0 / ms;
+                } else {
+                    p.dim = 1.0;
+                    p.dim_vel = 0.0;
+                }
+            }
+            // CLO5(n) (Witch on the Holy Night, 0x5f190): n 0 / 2 (or none) hide the text until a CLO5(1 / 3) or
+            // CLO6: F1103 = 2, which a message start keeps (it ends only 1), with the text head, its fade tail
+            // and the slot progress at 99999; n 1 / 3 turn a set F1103 into 1, so the next message shows. n 0 /
+            // 1 also end a running next-scene seek (AE0568 = 0, without sub_5D7E0's sound resume) with a
+            // 10 frame wait (AE04A8, its click flag as the last WTTM left it).
+            "CLO5" if crate::assets::witch() => {
+                let n = c.int_or(0, 0);
+                if n & !2 == 0 {
+                    self.set_var("F1103", 2);
+                    self.page.revealed = 99999.0_f32.min(self.page.order as f32);
+                } else if self.var("F1103") != 0 {
+                    self.set_var("F1103", 1);
+                }
+                if n & !1 != 2 && self.seek_node {
+                    self.end_seek(false);
+                    self.wait = Wait::Time { left: 10.0 * 50.0 / 3.0, click: !self.wait_no_click };
+                }
+            }
+            // CLO6(ms) (Witch on the Holy Night, 0x588d4) is Tsukihime's CLO5, F1103 == 1 only restarting the
+            // fade; the dispatch goes on
+            "CLO6" => {
+                let ms = c.int_or(0, 0) as f32;
+                let f1103 = self.var("F1103") == 1;
+                let p = &mut self.page;
+                if self.skip || self.seek_node || ms <= 0.0 || (p.dim_vel <= 0.0 && p.dim < 1.0 && !f1103) {
+                    p.dim = 0.0;
+                    p.dim_vel = 0.0;
+                } else {
+                    p.dim = 1.0;
+                    p.dim_vel = -1.0 / ms;
+                }
+                p.visible = true;
+                p.alpha = 1.0;
+                p.quick = false;
+                self.set_var("F1103", 0);
             }
             "CLO4" => {
                 // fade the content (text, icon) out over `ms`; at once when skipping or ms <= 0
@@ -2274,8 +2655,9 @@ impl Game {
 
             // choices
             "SELR" => {
-                // 0x78a6c: the group's first option pushes a type 13 entry and adds 1 to C847 (when F823 >= 1)
-                if self.sel_opts.is_empty() {
+                // 0x78a6c: the group's first option pushes a type 13 entry and adds 1 to C847 (when F823 >= 1);
+                // Witch on the Holy Night's SELR (0x5aa70) only stores the option, with no disabled flag
+                if self.sel_opts.is_empty() && !crate::assets::witch() {
                     self.push_ring_event(13);
                     if self.var("F823") >= 1 {
                         let v = self.var("C847") + 1;
@@ -2285,10 +2667,13 @@ impl Game {
                 let value = c.int_or(0, self.sel_opts.len() as i32);
                 // the option keeps the script's text; its `$` reference resolves where it is laid out
                 let text = c.arg(1).unwrap_or("").to_string();
-                let disabled = c.int_or(2, 0) == 1;
+                let disabled = c.int_or(2, 0) == 1 && !crate::assets::witch();
                 self.cmd_selr(value, &text, disabled);
             }
-            "SELD" | "SELA" | "SELS" => {
+            "TTCT" if crate::assets::witch() => self.cmd_ttct(c.int(0)),
+            // Witch on the Holy Night's dispatcher has no SELA / SELS (default case)
+            "SELA" | "SELS" if crate::assets::witch() => {}
+            "SELD" | "SELA" | "SELS" | "SEWI" => {
                 // 0x7f6d8 / sub_92800 / sub_92930 end a next-scene seek with the sound resumed
                 if self.seek_node {
                     self.end_seek(true);
@@ -2299,6 +2684,8 @@ impl Game {
 
             // stage
             "STCH" | "SCH2" | "STCG" => self.cmd_stch(r, c),
+            "CKDP" => self.cmd_ckdp(r, c),
+            "CKTT" => self.cmd_cktt(c),
             "STCC" => {
                 // sub_62140: no argument clears layer 0, a layer above 39 nothing, a negative one all of them
                 let l = c.int_or(0, 0);
@@ -2317,8 +2704,16 @@ impl Game {
             // SACL(layer = 0, on = 0) (inline 0x7af80): stage byte +0x54 bit 0x40, drawn from the next commit
             "SACL" => {
                 let on = c.int_or(1, 0) != 0;
-                if let Some(l) = self.stage.get(c.int_or(0, 0)) {
+                let i = c.int_or(0, 0);
+                if let Some(l) = self.stage.get(i) {
                     l.staged.absolute = Some(on);
+                } else if let Some(k) = usize::try_from(i).ok().and_then(|i| self.stage.kept.get_mut(i)) {
+                    // an empty slot keeps the bit for its record (STCH clears it)
+                    match k {
+                        Some(k) => k.absolute = on,
+                        None if on => *k = Some(crate::save::Kept { neg_anchor: (0, 0), blend: 0xff, stcc: false, absolute: true }),
+                        None => {}
+                    }
                 }
             }
             // SBAS(layer = 0, base = -1) (inline 0x7afec): stage word 0x93C / 2 + layer, drawn from the next commit
@@ -2389,10 +2784,16 @@ impl Game {
             "STGS" => {
                 let frames = c.int(3).map_or(0, |ms| 60 * ms / 1000);
                 let ease = c.int_or(4, 0);
+                // Witch on the Holy Night (jp_637A0) also keeps the fade in its stage words: (from, from, frames),
+                // or (to, to, 0) in the next-scene seek, skip mode or a TeaTime replayed from the Archive
+                let fast = self.seek_node || self.skip_mode || self.teatime_replay;
                 if let Some(l) = self.stage.get(c.int_or(0, 0)) {
                     let from = c.int(1).unwrap_or((l.alpha.to * 255.0).round() as i32).min(255);
                     let to = c.int_or(2, 0).min(255);
                     l.alpha = Tween::new(from as f32 / 255.0, to as f32 / 255.0, frames, ease);
+                    let (w, n) = if fast { (to, 0) } else { (from, frames) };
+                    l.wfade = [w as i16, n as i16];
+                    l.wfade_ease = ease as u8;
                 }
             }
             // STPV(layer, px, py, rot) (sub_639A0): set the pivot (stage anchor floats 221 / 261, and the render
@@ -2431,7 +2832,7 @@ impl Game {
                 let l = c.int_or(0, 0);
                 let l = if (0..40).contains(&l) { l } else { -1 };
                 let mask = c.int_or(1, 63);
-                if self.stage.animating(l, mask) {
+                if self.stage.animating(l, mask, &|id| self.motions.looping(id)) {
                     self.wait = Wait::Layer(l, mask);
                 }
             }
@@ -2538,7 +2939,7 @@ impl Game {
                     None => {
                         self.snapshot = true;
                         if self.stage.layers.iter().flatten().any(|l| l.pending) {
-                            self.stage.commit();
+                            self.commit_stage();
                             self.stage_dirty = false;
                             self.trans = Some(Transition::hold());
                             self.fads = Some(Fads { hold: 1, started: false });
@@ -2632,6 +3033,31 @@ impl Game {
             }
             // FCLN (sub_92120): only arg 5 counts, the effect (the others repeat its table entry); stage byte
             // 6569 keeps it for loads. FCSP (sub_921B0): off, fading over arg 0 ms (60 * ms / 1000 frames).
+            // Witch on the Holy Night's handlers (the dispatcher, jp_77790): FCLN starts effect 4 whatever its
+            // arguments (sub_6EC00) and FCSP stops over 24 frames (sub_6EC70); FLNT effect 1 (jp_91FA0), FLOP(n)
+            // 2 for n = 5 else 3 (jp_92010), FLSP stops over 48 frames (jp_920B0). Tsukihime has the last three
+            // too (sub_91FA0 / sub_92010 / sub_920B0) but no script uses them.
+            "FCLN" if crate::assets::witch() => {
+                self.focus_saved = 4;
+                self.focus.start(4, 0);
+            }
+            "FCSP" if crate::assets::witch() => {
+                self.focus_saved = 0;
+                self.focus.start(0, 24);
+            }
+            "FLNT" => {
+                self.focus_saved = 1;
+                self.focus.start(1, 0);
+            }
+            "FLOP" => {
+                let n = if c.int(0) == Some(5) { 2 } else { 3 };
+                self.focus_saved = n as u8;
+                self.focus.start(n, 0);
+            }
+            "FLSP" => {
+                self.focus_saved = 0;
+                self.focus.start(0, 48);
+            }
             "FCLN" => {
                 let n = c.int_or(5, 0);
                 self.focus_saved = n as u8;
@@ -2658,6 +3084,24 @@ impl Game {
                 }
             }
             "XRSM" => self.end_staff_task(),
+            // XSKR(n, label) (Witch on the Holy Night, 0x57db0): the label a held button skips the staff roll to;
+            // XSKR(-1,) turns it off. Either restarts the hold count.
+            "XSKR" if crate::assets::witch() => {
+                self.xskr = c.int(0).unwrap_or(-1);
+                self.xskr_pc = if self.xskr >= 0 { c.arg(1).and_then(|l| self.script.label(l)) } else { None };
+                self.xskr_hold = 0.0;
+            }
+            // XSOF() (Witch on the Holy Night): the fast skip (AE0670) and the auto / skip modes (AE0660) go off and
+            // a next-scene seek ends with its sound (jp_5D7E0, AE0568 = 0)
+            "XSOF" => {
+                self.skip = false;
+                self.speed = 1;
+                self.auto = false;
+                self.skip_mode = false;
+                if self.seek_node {
+                    self.end_seek(true);
+                }
+            }
             // FADE(40, p, q) (sub_5F420): F1100 = 4, F1120 = p + 127, F1121 = q, then the channel-split effect;
             // FADE(41): F1100 = 0 and the effect fades out. Other modes are engine states.
             "FADE" => match c.int_or(0, 0) {
@@ -2698,6 +3142,14 @@ impl Game {
                     return;
                 }
                 let word = if n >= 1 { ((n - 1) & 0xffff | b << 12) as i16 } else { -1 };
+                // Witch on the Holy Night's STTR (0x5ae0c) runs only outside the seek and AE0670, and sets the
+                // wipe edge from its fourth argument (64 by default)
+                if crate::assets::witch() {
+                    if self.seek_node || self.skip {
+                        return;
+                    }
+                    self.stage.rule_soft = soft_width(c.int_or(3, 64) as f32);
+                }
                 if let Some(l) = self.stage.get(li) {
                     l.rule = (word >= 0).then_some(n);
                     l.rule_flip = (word.max(0) >> 12 & 7) as u8;
@@ -2761,6 +3213,49 @@ impl Game {
                     }
                 }
             }
+            // STQK(layer = 0, ax = 0, ay = 0, period_ms = 34, dur_ms = -1, delay_ms = 0, type = 0) (Witch on the
+            // Holy Night, sub_438A0): the layer's quake slot (`WitchQuake::new`); -1 sets layers 0 and 1 and every
+            // other layer that is drawn or holds an image, which type 1 makes followers of layers 0 / 1 (ax = ay =
+            // -1, type 0, P at least 0)
+            "STQK" => {
+                let li = c.int_or(0, 0);
+                if li <= 39 {
+                    let (kind, period, dur) = (c.int_or(6, 0), c.int_or(3, 34), c.int_or(4, -1));
+                    let delay = c.int(5).map_or(0, |v| 3 * v / 50) as i16;
+                    let q = WitchQuake::new(kind, c.int_or(1, 0) as i16, c.int_or(2, 0) as i16, period, dur, delay);
+                    let follow = WitchQuake::new(0, -1, -1, period, dur, delay);
+                    for (k, l) in self.stage.layers.iter_mut().enumerate() {
+                        if (li < 0 || k as i32 == li)
+                            && let Some(l) = l
+                        {
+                            l.wquake = if li < 0 && k >= 2 && kind == 1 { follow } else { q };
+                        }
+                    }
+                }
+            }
+            // STSW(layer = 0) (jp_91870 -> sub_43770(layer, 0, 0, 0, -1, 0, 1)): the layer sways
+            "STSW" => {
+                if let Some(l) = self.stage.get(c.int_or(0, 0)) {
+                    l.wquake = WitchQuake::sway();
+                }
+            }
+            // STQS(layer = 0) (sub_44320): zeroes the layer's quake slot but its type, -1 every layer's after
+            // stopping the screen shake (sub_2EA70(-1))
+            "STQS" => {
+                let li = c.int_or(0, 0);
+                if li <= 39 {
+                    if li < 0 {
+                        self.shake.stop();
+                    }
+                    for (k, l) in self.stage.layers.iter_mut().enumerate() {
+                        if (li < 0 || k as i32 == li)
+                            && let Some(l) = l
+                        {
+                            l.wquake.stop();
+                        }
+                    }
+                }
+            }
             "SNX2" | "SNX3" => {
                 // sub_4030 / sub_4120: brightness 1 + v / 255 (default 0) / contrast 1 + v / 100 (default 1.0
                 // as is) into the stage and render floats; the texture build bakes them (pre_alter)
@@ -2785,7 +3280,18 @@ impl Game {
                     l.staged.rot2 = Some(if c.int(1).is_none() { 0 } else if v == -99999 { i16::MIN } else { wrap_rot2(v) });
                 }
             }
-            "SNX4" | "FANX" | "STQK" | "TRPY" => {}
+            // SNX4(layer = -1, a = 0, b = 0) (Witch on the Holy Night, 0x58f50): two floats into the stage (4844 +
+            // 16 layer + 8 / + 12) and render (+0x20C / +0x210) that nothing draws with; Tsukihime ignores it
+            "SNX4" => {
+                let v = [c.int_or(1, 0) as f32, c.int_or(2, 0) as f32];
+                if crate::assets::witch()
+                    && let Some(l) = self.stage.get(c.int_or(0, -1))
+                {
+                    l.snx4 = v;
+                }
+            }
+            // SPIA / SPAB fall to the dispatcher's default case in Witch on the Holy Night
+            "FANX" | "TRPY" | "SPIA" | "SPAB" => {}
             // SHOK(ax, ay, period_ms = 300, count = 3, delay_ms) (sub_5F8F0 -> sub_2EE70(1, ..)): the sine screen
             // shake (ignored only during the load label scan)
             "SHOK" => {
@@ -2798,7 +3304,7 @@ impl Game {
             },
 
             // audio
-            "SEPL" | "SEFD" | "SESP" | "SEVL" => self.cmd_se(c),
+            "SEPL" | "SEFD" | "SESP" | "SEVL" | "SEPN" | "SEAC" => self.cmd_se(c),
             // MPLY(n, key 17 volume = 100, key 1 fade-in ms, key 11 fade-out ms, key 69 start sample) (sub_649E0):
             // a track already playing is left alone; with a fade-in the old track fades out at 1666.7 / (key 11
             // or key 1) volume points a frame while the new one rises at 1666.7 / key 1 (so key 1 ms at full
@@ -2809,16 +3315,35 @@ impl Game {
                 let fade_in = c.keyed_int(1).unwrap_or(0);
                 let fade_out = c.keyed_int(11).unwrap_or(0);
                 let start = c.keyed_int(69).unwrap_or(0).max(0) as usize;
-                // only MPLY marks a BGM heard (sub_649E0, n <= 0x417); the title and movie BGM do not
-                if (0..=0x417).contains(&n) {
+                // only MPLY marks a BGM heard (sub_649E0, n <= 0x417; jp_649E0, n <= 0x207); the title and
+                // movie BGM do not
+                let witch = crate::assets::witch();
+                if (0..=if witch { 0x207 } else { 0x417 }).contains(&n) {
                     set_bit(&mut self.heard, n as usize);
                 }
-                if let Some(sa) = &mut self.seek_audio {
-                    sa.bgm = (n >= 0).then_some((n, vol as f32 / 100.0));
+                // jp_649E0 keeps the volume as 255 x key 17 / 100 (jd_146E650): a fade-in goes to the whole
+                // percent of it at that word x 1000 / 60 / key 1 percent a frame, the old track out at its own
+                // percent x 1000 / 60 / (key 11 or key 1) (out in that many ms at any volume); without a fade
+                // jp_9C470 plays at word / 255
+                let word = 255 * vol / 100;
+                let frac = if witch { word as f32 / 255.0 } else { vol as f32 / 100.0 };
+                if n >= 0 {
+                    self.sound.bgm_word = if witch { word } else { vol } as i16;
+                }
+                if witch && self.seek_audio.is_none() && n >= 0 && fade_in != 0 && self.sound.bgm_state().map(|b| b.0) != Some(n) {
+                    let out = if fade_out == 0 { fade_in } else { fade_out };
+                    let old = self.sound.bgm_state().map_or(0.0, |b| b.1 * 100.0);
+                    self.sound.stop_bgm_rate(old * 1000.0 / 60.0 / out as f32);
+                    let pct = 100 * word / 255;
+                    // pct / (word x 1000 / 60 / ms) frames
+                    let secs = if word > 0 { f64::from(pct) * fade_in as f64 / (f64::from(word) * 1000.0) } else { 0.0 };
+                    self.play_bgm_at(n, pct as f32 / 100.0, secs, start);
+                } else if let Some(sa) = &mut self.seek_audio {
+                    sa.bgm = (n >= 0).then_some((n, frac));
                 } else if n < 0 {
                     self.sound.stop_bgm(0.0);
                 } else if self.sound.bgm_state().map(|b| b.0) != Some(n) {
-                    let vol = vol as f32 / 100.0;
+                    let vol = frac;
                     if fade_in != 0 {
                         let out = if fade_out == 0 { fade_in } else { fade_out };
                         self.sound.stop_bgm_rate(1666.7 / out as f32);
@@ -2837,24 +3362,52 @@ impl Game {
                     self.sound.stop_bgm(ms.max(0) as f64 / 1000.0);
                 }
             }
+            // MSTP() (Witch on the Holy Night): outside the next-scene seek (AE0568) the BGM fades out at 4.17 points
+            // a frame (jp_9C9B0: 0.4 s from full volume); the BGM word clears
+            "MSTP" => {
+                if let Some(sa) = &mut self.seek_audio {
+                    sa.bgm = None;
+                } else {
+                    self.sound.stop_bgm_rate(4.1666665);
+                }
+            }
             // MVOL(key 1 ms, key 17 volume = 0) (sub_653B0): to the volume over max(ms, 1) ms
+            // Witch on the Holy Night's jp_653B0 keeps 255 x volume / 100 and steps the player to word x 100 / 255
+            // percent at |word - old word| x 1000 / 60 / ms a frame (that is, in ms x 100 / 255)
             "MVOL" => {
                 let ms = c.keyed_int(1).unwrap_or(0).max(1);
-                let v = c.keyed_int(17).unwrap_or(0) as f32 / 100.0;
+                let pct = c.keyed_int(17).unwrap_or(0);
+                let witch = crate::assets::witch();
+                let word = if witch { 255 * pct / 100 } else { pct };
+                let (v, secs) = if witch {
+                    let to = word as f32 * 100.0 / 255.0;
+                    let d = (word - i32::from(self.sound.bgm_word)).abs();
+                    let from = f32::from(self.sound.bgm_word) * 100.0 / 255.0;
+                    (to / 100.0, if d > 0 { f64::from((to - from).abs()) * ms as f64 / (f64::from(d) * 1000.0) } else { 0.0 })
+                } else {
+                    (pct as f32 / 100.0, ms as f64 / 1000.0)
+                };
                 if let Some(sa) = &mut self.seek_audio {
                     if let Some(b) = &mut sa.bgm {
                         b.1 = v;
                     }
                 } else {
-                    self.sound.set_bgm_volume(v, ms as f64 / 1000.0);
+                    self.sound.set_bgm_volume(v, secs);
                 }
+                self.sound.bgm_word = word as i16;
             }
-            "VPLY" | "VPL2" => {
+            "VPLY" | "VPL2" | "VLOG" => {
                 if let Some(n) = c.arg(0) {
-                    self.note_voice(n);
+                    // Witch on the Holy Night's handler (0x57c90) keeps no voice progress
+                    if self.assets.build != Build::Witch {
+                        self.note_voice(n);
+                    }
                     self.pending_voice = Some(n.to_string());
                     // VPLY leaves the voice for the next message start (AE04C8, played by sub_6E0D0); VPL2
-                    // plays it at once, without making it the replay voice, and drops it
+                    // plays it at once, without making it the replay voice, and drops it. VLOG (Witch on the
+                    // Holy Night) marks the history entry (+13281 bit 7), so the next message makes it the replay
+                    // and backlog voice without playing it
+                    self.log_voice = name == "VLOG";
                     if name == "VPL2" {
                         self.play_voice(n, false);
                         self.voice_to_play = None;
@@ -2867,6 +3420,15 @@ impl Game {
                 if self.sound.voice_playing() {
                     self.wait = Wait::Voice;
                 }
+            }
+            // Witch on the Holy Night (0x5813c) reads no argument: it ends a next-scene seek without its sound and
+            // the fast skip, then starts engine task 0 as kind 0 (jp_3F600(0, 0, 2, 1, 0, 0)), the opening movie
+            "TOMP" if self.assets.build == Build::Witch => {
+                if self.seek_node {
+                    self.end_seek(false);
+                }
+                self.skip = false;
+                self.start_witch_opening(r);
             }
             "TOMP" => {
                 let n = c.int_or(0, -1);
@@ -2907,6 +3469,16 @@ impl Game {
                 }
             }
             // bookkeeping commands with no visible effect here
+            // Witch on the Holy Night (jp_92630): n <= 255 sets bit n of the G words from 130 (the title's
+            // completion test, jp_8D180)
+            "RDST" if crate::assets::witch() => {
+                self.node_seq += 1;
+                if let Some(n) = c.int(0).filter(|&n| (0..=255).contains(&n)) {
+                    let g = format!("G{:03}", 130 + n / 16);
+                    let v = self.var(&g) | i32::from((1u32 << (n % 16)) as u16 as i16);
+                    self.set_var(&g, v);
+                }
+            }
             "RDST" => {
                 self.node_seq += 1;
                 if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n)) {
@@ -3104,7 +3676,7 @@ impl Game {
     pub fn play_sys_sound(&mut self, n: usize) {
         tracing::debug!("system sound {n}");
         let vol = if self.settings.mute & 4 != 0 { 0.0 } else { self.settings.sys_se };
-        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|&id| self.assets.sound_effect_id(id)) {
+        if let Some(pcm) = sys_sound_id(n).and_then(|id| self.assets.sound_effect_id(id)) {
             self.sound.play_sys(0, pcm, vol);
         }
     }
@@ -3112,7 +3684,7 @@ impl Game {
     /// sub_ACFA0(n): system sound n on the SE volume through the sub_CA0 curve.
     fn play_se_sound(&mut self, n: usize) {
         let vol = knife_audio::volume_curve(self.sound.se_volume());
-        if let Some(pcm) = SYS_SOUNDS.get(n).and_then(|&id| self.assets.sound_effect_id(id)) {
+        if let Some(pcm) = sys_sound_id(n).and_then(|id| self.assets.sound_effect_id(id)) {
             self.sound.play_sys(1, pcm, vol);
         }
     }
@@ -3139,7 +3711,29 @@ impl Game {
             if let Some(f) = t.flag() {
                 self.movie_flags |= 1 << f;
             }
+            // sub_21DE0: F36 = 0
+            if t.is_witch() {
+                self.set_var("F36", 0);
+            }
             self.end_mode_task();
+        }
+    }
+
+    /// Witch on the Holy Night's opening task init (sub_21AD0): F36 = 1, the modes saved and auto / skip off,
+    /// and opening_<language>.mp4 (jd_40B868) at the movie volume. jp_3F600 ends the slot's running task first.
+    fn start_witch_opening(&mut self, r: &Renderer) {
+        if self.story_movie.is_some() {
+            self.stop_movie();
+        }
+        if self.skip_all {
+            return;
+        }
+        let name = ["opening_ja", "opening_en", "opening_zc", "opening_zt"][self.assets.language().min(3)];
+        self.play_movie(r, name);
+        if self.movie.is_some() {
+            self.set_var("F36", 1);
+            self.story_movie = Some(StoryMovie::witch_opening(self.assets.language()));
+            self.begin_mode_task();
         }
     }
 
@@ -3206,7 +3800,9 @@ impl Game {
             "STMA" if matches!(arg(2), Some(1)) || (arg(2) == Some(2) && self.page.dim_vel == 0.0) => {
                 self.set_var("F1103", 1);
             }
-            "VPLY" | "MSAD" | "WTTM" => {
+            // WoH's WTTM(0) returns before the refresh
+            "WTTM" if crate::assets::witch() && arg(0).unwrap_or(0) == 0 => return,
+            "VPLY" | "VLOG" | "MSAD" | "WTTM" | "WTIN" => {
                 self.refresh_backup();
                 return;
             }
@@ -3219,10 +3815,15 @@ impl Game {
             "STCH" | "SCH2" | "SOXY" | "STTR" => stch_ok,
             "STZ4" => signed(0),
             "STCC" | "STBR" | "STCL" | "STCP" | "STRT" | "STRC" | "STRR" | "STGS" | "STRA" | "STNS" | "FCSP" | "FCLN"
-            | "FLNT" | "STMA" | "SPMA" | "SGMA" | "SQK2" | "SQS2" | "SHK2" | "SHS2" | "SSW2" | "SSS2" => true,
+            | "FLNT" | "FLOP" | "FLSP" | "STMA" | "SPMA" | "SGMA" | "SQK2" | "SQS2" | "SHK2" | "SHS2" | "SSW2" | "SSS2" | "STQK" | "STQS"
+            | "STSW" => true,
             // sub_3DE0 / sub_4030 / sub_4120 back up once their layer passes (STEC 0..=39, SNX2 / SNX3 >= 0)
             "STEC" => stch_ok,
             "SNX2" | "SNX3" => arg(0).is_some_and(|l| l >= 0),
+            // Witch on the Holy Night's SNX4 backs up before it looks at its layer
+            "SNX4" => crate::assets::witch(),
+            // Witch on the Holy Night's clock (sub_73A0 / sub_7BB0) backs up once its layer is 0..=34
+            "CKDP" | "CKTT" => arg(0).is_some_and(|l| (0..=34).contains(&l)),
             _ => false,
         };
         if backs_up && self.var("F991") == 0 {
@@ -3233,7 +3834,7 @@ impl Game {
         }
         let changed = match name {
             "STCH" => stch_ok,
-            "STZ4" | "STGS" | "SQS2" | "SHS2" | "SSS2" => signed(0),
+            "STZ4" | "STGS" | "SQS2" | "SHS2" | "SSS2" | "STQK" | "STQS" | "STSW" => signed(0),
             // the quakes skip a timed call (arg 4 / 4 / 6 >= 0) only during the load label scan
             "SQK2" => signed(0),
             "SHK2" => arg(0).is_none_or(|l| (-1..=39).contains(&l)),
@@ -3241,7 +3842,7 @@ impl Game {
             "STCL" => signed(1),
             "STRR" | "STMA" => unsigned(0),
             "SGMA" => unsigned(0) && arg(1).is_some_and(|m| m >= 1),
-            "SPMA" | "FCSP" | "FCLN" | "FLNT" => true,
+            "SPMA" | "FCSP" | "FCLN" | "FLNT" | "FLOP" | "FLSP" => true,
             _ => false,
         };
         if changed {
@@ -3268,8 +3869,26 @@ impl Game {
     /// 20 for a negative one) for (3 ms + 49) / 50 frames (1 for -32..0); an op already queued there runs at once
     /// first. sub_65E50 counts the frames down and sub_65A60 runs it (`run_se_queued`).
     fn cmd_se(&mut self, c: &Command) {
-        let ch = c.int_or(0, if c.name == "SEPL" { 0 } else { -1 });
+        let ch = c.int_or(0, if matches!(c.name.as_str(), "SEPL" | "SEAC") { 0 } else { -1 });
         let seek = self.seek_audio.is_some();
+        if c.name == "SEPN" {
+            // SEPN(ch, pan 0..128, ms) (sub_6B820): the pan word (x 1000, -1000..1000, 0 without one) and outside
+            // a seek the player's pan, at once for ms <= 0 (sub_9CE60) or from the word at a rate a frame
+            // (sub_9D110); no delay key
+            let pan = c.int(1).map_or(0, |p| ((1000 * p - 64000) / 64).clamp(-1000, 1000));
+            let ms = c.int_or(2, 0);
+            let Ok(ku) = usize::try_from(ch % 20) else { return };
+            if !seek {
+                let word = i32::from(self.sound.se_pan[ku]);
+                if ms <= 0 {
+                    self.sound.set_se_pan(ch % 20, pan);
+                } else {
+                    self.sound.ramp_se_pan(ch % 20, word, pan, (pan - word) as f32 * 1000.0 / 60.0 / ms as f32);
+                }
+                self.sound.se_pan[ku] = pan as i16;
+            }
+            return;
+        }
         if c.name == "SESP" {
             // SESP(ch % 20, all 20 when negative) clears the channel's loop words and drops its queued op unrun;
             // outside the seek it stops the channel at once (sub_9CF90). The volume word stays.
@@ -3286,29 +3905,82 @@ impl Game {
         }
         if !seek && let Some(ms) = c.keyed_int(68) {
             let frames = if (-32..=0).contains(&ms) { 1 } else { (3 * ms + 49) / 50 };
+            // SEAC (type 4) without a sound queues as SEFD; its duration is never stored (+1116 stays -1)
             let kind = match c.name.as_str() {
                 "SEPL" => 1,
                 "SEFD" => 2,
+                "SEAC" if c.arg(1).is_none() => 2,
+                "SEAC" => 4,
                 _ => 3,
             };
+            let seac = c.name == "SEAC";
             for k in if ch < 0 { 0..20 } else { ch % 20..ch % 20 + 1 } {
                 if let Some(i) = self.se_delayed.iter().position(|d| d.0.channel == k) {
                     let (old, _, _) = self.se_delayed.remove(i);
                     self.run_se_queued(&old);
                 }
                 let key = |n| c.keyed_int(n);
-                let q = SeQueued {
-                    channel: k,
-                    frames: frames as i16,
-                    kind,
-                    name: (kind == 1).then(|| c.arg(2).map(str::to_string)).flatten(),
-                    fade: if kind == 1 || kind == 2 || kind == 3 { key(1).unwrap_or(-1) } else { -1 },
-                    volume: if kind != 2 { key(17).map_or(-1, |v| v as i8) } else { -1 },
-                    looping: kind == 1 && c.int_or(1, 0) != 0,
-                    pan: if kind == 1 { key(18).map_or(-1, |v| v as i16) } else { -1 },
-                    speaker: if kind == 1 { key(70).unwrap_or(0) } else { 0 },
+                let q = if seac {
+                    // SEAC(ch, sound, loop, volume, end volume, pan = 64, end pan = pan, ms)
+                    let pan = c.int_or(5, 64);
+                    SeQueued {
+                        channel: k,
+                        frames: frames as i16,
+                        kind,
+                        name: (kind == 4).then(|| c.arg(1).map(str::to_string)).flatten(),
+                        fade: -1,
+                        volume: if kind == 4 { c.int(3).map_or(-1, |v| v as i8) } else { -1 },
+                        looping: kind == 4 && c.int_or(2, 0) != 0,
+                        pan: if kind == 4 { pan as i16 } else { -1 },
+                        speaker: 0,
+                        vol_end: if kind == 4 { c.int(4).map_or(-1, |v| v as i8) } else { -1 },
+                        pan_end: if kind == 4 { c.int_or(6, pan) as i16 } else { -1 },
+                    }
+                } else {
+                    SeQueued {
+                        channel: k,
+                        frames: frames as i16,
+                        kind,
+                        name: (kind == 1).then(|| c.arg(2).map(str::to_string)).flatten(),
+                        fade: if kind == 1 || kind == 2 || kind == 3 { key(1).unwrap_or(-1) } else { -1 },
+                        volume: if kind != 2 { key(17).map_or(-1, |v| v as i8) } else { -1 },
+                        looping: kind == 1 && c.int_or(1, 0) != 0,
+                        pan: if kind == 1 { key(18).map_or(-1, |v| v as i16) } else { -1 },
+                        speaker: if kind == 1 { key(70).unwrap_or(0) } else { 0 },
+                        vol_end: -1,
+                        pan_end: -1,
+                    }
                 };
                 self.se_delayed.push((q, (frames - 1) as f32 * 1000.0 / 60.0, true));
+            }
+            return;
+        }
+        if c.name == "SEAC" {
+            // SEAC (sub_6C0A0) writes and runs SEPL(ch, loop, sound, , `017:volume (0 -> 1, none without one),
+            // `018:pan), then SEVL(ch, , , `017:end volume, `001:ms) for an end volume >= 0 other than the start,
+            // then SEPN(ch, end pan, ms) for an end pan other than the start
+            let vol = c.int(3).map(|v| if v == 0 { 1 } else { v });
+            let vol_end = c.int(4).unwrap_or(-1);
+            let pan = c.int_or(5, 64);
+            let pan_end = c.int_or(6, pan);
+            let ms = c.int_or(7, 0);
+            let cmd = |name: &str, args: Vec<String>| Command {
+                op: knife_core::vm::parse::Op::Cmd(name.as_bytes().try_into().unwrap()),
+                name: name.to_string(),
+                args,
+                offset: c.offset,
+                legacy_offset: c.legacy_offset,
+            };
+            let mut args = vec![ch.to_string(), c.int_or(2, 0).to_string(), c.arg(1).unwrap_or("").to_string(), String::new()];
+            args.extend(vol.map(|v| format!("`017:{v}")));
+            args.push(format!("`018:{pan}"));
+            self.cmd_se(&cmd("SEPL", args));
+            if vol_end >= 0 && vol_end != vol.unwrap_or(-1) {
+                let args = vec![ch.to_string(), String::new(), String::new(), format!("`017:{vol_end}"), format!("`001:{ms}")];
+                self.cmd_se(&cmd("SEVL", args));
+            }
+            if pan_end != pan {
+                self.cmd_se(&cmd("SEPN", vec![ch.to_string(), pan_end.to_string(), ms.to_string()]));
             }
             return;
         }
@@ -3339,6 +4011,7 @@ impl Game {
                 if looping && cur_loop.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(name)) && self.sound.se_word[ch as usize] > 0 {
                     return;
                 }
+                self.sound.se_loop[ch as usize] = looping;
                 if !looping && self.skip {
                     match &mut self.seek_audio {
                         Some(sa) => {
@@ -3434,6 +4107,7 @@ impl Game {
         match q.kind {
             // sub_65780
             1 => {
+                self.sound.se_loop[chu] = q.looping;
                 let Some(name) = q.name.as_deref() else {
                     self.sound.stop_se(ch);
                     return;
@@ -3482,6 +4156,16 @@ impl Game {
                 }
             }
             2 => {
+                // Witch on the Holy Night (sub_465C0) does nothing without a loop on the channel (+100 < 0) and
+                // keeps the volume word
+                let witch = self.assets.build == Build::Witch;
+                let looping = match &self.seek_audio {
+                    Some(sa) => sa.loops.contains_key(&ch),
+                    None => self.sound.looping_on(ch).is_some(),
+                };
+                if witch && !looping {
+                    return;
+                }
                 if let Some(sa) = &mut self.seek_audio {
                     sa.loops.remove(&ch);
                 } else if q.fade > 0 && word > 0 {
@@ -3491,7 +4175,35 @@ impl Game {
                 } else {
                     self.sound.stop_se(ch);
                 }
-                self.sound.se_word[chu] = 0;
+                if !witch {
+                    self.sound.se_word[chu] = 0;
+                }
+            }
+            // SEAC (sub_65A60 case 4): a missing start volume / pan takes the end one, the SE plays as a queued
+            // SEPL, then the volume (0 counts as 1) and the pan move to their ends, at once without a duration
+            4 => {
+                let vol = if q.volume == -1 && q.vol_end != -1 { q.vol_end } else { q.volume };
+                let pan = if q.pan == -1 && q.pan_end != -1 { q.pan_end } else { q.pan };
+                self.run_se_queued(&SeQueued { kind: 1, volume: vol, pan, ..q.clone() });
+                let vol = if vol == 0 { 1 } else { vol };
+                let dur = q.fade as i16;
+                if q.vol_end >= 0 && vol != q.vol_end && !seek {
+                    let word = i32::from(self.sound.se_word[chu]);
+                    let to = i32::from(q.vol_end);
+                    let rate = if dur >= 1 { (to - word) as f32 * 1000.0 / 60.0 / f32::from(dur) } else { 2000.0 };
+                    self.sound.ramp_se(ch, to as f32 / 100.0, rate);
+                    self.sound.se_word[chu] = to as i16;
+                }
+                if q.pan_end >= 0 && pan != q.pan_end && !seek {
+                    let x = |p: i16| ((1000 * i32::from(p) - 64000) / 64).clamp(-1000, 1000);
+                    let (from, to) = (x(pan), x(q.pan_end));
+                    if dur >= 1 {
+                        self.sound.ramp_se_pan(ch, from, to, (to - from) as f32 * 1000.0 / 60.0 / f32::from(dur));
+                    } else {
+                        self.sound.set_se_pan(ch, to);
+                    }
+                    self.sound.se_pan[chu] = to as i16;
+                }
             }
             3 if !seek && q.volume >= 0 => {
                 let vol = i32::from(q.volume);
@@ -3539,10 +4251,17 @@ impl Game {
     fn cmd_stch(&mut self, r: &Renderer, c: &Command) {
         let li = c.int_or(0, -1);
         if c.name == "STCG" {
-            // STCG(image) (0x7b214) only marks the image seen: its own table index, when below 2701
-            if let Some(i) = c.arg(0).and_then(|n| self.assets.image_index_of(&n.to_ascii_uppercase()))
-                && i < records::SEEN_DIRECT
-            {
+            // STCG(image) (0x7b214) only marks the image seen: its own table index, when below 2701. Witch on the
+            // Holy Night (0x5a6bc): the index when at most 2880 (BG_ERROR, not a name, else), through jp_644A0
+            // (a variant counts as its base image) when below 3200.
+            let idx = c.arg(0).and_then(|n| self.assets.image_index_of(&n.to_ascii_uppercase()));
+            if crate::assets::witch() {
+                if let Some(n) = c.arg(0).filter(|_| idx.is_some_and(|i| i <= 2880))
+                    && let Some(b) = self.seen_bit(&n.to_ascii_uppercase())
+                {
+                    set_bit(&mut self.seen, b);
+                }
+            } else if let Some(i) = idx.filter(|&i| i < records::SEEN_DIRECT) {
                 set_bit(&mut self.seen, i);
             }
             return;
@@ -3553,6 +4272,8 @@ impl Game {
         let prev = src_layer
             .and_then(|s| self.stage.layers.get(s as usize).cloned().flatten())
             .or_else(|| self.stage.layers.get(li.max(0) as usize).cloned().flatten());
+        let dest_prev = self.stage.layers.get(li.max(0) as usize).cloned().flatten();
+        let src_prev = src_layer.and_then(|s| self.stage.layers.get(s as usize).cloned().flatten());
         let variant = match (c.int(9), c.int(10)) {
             // `_00_00` is the base image itself
             (Some(a), Some(b)) if (a, b) != (0, 0) => Some(format!("{base}_{a:02}_{b:02}")),
@@ -3575,10 +4296,15 @@ impl Game {
         };
         let x = c.int(2).map(|v| v as f32).or(prev.as_ref().map(|p| p.x.value_x())).unwrap_or(240.0);
         let y = c.int(3).map(|v| v as f32).or(prev.as_ref().map(|p| p.y.value())).unwrap_or(136.0);
-        let prio = c.int(6).or(prev.as_ref().map(|p| p.stage_prio())).unwrap_or(li * 10);
+        // STCH runs cmd_STCH_impl / jp_60840 with flag 1, SCH2 with 0: STCH's missing priority is 10 x layer and
+        // its missing alpha 255, also over a source layer's copied words; SCH2 keeps them
+        let fresh = c.name == "STCH";
+        let prio = c.int(6).or(prev.as_ref().filter(|_| !fresh).map(|p| p.stage_prio())).unwrap_or(li * 10);
         // the exe marks shown images in a persistent bitmap (sub_774F0) for gallery unlocks, BLACK and WHITE
-        // (table indices 0 and 5) too
-        if let Some(b) = self.seen_bit(variant.as_deref().unwrap_or(&upper)) {
+        // (table indices 0 and 5) too (Witch on the Holy Night: at the commit, `commit_stage`)
+        if !crate::assets::witch()
+            && let Some(b) = self.seen_bit(variant.as_deref().unwrap_or(&upper))
+        {
             set_bit(&mut self.seen, b);
         }
         let mut l = Layer::new(variant.unwrap_or(base), source, x, y, prio);
@@ -3601,6 +4327,17 @@ impl Game {
             // a source layer's quake slots come along; otherwise cmd_STCH_impl clears them
             if src_layer.is_some() {
                 l.quake = p.quake;
+            }
+            // Witch on the Holy Night's slot stays the destination's own render slot (jp_60840); a source layer
+            // gives only its stage words, else they are zeroed with D and the delay
+            if let Some(d) = &dest_prev {
+                l.wquake = d.wquake;
+            }
+            if src_layer.is_some() {
+                (l.wquake.stage, l.wquake.stage_kind) =
+                    src_prev.as_ref().map_or(([0; 6], 0), |sp| (sp.wquake.stage, sp.wquake.stage_kind));
+            } else {
+                l.wquake.stch_clear();
             }
             // cmd_STCH_impl resets the stage anchor on every call: without a source layer to the centre cut to
             // whole units (the defaults, `Image::anchor`); with one (SCH2 arg 18) to the source's pivot moved by
@@ -3631,6 +4368,7 @@ impl Game {
                 l.stec_mode = p.stec_mode;
                 l.stec_color = p.stec_color;
                 l.snx = p.snx;
+                l.snx4 = p.snx4;
                 if p.bake.cpu()
                     && let Source::Image(_) = l.source
                     && let Some(img) = self.assets.image_graded(r, &l.name, p.bake)
@@ -3650,8 +4388,10 @@ impl Game {
             l.zoom_x = Tween::fixed(z as f32 / 1000.0);
             l.zoom_y = Tween::fixed(z as f32 / 1000.0);
         }
-        if let Some(a) = c.int(5) {
-            l.alpha = Tween::fixed(a as f32 / 255.0);
+        match c.int(5) {
+            Some(a) => l.alpha = Tween::fixed(a.clamp(0, 255) as f32 / 255.0),
+            None if fresh => l.alpha = Tween::fixed(1.0),
+            None => {}
         }
         if let Some(p) = c.int(11) {
             l.parent = (p >= 0).then_some(p as usize);
@@ -3684,9 +4424,115 @@ impl Game {
         if let Some(v) = c.int(19) {
             l.rot2 = wrap_rot2(v);
         }
+        // jp_60840: STCH (and SCH2 with an alpha) sets the STGS words to (alpha, 0) and the curve byte to 0, the
+        // alpha being argument 5 or 255; SCH2 without one keeps the slot's
+        if c.name == "STCH" || c.int(5).is_some() {
+            let a = c.int(5).map_or(255, |v| v.clamp(0, 255)) as i16;
+            (l.wfade, l.wfade_ease) = ([a, 0], 0);
+        } else if let Some(d) = src_prev.as_ref().or(dest_prev.as_ref()) {
+            // a source layer's words come along (jp_60840 LABEL_52)
+            (l.wfade, l.wfade_ease) = (d.wfade, d.wfade_ease);
+        }
         self.stage.set(li, l);
         // script_dispatch 0x7b274: a done STCH / SCH2 sets words 0x7C8 / 0x7CA
         self.stage_dirty = true;
+    }
+
+    /// The clock hands' rotations in 1/100 degrees, wrapped to -18000..18000: the hour hand 30 degrees an hour and
+    /// 0.5 a minute, the minute hand 6 degrees a minute (sub_73A0 / sub_7BB0).
+    fn clock_hands(h: i32, m: i32) -> (i32, i32) {
+        (-18000 * (h / 6) + 3000 * (h % 6) + 50 * m, 600 * (m % 30) - 18000 * (m / 30))
+    }
+
+    /// CKDP(layer, hour, minute, x, y, zoom = 1000, mode) (Witch on the Holy Night, sub_73A0): a clock on layers
+    /// layer..layer + 4 (layer <= 34), written to the stage only like STCH: the face img1242 centred at (x + 820,
+    /// y + 635), the hour hand img1244 92 stage units (640x480) up and the minute hand img1246 124 up, each
+    /// turning about its fixed pivot, and under each hand its `_02_02` shadow at alpha 64, a black fill (STEC
+    /// mode 1, colour 0) offset by (9 * 480 / 1024, 13 * 272 / 576) stage units times the zoom. Arg 6 is the
+    /// STEC mode of the face and hands (a grade; 1 makes them black too). Priorities 100, 103 / 101, 104 / 102;
+    /// the STBR byte -1.
+    fn cmd_ckdp(&mut self, r: &Renderer, c: &Command) {
+        let Some(li) = c.int(0).filter(|&l| (0..=34).contains(&l)) else { return };
+        let (hour, minute) = Self::clock_hands(c.int_or(1, 0), c.int_or(2, 0));
+        // stage units (x / 1280 * 640, y / 720 * 480); the layer keeps script units (x 2, y 1.5 of them)
+        let x = (c.int_or(3, 0) + 820) as f32 * 640.0 / 1280.0;
+        let y = (c.int_or(4, 0) + 635) as f32 * 480.0 / 720.0;
+        let zoom = c.int_or(5, 1000);
+        let mode = c.int_or(6, 0);
+        let z = zoom as f32 / 1000.0;
+        let dx = z * 9.0 * 480.0 * 0.00097656 * 640.0 / 1280.0;
+        let dy = z * 13.0 * 272.0 / 576.0 * 480.0 / 720.0;
+        // image, position, alpha, priority, pivot / shift (None: the face's half size), rotation, STEC mode
+        type Part = (&'static str, f32, f32, i32, i32, Option<([f32; 2], [f32; 2])>, i32, i32);
+        let parts: [Part; 5] = [
+            ("img1242", x, y, 255, 100, None, 0, mode),
+            ("img1244", x, y - 92.0, 255, 103, Some(([41.5, 388.0], [-41.0, -388.0])), hour, mode),
+            ("img1244_02_02", x + dx, y - 93.0 + dy, 64, 101, Some(([46.2, 394.0], [-46.0, -394.0])), hour, 1),
+            ("img1246", x, y - 124.0, 255, 104, Some(([37.5, 513.0], [-37.0, -513.0])), minute, mode),
+            ("img1246_02_02", x + dx, y - 124.0 + dy, 64, 102, Some(([42.5, 517.5], [-42.0, -517.0])), minute, 1),
+        ];
+        for (k, (name, px, py, alpha, prio, pivot, rot, stec)) in parts.into_iter().enumerate() {
+            let slot = li + k as i32;
+            // sub_42250: the image, else BG_ERROR
+            // (the commit marks the images seen, `commit_stage`)
+            let Some(img) = self.assets.image(r, name).or_else(|| self.assets.image(r, "BG_ERROR")) else { continue };
+            let (pivot, shift) = pivot.unwrap_or_else(|| {
+                // the ImageInfo size (floats 11 / 12), not the texture's that the draw uses
+                let (w, h) = self.assets.image_info(name).map_or((img.width, img.height), |i| (i.width, i.height));
+                let (w, h) = (w * 0.5, h * 0.5);
+                ([w, h], [(-w).trunc(), (-h).trunc()])
+            });
+            let prev = self.stage.layers.get(slot as usize).cloned().flatten();
+            let mut l = match prev {
+                Some(p) => {
+                    let keep = p.name == name && (!p.pending || p.keeps_texture);
+                    let mut l = Layer { name: name.to_string(), pending: true, keeps_texture: keep, ..p };
+                    if !keep {
+                        l.source = Source::Image(img);
+                        l.fill = None;
+                        l.shade = Shade::Sprite;
+                        l.bake = crate::grade::Bake::NONE;
+                    }
+                    l
+                }
+                None => Layer::new(name.to_string(), Source::Image(img), 0.0, 0.0, prio),
+            };
+            l.x = Tween::fixed(px * 2.0);
+            l.y = Tween::fixed(py * 1.5);
+            l.zoom_x = Tween::fixed(z);
+            l.zoom_y = Tween::fixed(z);
+            l.alpha = Tween::fixed(alpha as f32 / 255.0);
+            (l.prio, l.stbr, l.blend) = (prio, -1, Blend::Alpha);
+            (l.staged.prio, l.staged.stbr) = (None, None);
+            l.stage_pivot = Some(pivot);
+            l.stage_shift = Some(shift);
+            l.stage_rot = Some(rot as f32 / 100.0);
+            l.stec_mode = stec;
+            l.stec_color = if stec == 1 { [0.0; 3] } else { [1.0; 3] };
+            self.stage.set(slot, l);
+            self.rebake(r, slot);
+        }
+        self.stage_dirty = true;
+    }
+
+    /// CKTT(layer, hour, minute) (Witch on the Holy Night, sub_7BB0): the hands of a CKDP clock turn to the new
+    /// time over 18 frames, linear (kind 70), from the hour / minute hand's stage rotation (layers + 1 / + 3);
+    /// the render tweens start at once and the stage rotations take the targets.
+    fn cmd_cktt(&mut self, c: &Command) {
+        let Some(li) = c.int(0).filter(|&l| (0..=34).contains(&l)) else { return };
+        let (hour, minute) = Self::clock_hands(c.int_or(1, 0), c.int_or(2, 0));
+        let stage_rot = |l: &Option<Layer>| {
+            l.as_ref().map_or(0, |l| (l.stage_rot.unwrap_or(l.rotation.to) * 100.0).round() as i32)
+        };
+        let from_hour = stage_rot(&self.stage.layers[li as usize + 1]);
+        let from_minute = stage_rot(&self.stage.layers[li as usize + 3]);
+        for (k, from, to) in [(1, from_hour, hour), (2, from_hour, hour), (3, from_minute, minute), (4, from_minute, minute)] {
+            if let Some(l) = self.stage.get(li + k) {
+                // sub_326E0 keeps the start as an i16
+                l.rotation = Tween::new(from as i16 as f32 / 100.0, to as f32 / 100.0, 18, 70);
+                l.stage_rot = None;
+            }
+        }
     }
 
     /// sub_63520 on one layer, or for a negative one on every layer with an image (sub_91540 / sub_91900).
@@ -3713,13 +4559,18 @@ impl Game {
             self.last_voice = Some(n.to_string());
         }
         let row = voice_row(n);
-        if self.settings.char_mute >> row & 1 == 0 {
+        if self.speaker_voice_on(n) {
             let gain = self.settings.char_voice.get(row).copied().unwrap_or(1.0);
             match self.assets.voice(n) {
                 Ok(pcm) => self.sound.play_voice_gain(Arc::new(pcm), gain, replay),
                 Err(e) => tracing::warn!("voice {n}: {e:#}"),
             }
         }
+    }
+
+    /// The voice's config row is not muted (off_AE03D8 + 0x24 / WoH + 0x3C: the row's enable bit).
+    fn speaker_voice_on(&self, n: &str) -> bool {
+        self.settings.char_mute >> voice_row(n) & 1 == 0
     }
 
     /// Voice progress (script_dispatch VPLY): the speaker (sub_2360, by the name's first three letters) gets
@@ -3808,6 +4659,7 @@ impl Game {
         self.page.chars.clear();
         self.page.texts.clear();
         self.page.msgs.clear();
+        self.page.zs.clear();
         self.page.order = 0;
         self.page.revealed = 0.0;
         let (lay, top) = self.text_layout();
@@ -3817,7 +4669,55 @@ impl Game {
     /// Text colour of the page's messages (sub_391A0 draws history lines with it): hi / lo byte of 0xDC6D
     /// (read text) when config u16 24 is 1, else 0xFFFF. Only a whole-config copy writes that word, so it is
     /// 0 on the Switch and every colour is 0xFFFF.
-    const TEXT_COLOUR: i32 = 0xFFFF;
+    const TEXT_COLOUR: u16 = 0xFFFF;
+
+    /// Witch on the Holy Night's bubble text (jp_39010 false: window type F1105, or F1109 > 0 in English, at
+    /// least 3): colour 31200 and text flags 0x180000 (the bubble font, no edge or shadow).
+    fn witch_bubble_text(&self) -> bool {
+        self.assets.build == Build::Witch && self.window_type().is_some_and(|t| t >= 3)
+    }
+
+    /// The current message's colour (word_459424, jp_6E0D0 / MSAD jp_6E950): Witch on the Holy Night's mode 1
+    /// tints read text (sub_53A60) 0xDC6D, mode 2 takes the speaker table (every entry 0xFFFF, bubbles too);
+    /// bubble text is 31200 otherwise.
+    fn msg_colour(&self) -> u16 {
+        if self.assets.build != Build::Witch {
+            return Self::TEXT_COLOUR;
+        }
+        let bubble = self.witch_bubble_text();
+        match self.settings.text_colour {
+            1 if self.line_read && !bubble => 0xDC6D,
+            2 => 0xFFFF,
+            _ if bubble => 31200,
+            _ => 0xFFFF,
+        }
+    }
+
+    /// The per-message colour words after a click (jp_40ED0): mode 1 makes the page's messages read (0xDC6D),
+    /// bubbles 31200.
+    fn line_reset_colour(&self) -> u16 {
+        match self.assets.build {
+            Build::Witch if self.witch_bubble_text() => 31200,
+            Build::Witch if self.settings.text_colour == 1 => 0xDC6D,
+            _ => Self::TEXT_COLOUR,
+        }
+    }
+
+    /// Colour of history message `i` on the page (jp_391A0): mode 1 tints them all 0xDC6D (bubbles 31200) while
+    /// the current message is read, else each keeps its words F(800 + i) / F(811 + i); otherwise 0xFFFF,
+    /// bubbles 31200.
+    fn history_colour(&self, i: usize) -> u16 {
+        if self.assets.build != Build::Witch {
+            return Self::TEXT_COLOUR;
+        }
+        let bubble = self.witch_bubble_text();
+        match self.settings.text_colour {
+            1 if self.line_read => if bubble { 31200 } else { 0xDC6D },
+            1 => (self.var(&format!("F{}", 800 + i.min(10))) << 8 | self.var(&format!("F{}", 811 + i.min(10))) & 0xFF) as u16,
+            _ if bubble => 31200,
+            _ => 0xFFFF,
+        }
+    }
 
     /// Page mode (F822 == 1, set by START_SCRIPT): a page keeps its earlier messages (sub_391A0).
     fn page_mode(&self) -> bool {
@@ -3836,19 +4736,49 @@ impl Game {
             Some(t) if self.is_bubble(t) => {
                 let (left, top) = self.bubble_text_origin(t, self.window_offset());
                 let right = left + self.bubble_width(t) * UX;
+                // Witch on the Holy Night's English bubbles scale the glyphs 0.85 wide and 0.95 tall (jp_6E0D0,
+                // jp_391A0); the line feed follows the height
+                let (k, sx) = if self.assets.build == Build::Witch && text::english() { (0.95, 0.85 / 0.95) } else { (1.0, 1.0) };
+                let size = base.size * k;
+                let mut line_height = base.line_height + (k * text::bubble_line_feed() - text::line_feed()) * base.size / text::BASE_SIZE;
+                // Witch on the Holy Night's bubble flag 0x100000 (jp_A7790): line spacing a8 - 14 + 6, 8 px of 1080
+                // closer (Switch: TeaTime bubble lines 82 px apart in the shared font's line feed 60)
+                if self.assets.build == Build::Witch {
+                    line_height -= 8.0 * CANVAS_H as f32 / 1080.0;
+                }
+                if self.z_cur == Some(true) {
+                    line_height -= 8.0 * CANVAS_H as f32 / 1080.0;
+                }
                 // the bubble font's own pair ascent (`text::bubble_ascent`)
-                let ascent = base.ascent * text::bubble_ascent();
-                (Layout { left, right, ascent, ..base }, top + ascent)
+                let ascent = base.ascent * k * text::bubble_ascent();
+                (Layout { left, right, ascent, size, sx, line_height, ..base }, top + ascent)
             }
-            _ => (base, top_baseline()),
+            _ => match self.z_cur {
+                // `@z` in a page slot: the shared font's line feed and pair ascent (`text::bubble_ascent`), as
+                // a bubble's
+                Some(tight) => {
+                    let mut line_height = base.line_height + (text::bubble_line_feed() - text::line_feed()) * base.size / text::BASE_SIZE;
+                    if tight {
+                        line_height -= 8.0 * CANVAS_H as f32 / 1080.0;
+                    }
+                    let ascent = base.ascent * text::bubble_ascent();
+                    (Layout { ascent, line_height, ..base }, top_baseline() - base.ascent + ascent)
+                }
+                None => (base, top_baseline()),
+            },
         }
     }
 
-    /// The window types of the build (unk_34D94C; the overseas build's flt_231D74 has 56).
+    /// The window types of the build (unk_34D94C; the overseas build's flt_231D74 has 56; Witch on the Holy
+    /// Night's 99, `witch::WINDOWS`, origins converted to 1280x720 units).
     fn windows(&self) -> &'static [(u16, f32, f32)] {
+        static WITCH_WINDOWS: std::sync::LazyLock<Vec<(u16, f32, f32)>> = std::sync::LazyLock::new(|| {
+            crate::witch::WINDOWS.iter().map(|&(slot, x, y, _, _)| (slot, x * 2.0, y * 720.0 / 448.0)).collect()
+        });
         match self.assets.build {
             Build::Japanese => &WINDOWS,
             Build::Overseas => &EN_WINDOWS,
+            Build::Witch => &WITCH_WINDOWS,
         }
     }
 
@@ -3859,6 +4789,12 @@ impl Game {
         let &(slot, _, _) = self.windows().get(t)?;
         if self.assets.build == Build::Japanese {
             return Some((slot, 1.0, 1.0));
+        }
+        if self.assets.build == Build::Witch {
+            // sub_1AF00: types 0..2 take slots 62..64 with English text (or outside the 1920x1080 mode)
+            let &(_, _, _, sx, sy) = crate::witch::WINDOWS.get(t)?;
+            let slot = if t <= 2 && text::english() { 62 + t as u16 } else { slot };
+            return Some((slot, sx, sy));
         }
         let slot = if t <= 2 && text::english() { 63 + t as u16 } else { slot };
         let (sx, sy) = match t {
@@ -3878,14 +4814,25 @@ impl Game {
         Some((slot, sx, sy))
     }
 
+    /// The image slot of DISP_PARTS entry 0.
+    fn disp_slot0(&self) -> u16 {
+        if self.assets.build == Build::Witch { WITCH_DISP_SLOT0 } else { DISP_SLOT0 }
+    }
+
     /// Window types 3.. are the QA corner bubbles.
     fn is_bubble(&self, t: usize) -> bool {
         (3..self.windows().len()).contains(&t)
     }
 
-    /// The message slot's width in 640-wide units (sub_39050: English 573).
+    /// The message slot's width in 640-wide units (sub_39050: English 573; Witch on the Holy Night sub_1AE20: 436,
+    /// English 556).
     fn msg_width(&self) -> f32 {
-        if text::english() { EN_WIDTH } else { 464.0 }
+        match (self.assets.build == Build::Witch, text::english()) {
+            (true, true) => 556.0,
+            (true, false) => 436.0,
+            (false, true) => EN_WIDTH,
+            (false, false) => 464.0,
+        }
     }
 
     /// Text width of bubble type `t` in 640-wide units (flt_34DEFC; overseas sub_39050).
@@ -3894,23 +4841,36 @@ impl Game {
             Build::Japanese => BUBBLE_WIDTH[(t - 3) % 6 / 2],
             Build::Overseas if t - 3 < 40 && (EN_BUBBLE_WIDTH_MASK >> (t - 3)) & 1 != 0 => EN_BUBBLE_WIDTH[t - 3],
             Build::Overseas => self.msg_width(),
+            Build::Witch => crate::witch::BUBBLE_WIDTH.get(t - 3).copied().unwrap_or_else(|| self.msg_width()),
         }
     }
 
     /// Text origin of bubble type `t` in canvas pixels: unk_34D94C + unk_34DAD8 + the window offset.
     fn bubble_text_origin(&self, t: usize, (dx, dy): (f32, f32)) -> (f32, f32) {
+        if self.assets.build == Build::Witch {
+            // WoH jp_391A0: flt_25E588[type] in 1024x576 units, centred on the line count F1108; the offsets are
+            // 1280x720-unit values here (`window_offset`)
+            let (tx, ty) = crate::witch::BUBBLE_TEXT.get(t).copied().unwrap_or((0.0, 0.0));
+            let lines = self.var("F1108") as f32;
+            let x = tx * 0.625 + dx * 0.5;
+            let y = ty * 0.77778 - ((lines - 1.0) * 41.0 + 26.0) * 0.41481 + dy * 448.0 / 720.0;
+            return (x * UX, y * UY);
+        }
         let (_, wx, wy) = self.windows()[t];
         let (tx, ty) = match self.assets.build {
             Build::Japanese => BUBBLE_TEXT[(t - 3) / 2],
-            Build::Overseas => EN_BUBBLE_TEXT[t],
+            Build::Overseas | Build::Witch => EN_BUBBLE_TEXT[t],
         };
         // 1280x720 units -> 640x448 -> canvas pixels
         ((wx + tx + dx) * 640.0 / 1280.0 * UX, (wy + ty + dy) * 448.0 / 720.0 * UY)
     }
 
     /// The second bubble (F1111 a bubble type, page mode): sub_391A0 draws it like the F1105 window with the
-    /// F1112 / F1113 offsets.
+    /// F1112 / F1113 offsets. Witch on the Holy Night's jp_391A0 has none.
     fn second_bubble(&self) -> Option<usize> {
+        if self.assets.build == Build::Witch {
+            return None;
+        }
         usize::try_from(self.var("F1111")).ok().filter(|&t| self.is_bubble(t) && self.page_mode())
     }
 
@@ -3954,6 +4914,10 @@ impl Game {
                 tracing::warn!("bubble font: {e:#}");
                 None
             }
+            // Witch on the Holy Night loads one font per language (sub_85A90: the folder's file and the
+            // exfont); its bubble text (flag 0x100000: slot +101793, font variant 3 in jp_C406C) draws in the
+            // shared system font (Switch: the TeaTime bubbles and the save list's header in gothic)
+            None if assets.build == Build::Witch => crate::ui::shared_font_atlas(r, assets.shared_fonts()).map(with_exfont),
             None => {
                 tracing::warn!("no bubble font");
                 None
@@ -3995,9 +4959,10 @@ impl Game {
         let texts = std::mem::take(&mut self.page.texts);
         self.page.extras.clear();
         let msgs = std::mem::take(&mut self.page.msgs);
+        self.relay_zs = std::mem::take(&mut self.page.zs);
         let (waiting, visible, msg_pc) = (self.page.waiting, self.page.visible, self.msg_pc);
         self.relaying = true;
-        self.page.chars.clear();
+        let old_chars = std::mem::take(&mut self.page.chars);
         self.page.order = 0;
         let (lay, top) = self.text_layout();
         self.page.pen = (lay.left, top);
@@ -4007,6 +4972,14 @@ impl Game {
         for (m, old) in self.page.msgs.iter_mut().zip(&msgs) {
             m.2 = old.2;
             m.3 = old.3;
+        }
+        // each message's slot keeps its glyph records through a new layout (`Wobble::arm`)
+        for (pc, old) in self.page.chars.iter_mut().zip(&old_chars) {
+            if let (Some(w), Some(o)) = (&mut pc.wobble, old.wobble)
+                && o.kind == w.kind
+            {
+                *w = o;
+            }
         }
         self.relaying = false;
         self.msg_pc = msg_pc;
@@ -4045,11 +5018,34 @@ impl Game {
     /// rasterises those with font variant 2 (classes 0 / 1 use variants 0 / 1). The exe names no font files;
     /// the Switch draws that variant in FOT-Seurat (ja3); variant 3 is the shared system font (`Ui::sys_font`).
     fn msg_font(&mut self) -> &mut FontAtlas {
-        let bubble = self.window_type().is_some_and(|t| t >= 3);
+        let bubble = self.window_type().is_some_and(|t| t >= 3) || self.z_cur.is_some();
         match &mut self.font_bubble {
             Some(f) if bubble => f,
             _ => &mut self.font,
         }
+    }
+
+    /// F824, line 0's top in page units: 65 in Tsukihime (sub_391A0). Witch on the Holy Night's jp_391A0 (docked,
+    /// jp_A59D0): 65 (English (int)(65 - 9.8824) = 55) for the docked windows; a bubble type 3..98 its text origin
+    /// y flt_25E588 x 0.77778 less ((F1108 - 1) x 41 + 26) x 0.41481, plus the F1107 offset x 0.77778 (F1107
+    /// 0..20).
+    fn witch_f824(&self) -> i32 {
+        if self.assets.build != Build::Witch {
+            return 65;
+        }
+        let f1109 = self.var("F1109");
+        let t = if text::english() && f1109 > 0 { f1109 } else { self.var("F1105") };
+        let docked = if text::english() { (65.0f32 - 9.8824) as i32 } else { 65 };
+        let Some(&(_, ty)) = usize::try_from(t).ok().filter(|&t| (3..=98).contains(&t)).and_then(|t| crate::witch::BUBBLE_TEXT.get(t))
+        else {
+            return docked;
+        };
+        let lines = self.var("F1108") as f32;
+        let mut y = ty * 0.77778 - ((lines - 1.0) * 41.0 + 26.0) * 0.41481;
+        if let Some(dy) = usize::try_from(self.var("F1107")).ok().and_then(|i| crate::witch::WINDOW_DY.get(i)) {
+            y += dy * 0.77778;
+        }
+        y as i32
     }
 
     /// Message window type (stage word F1105; for English F1109 instead when it is above 0, sub_2DF20).
@@ -4058,9 +5054,13 @@ impl Game {
         usize::try_from(if text::english() && f1109 > 0 { f1109 } else { self.var("F1105") }).ok()
     }
 
-    /// Window offset in 1280x720 units: flt_34D84C[F1106], flt_34D8B8[F1107] (0 out of range).
+    /// Window offset in 1280x720 units: flt_34D84C[F1106], flt_34D8B8[F1107] (0 out of range; Witch on the Holy
+    /// Night's 1024x576-unit tables, `witch::WINDOW_DX` / `WINDOW_DY`).
     fn window_offset(&self) -> (f32, f32) {
         let at = |t: &[f32], w: &str| usize::try_from(self.var(w)).ok().and_then(|i| t.get(i)).copied().unwrap_or(0.0);
+        if self.assets.build == Build::Witch {
+            return (at(&crate::witch::WINDOW_DX, "F1106") * 1.25, at(&crate::witch::WINDOW_DY, "F1107") * 1.25);
+        }
         (at(&WINDOW_DX, "F1106"), at(&WINDOW_DY, "F1107"))
     }
 
@@ -4070,25 +5070,53 @@ impl Game {
         let shown = self.resolve_text(text);
         let runs = text::parse_markup(&shown);
         self.page.visible = true;
+        let i = self.page.msgs.len();
+        self.z_cur = if self.relaying {
+            self.relay_zs.get(i).copied().flatten()
+        } else if self.assets.build == Build::Witch && shown.contains("@z") {
+            let bit = 1u64 << (4 + i).min(63);
+            let fresh = self.z_latch & bit == 0;
+            self.z_latch |= bit;
+            Some(fresh)
+        } else {
+            None
+        };
         // lay out on a scratch copy; restart the page if it overflows
         let (lay, top) = self.text_layout();
         // sub_391A0: in page mode message i of the page starts F(847 + i) lines further down (over 32 counts as
-        // that minus 63, i.e. up), never above the first line; the scripts' WKAD(C847,1) after a message (and
-        // the first SELR of a choice) leave a blank line before the next
-        let extra = if self.page_mode() {
-            match self.var(&format!("F{}", 847 + self.page.msgs.len())) {
-                v if v > 32 => v - 63,
-                v if v >= 1 => v,
-                _ => 0,
-            }
-        } else {
-            0
+        // that minus 63, i.e. up; Witch on the Holy Night's jp_391A0 minus 64), never above the first line; the
+        // scripts' WKAD(C847,1) after a message (and the first SELR of a choice) leave a blank line before the
+        // next
+        let witch = self.assets.build == Build::Witch;
+        let f = if self.page_mode() { self.var(&format!("F{}", 847 + self.page.msgs.len())) } else { 0 };
+        let extra = match f {
+            v if v > 32 => v - if witch { 64 } else { 63 },
+            v if v >= 1 => v,
+            _ => 0,
         };
         let start = if self.page.chars.is_empty() {
             (lay.left, top + extra.max(0) as f32 * lay.line_height)
         } else {
-            let y = self.page.pen.1 + lay.line_height * (1 + extra) as f32 + PARAGRAPH_GAP;
-            (lay.left, y.max(top))
+            let y = (self.page.pen.1 + lay.line_height * (1 + extra) as f32 + PARAGRAPH_GAP).max(top);
+            if runs.iter().any(|r| matches!(r, text::Run::Indent)) {
+                // `@x` (sub_391A0 / jp_391A0: the slot's text has tag 12, sub_A88B0): the slot's base x
+                // (sub_A8190) is the end cursor of the message before (+101024) + 2 units, on that message's
+                // last line (Tsukihime: line - 1; Witch on the Holy Night: line - 1 while F(847 + i) is 0, else
+                // its own line). From the box's right edge on it starts the line after at the left (Tsukihime:
+                // its own line; Witch on the Holy Night: the line after it). Switch: 1_0's 「数分後。」 and the
+                // message after it on one line.
+                let gap = self.page.texts.last().map_or(0.0, |t| text::trailing_gap(&text::parse_markup(&self.resolve_text(t)), lay.spacing));
+                let x = self.page.pen.0 - gap + 2.0 * UX;
+                if x >= lay.right {
+                    (lay.left, if witch { y + lay.line_height } else { y })
+                } else if !witch || f == 0 {
+                    (x, (y - lay.line_height).max(top))
+                } else {
+                    (x, y)
+                }
+            } else {
+                (lay.left, y)
+            }
         };
         let mut placed = Vec::new();
         let mut from = (start, self.page.order);
@@ -4107,8 +5135,10 @@ impl Game {
             self.page.order = order;
         }
         self.page.last_start = from;
-        let fade_frames = self.settings.text_ms[usize::from(self.line_read)] * 1.2;
+        self.arm_wobbles(&mut placed, &[]);
+        let fade_frames = self.read_fade_frames();
         self.page.msgs.push((self.page.chars.len(), shown.trim_end().ends_with("@k"), 0.0, fade_frames));
+        self.page.zs.push(self.z_cur);
         self.page.chars.extend(placed);
         let extra = self.var(&format!("F{}", 847 + self.page.texts.len()));
         self.page.extras.push(extra);
@@ -4133,9 +5163,10 @@ impl Game {
         let runs = text::parse_markup(&shown);
         let (lay, _) = self.text_layout();
         let ((x0, y0), order0) = self.page.last_start;
-        self.page.chars.truncate(first);
+        let old = self.page.chars.split_off(first.min(self.page.chars.len()));
         let mut placed = Vec::new();
         let (x, b, order) = text::layout(self.msg_font(), &lay, &runs, x0, y0, order0, &mut placed);
+        self.arm_wobbles(&mut placed, &old);
         self.page.pen = (x, b);
         self.page.order = order;
         self.page.chars.extend(placed);
@@ -4148,6 +5179,17 @@ impl Game {
             self.page.waiting = true;
             self.wait = Wait::Click;
             self.auto_timer = 0.0;
+        }
+    }
+
+    /// jp_BDC2C's glyph records for a message's new layout: each wobbling glyph draws its phases and rates
+    /// unless the glyph at its index in the message's last layout (`old`) had a record of the same type.
+    fn arm_wobbles(&mut self, placed: &mut [text::PlacedChar], old: &[text::PlacedChar]) {
+        let rng = &mut self.app_rng;
+        for (k, pc) in placed.iter_mut().enumerate() {
+            if let Some(w) = &mut pc.wobble {
+                w.arm(old.get(k).and_then(|o| o.wobble), |a, b| rng.uniform(a, b));
+            }
         }
     }
 
@@ -4184,24 +5226,47 @@ impl Game {
         };
         let mut placed = Vec::new();
         let (mut pen_y, mut order) = (None, 0);
+        // the end cursor of the entry before (`text::trailing_gap`)
+        let mut end_x = None;
+        // each entry's first glyph and edge colour (its own slot's)
+        let mut edges = Vec::new();
         for (i, t) in texts.iter().enumerate() {
+            edges.push((placed.len(), text::text_edge(t)));
             let runs = text::parse_markup(&resolve_refs(&self.assets, t));
             // sub_28470: entry i starts a line pitch below the last one (the first at the top line), then
             // F(847 + i) of its record more lines down when 1..32, or (that - 64) lines when over 32, not above
             // the top line (a choice's first option: the blank line its first SELR asked for)
             let y = pen_y.map_or(top, |y: f32| y + lay.line_height + PARAGRAPH_GAP);
-            let y = match extras.get(i).copied().unwrap_or(0) {
+            let extra = extras.get(i).copied().unwrap_or(0);
+            let y = match extra {
                 v @ 1..=32 => y + v as f32 * lay.line_height,
                 v if v > 32 => (y + (v - 64) as f32 * lay.line_height).max(top),
                 _ => y,
             };
-            let (_, b, o) = text::layout(font, &lay, &runs, lay.left, y, order, &mut placed);
+            // `@x` (sub_A88B0): the end cursor of the entry before + 2 units, a line up while F(847 + i) is below
+            // 32; from the box's right edge on the line after at the left
+            let (x, y) = match end_x {
+                Some(e) if runs.iter().any(|r| matches!(r, text::Run::Indent)) => {
+                    let x: f32 = e + 2.0 * UX;
+                    if x >= lay.right {
+                        (lay.left, y + lay.line_height)
+                    } else if extra < 32 {
+                        (x, y - lay.line_height)
+                    } else {
+                        (x, y)
+                    }
+                }
+                _ => (lay.left, y),
+            };
+            let (px, b, o) = text::layout(font, &lay, &runs, x, y, order, &mut placed);
+            end_x = Some(px - text::trailing_gap(&runs, lay.spacing));
             pen_y = Some(b);
             order = o;
         }
         let mut out = Vec::new();
-        for pc in &placed {
-            Self::rimmed_glyph(font, r, &mut out, pc, 1.0);
+        for (i, pc) in placed.iter().enumerate() {
+            let edge = edges.iter().rev().find(|e| e.0 <= i).map_or([0; 3], |e| e.1);
+            Self::rimmed_glyph_edge(font, r, &mut out, pc, edge, 1.0);
         }
         out.extend(placed.iter().filter_map(|pc| self.bar_quad(pc, None, [1.0; 4], true)));
         out
@@ -4219,17 +5284,23 @@ impl Game {
             return None;
         }
         let slot: u16 = if self.assets.build == Build::Overseas { 82 } else { 79 } + u16::from(edge);
-        let tex = self.disp.get(usize::from(slot - DISP_SLOT0))?;
+        let tex = self.disp.get(usize::from(slot - self.disp_slot0()))?;
         let (rect, [u0, v0, u1, v1]) = bar.rects(pc.x, pc.size, n);
         Some(Quad::rect(tex.clone(), rect, color).with_uv_rect(u0, v0, u1, v1))
     }
 
-    /// A message glyph: white with a dark rim all around.
+    /// A message glyph: white (or its fill code's colour) with a dark rim all around.
     fn rimmed_glyph(font: &mut FontAtlas, r: &Renderer, out: &mut Vec<Quad>, pc: &text::PlacedChar, alpha: f32) {
+        Self::rimmed_glyph_edge(font, r, out, pc, [0; 3], alpha);
+    }
+
+    /// `rimmed_glyph` with the rim in `edge` (the text's edge code's colour, `text::text_edge`).
+    fn rimmed_glyph_edge(font: &mut FontAtlas, r: &Renderer, out: &mut Vec<Quad>, pc: &text::PlacedChar, edge: [u8; 3], alpha: f32) {
         // the edge of font index 1 (`text::edge_rim`) scaled with the glyph, composited with the fill in the
         // shader: sub_391A0 fades a message by one alpha on the whole bordered glyph (Switch fire page: faded
         // line = B + 0.39 (full - B) per pixel), not by fading separately drawn rim and fill quads
-        if let Some(q) = font.rimmed_quad(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, alpha) {
+        let rgb = text::fill_rgb(pc, [1.0; 3]);
+        if let Some(q) = font.rimmed_quad_edge(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, rgb, edge, alpha) {
             out.push(q);
         }
     }
@@ -4246,8 +5317,10 @@ impl Game {
         }
         // the window (F1104 == 0, page mode): image slot WINDOWS[F1105] at its origin + the F1106 / F1107
         // offsets + the MSQK offset, natively sized (0.333 x 0.4148 units per 1920x1080 pixel). Types 0..2
-        // cover the screen at the page alpha * config word 0 (255); type 0 = txtwindow01 (alpha 102/255 in
-        // the middle, falling off to the left and right edges). The bubbles draw at 0.78431 * the page alpha.
+        // cover the screen at the page alpha * the window opacity (Witch on the Holy Night's config word 0x10, 255
+        // at first; 1 in Tsukihime); type 0 = txtwindow01 (alpha 102/255 in
+        // the middle, falling off to the left and right edges). The bubbles draw at 0.78431 * the page alpha
+        // (Witch on the Holy Night's jp_391A0: 1, Switch: the TeaTime bubbles opaque).
         // F822 != 1 draws image slots 10 / 2 instead (sub_B6DE0), which nothing ever fills, so no window
         // shows there (trainscene.mov)
         let (ox, oy) = self.msg_offset();
@@ -4258,10 +5331,12 @@ impl Game {
         if self.page_mode() && self.var("F1104") == 0 {
             let w = self.window_type().and_then(|t| Some((t, self.windows().get(t)?, self.window_image(t)?)));
             if let Some((t, &(_, wx, wy), (slot, sx, sy))) = w
-                && let Some(tex) = self.disp.get(usize::from(slot - DISP_SLOT0))
+                && let Some(tex) = self.disp.get(usize::from(slot - self.disp_slot0()))
             {
                 let (dx, dy) = self.window_offset();
-                let alpha = if t > 2 { 0.78431 } else { 1.0 } * a * layer;
+                // jp_391A0: types 0..2 at the config's window opacity
+                let bubble_alpha = if self.assets.build == Build::Witch { 1.0 } else { 0.78431 };
+                let alpha = if t > 2 { bubble_alpha } else { self.settings.window_alpha } * a * layer;
                 let size = tex.texture.size();
                 let rect = [(wx + dx) * 1.5 + ox, (wy + dy) * 1.5 + oy, size.width as f32 * sx, size.height as f32 * sy];
                 out.push(Quad::rect(tex.clone(), rect, [1.0, 1.0, 1.0, alpha]));
@@ -4269,7 +5344,7 @@ impl Game {
             // F1111 >= 3: a second bubble at its origin + the F1112 / F1113 offsets, also at 0.78431 * alpha
             if let Some(t) = self.second_bubble()
                 && let Some((slot, sx, sy)) = self.window_image(t)
-                && let Some(tex) = self.disp.get(usize::from(slot - DISP_SLOT0))
+                && let Some(tex) = self.disp.get(usize::from(slot - self.disp_slot0()))
             {
                 let at = |t: &[f32], w: &str| usize::try_from(self.var(w)).ok().and_then(|i| t.get(i)).copied().unwrap_or(0.0);
                 let (_, wx, wy) = self.windows()[t];
@@ -4309,10 +5384,25 @@ impl Game {
             let read_alpha = if self.second_bubble().is_some() { 1.0 } else { READ_ALPHA };
             let shift = self.second_bubble_shift();
             let bubble_font = self.window_type().is_some_and(|t| t >= 3);
-            let font = match &mut self.font_bubble {
-                Some(f) if bubble_font => f,
-                _ => &mut self.font,
-            };
+            // the current message in its own slot's colour (jp_6E0D0), the earlier ones in jp_391A0's; the
+            // edge follows the config unless the bubble flags (0x80000) take it off
+            let n_msgs = self.page.msgs.len();
+            let colours: Vec<[f32; 3]> =
+                (0..n_msgs).map(|i| text::rgb565(if i + 1 == n_msgs { self.msg_colour() } else { self.history_colour(i) })).collect();
+            let edge = self.settings.text_edge && !self.witch_bubble_text();
+            // each message's edge colour from an edge code in its text (its slot's +16; Switch, Witch on the Holy
+            // Night's @c5 rhymes: dark blue rims on their own pages, black again on the next message), and whether
+            // the code turns the edge on (Tsukihime's sub_BDC2C: +283 and the edge font index)
+            let slot_edges: Vec<([u8; 3], bool)> = (0..n_msgs)
+                .map(|i| {
+                    let t = self.page.texts.get(i).map_or("", String::as_str);
+                    let forced = text::edge_code(t).is_some() && !crate::assets::witch() && !self.witch_bubble_text();
+                    (text::text_edge(t), forced)
+                })
+                .collect();
+            // (an `@z` message in the shared font too, `Game::z_cur`)
+            let (font_main, font_bubble) = (&mut self.font, &mut self.font_bubble);
+            let zs = &self.page.zs;
             let msgs = &self.page.msgs;
             let cur = msgs.last().map_or(usize::MAX, |m| m.0);
             let fades: Vec<f32> = (0..msgs.len())
@@ -4329,11 +5419,15 @@ impl Game {
                 }
                 let fade = fades.get(m).copied().unwrap_or(1.0);
                 let (sx, sy) = shift.filter(|_| ci >= cur).unwrap_or((0.0, 0.0));
-                let pc = &text::PlacedChar { x: pc.x + ox + sx, baseline: pc.baseline + oy + sy, ..*pc };
+                // jp_C3C24: the glyph's wobble in 1920x1080 pixels
+                let (wx, wy) = pc.wobble.map_or((0.0, 0.0), |w| w.offset());
+                let (wx, wy) = (wx * CANVAS_W as f32 / 1920.0, wy * CANVAS_H as f32 / 1080.0);
+                let pc = &text::PlacedChar { x: pc.x + ox + sx + wx, baseline: pc.baseline + oy + sy + wy, ..*pc };
                 // sub_C6A58: the bar shows (int) revealed - its first character's index cells
+                let rgb = colours.get(m).copied().unwrap_or([1.0; 3]);
                 if pc.bar.is_some() && !self.rewinding {
                     let count = (revealed.floor() - pc.order as f32).max(0.0) as usize;
-                    bars.push((*pc, count, text_a * fade));
+                    bars.push((*pc, count, text_a * fade, rgb));
                 }
                 let mut vis = (revealed - pc.order as f32).clamp(0.0, 1.0);
                 if !self.settings.text_fade_in && vis > 0.0 {
@@ -4344,16 +5438,29 @@ impl Game {
                     continue;
                 }
                 let alpha = vis * text_a * fade;
-                Self::rimmed_glyph(font, r, &mut out, pc, alpha);
+                // a fill code's colour (jp_C3C24's node colour) in place of the slot's
+                let rgb = text::fill_rgb(pc, rgb);
+                let font = match font_bubble.as_mut() {
+                    Some(f) if bubble_font || zs.get(m).copied().flatten().is_some() => f,
+                    _ => &mut *font_main,
+                };
+                if edge || slot_edges[m].1 {
+                    out.extend(font.rimmed_quad_edge(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, rgb, slot_edges[m].0, alpha));
+                } else {
+                    out.extend(font.placed_quad(r, pc, 0.0, 0.0, [rgb[0], rgb[1], rgb[2], alpha]));
+                }
             }
-            // the message text is edged (+101003); the bar takes the slot alpha, not the glyph fade-in
-            for (pc, count, alpha) in bars {
-                out.extend(self.bar_quad(&pc, Some(count), [1.0, 1.0, 1.0, alpha], true));
+            // the message text is edged (+101003) as the config says; the bar takes the slot alpha, not the
+            // glyph fade-in
+            for (pc, count, alpha, rgb) in bars {
+                out.extend(self.bar_quad(&pc, Some(count), [rgb[0], rgb[1], rgb[2], alpha], edge));
             }
             // (sub_38EC0 draws nothing while a rewind runs)
             // (the overseas sub_38EC0 also draws nothing in auto mode, word_1916DEC bit 0)
-            let auto_hidden = self.assets.build == Build::Overseas && self.auto;
-            if self.icon_fade > 0.0 && !self.rewinding && !auto_hidden {
+            let auto_hidden = self.assets.build != Build::Japanese && self.auto;
+            if self.assets.build == Build::Witch {
+                self.witch_icon_quads(&mut out, shift, a * content * layer);
+            } else if self.icon_fade > 0.0 && !self.rewinding && !auto_hidden {
                 // sub_38EC0 at the pen + (2, 3.5) units for the F799 line icon (slot 54, lineBreak_a), (2, 5.5)
                 // for the page icon (slot 55, pageBreak_a, at half alpha); F822 != 1 always the page icon at
                 // (2, 6.5). Window types 3..32 draw slot 56 (pageBreak_ciel_a, 59 frames of 43x46) at (4, 4).
@@ -4385,7 +5492,7 @@ impl Game {
                 // frame ticks, at most 2) and wraps at twice the kind's frames, so each icon starts where the
                 // last one stopped
                 self.icon_ticks = (self.icon_ticks + (self.frame_ms * 0.06).min(2.0)) % (2 * frames) as f32;
-                if let Some(t) = self.disp.get(slot - usize::from(DISP_SLOT0)) {
+                if let Some(t) = self.disp.get(slot - usize::from(self.disp_slot0())) {
                     let frame = (self.icon_ticks / 2.0) as u32 % frames;
                     // the frame rects (dword_572B48, both builds) step one cell a frame, except the page icon's
                     // last, which repeats frame 103: pageBreak_a's 105th cell is empty
@@ -4403,7 +5510,87 @@ impl Game {
         if a <= 0.0 {
             self.choice_quads(r, &mut out, a);
         }
+        // the end of jp_391A0: SEWI's select over everything (sub_656A0)
+        self.wik_quads(r, &mut out);
+        self.teatime_quads(r, &mut out);
+        // sub_1E770 -> sub_1DAE0 (Witch on the Holy Night): XSKR's hold bar in 960x540 units, a grey (0.5) frame
+        // at 820..920 x 510..530 and black over 822 + 96 x held / 180 .. 918 x 512..528
+        let held = self.xskr_hold().floor();
+        if held >= 1.0 {
+            let k = CANVAS_W as f32 / 960.0;
+            let rect = |x0: f32, y0: f32, x1: f32, y1: f32, c: f32| {
+                Quad::rect(r.white.clone(), [x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k], [c, c, c, 1.0])
+            };
+            out.push(rect(820.0, 510.0, 920.0, 530.0, 0.5));
+            out.push(rect(822.0 + held * 96.0 / 180.0, 512.0, 918.0, 528.0, 0.0));
+        }
         out
+    }
+
+    /// The text head's step per frame (sub_81B30), None for instant text: 16.667 / the text ms of the message's
+    /// read state (sub_3B2D0). Witch on the Holy Night (jp_81B30) has one speed for read and unread text, the
+    /// config word 0x20 (0..255, 127 at first), and steps 0.768 x (speed x 0.005 + 0.0768) characters, above 200
+    /// 0.768 x ((speed - 200) / 16 + 1.0768); 255 is instant.
+    fn chars_per_frame(&self, read: usize) -> Option<f32> {
+        if self.assets.build == Build::Witch {
+            let v = self.settings.text_ms[0];
+            return match v {
+                255.0.. => None,
+                201.0.. => Some(0.768 * ((v - 200.0) * 0.0625 + 1.0 + 0.0768)),
+                _ => Some(0.768 * (v * 0.005 + 0.0768)),
+            };
+        }
+        let ms = self.settings.text_ms[read];
+        (ms > 0.0).then(|| FRAME_MS / ms)
+    }
+
+    /// Frames an earlier message on the page takes to fade to its read alpha: the text speed of the current
+    /// message's read state * 1.2 (stage word 870 + i); Witch on the Holy Night's sub_391A0 counts 30 frames
+    /// (stage word 859 + i up to 30, alpha 1 - 155 / 255 * n / 30).
+    fn read_fade_frames(&self) -> f32 {
+        if self.assets.build == Build::Witch {
+            30.0
+        } else {
+            self.settings.text_ms[usize::from(self.line_read)] * 1.2
+        }
+    }
+
+    /// Witch on the Holy Night's click icon (WoH jp_38EC0, called by jp_391A0 only for window types 0..2): the
+    /// line icon (kind F799 0, slot 52 lineBreak_a, 45x45 cells) or the page icon (kind 1, slot 53 pageBreak_a,
+    /// 60x45 cells; always outside page mode), 40 frames of 3 ticks each (dword_3AF4F8 % 120) whose rects
+    /// (dword_3AF4E8 + 262 / + 182 ints) run two rows of 20 cells, at 0.333 x 0.333 units per texture pixel from
+    /// the pen + (2, 6.5) units; nothing in auto mode (byte AE0660 bit 0) or during a rewind.
+    fn witch_icon_quads(&mut self, out: &mut Vec<Quad>, shift: Option<(f32, f32)>, alpha: f32) {
+        if self.icon_fade <= 0.0 || self.rewinding || self.auto {
+            return;
+        }
+        if self.page_mode() && self.window_type().is_some_and(|t| t > 2) {
+            return;
+        }
+        let page_icon = !self.page_mode() || self.wnty == 1;
+        let (slot, (fw, fh), row_gap) = if page_icon { (53, (60.0, 45.0), 50.0) } else { (52, (45.0, 45.0), 56.0) };
+        let (lay, _) = self.text_layout();
+        let (px, py) = self.page.pen;
+        let px = if px > lay.left { px - lay.spacing } else { px };
+        // the cursor jp_C5FB4 stores for English text is half a glyph cell (slot +776) further, as in the
+        // overseas Tsukihime
+        let px = if text::english() { px + lay.size * 0.5 } else { px };
+        let (ux, uy) = ((px / UX).trunc(), ((py - lay.ascent) / UY).trunc());
+        let (sx, sy) = shift.unwrap_or((0.0, 0.0));
+        let (x, y) = ((ux + 2.0) * UX + sx, (uy + 6.5) * UY + sy);
+        self.icon_ticks = (self.icon_ticks + (self.frame_ms * 0.06).min(2.0)) % 120.0;
+        let Some(t) = self.disp.get(usize::from(slot - self.disp_slot0())) else { return };
+        let frame = (self.icon_ticks as u32 / 3) % 40;
+        let (col, row) = ((frame % 20) as f32, (frame / 20) as f32);
+        // the line icon's second row is 44 px high (56..100)
+        let ch = if !page_icon && row > 0.0 { 44.0 } else { fh };
+        let (tw, th) = (t.texture.size().width as f32, t.texture.size().height as f32);
+        let (u0, v0) = (col * fw / tw, row * row_gap / th);
+        let (w, h) = (fw * 0.333 * UX, ch * 0.333 * UY);
+        out.push(
+            Quad::rect(t.clone(), [x, y, w, h], [1.0, 1.0, 1.0, self.icon_fade * alpha])
+                .with_uv_rect(u0, v0, u0 + fw / tw, v0 + ch / th),
+        );
     }
 
     fn load_noise(&mut self, r: &Renderer) {
@@ -4421,7 +5608,8 @@ impl Game {
         use crate::stage::Draw;
         let draws = self.stage.draws(&r.white, &self.border);
         let mut run: Vec<Quad> = Vec::new();
-        let mut clear = Some([0.0, 0.0, 0.0, 1.0]);
+        let b = if self.stage.backdrop_drawn == 1 { 1.0 } else { 0.0 };
+        let mut clear = Some([b, b, b, 1.0]);
         for d in draws {
             let quad = match d {
                 Draw::Stage(q) => {
@@ -4514,11 +5702,26 @@ impl Game {
             Some(t) => {
                 let p = if t.hold { 0.0 } else { (t.t / t.dur).clamp(0.0, 1.0) };
                 let rule = t.rule.clone();
-                r.transition(&mut enc, &self.canvas, &self.old_rt.tex, &self.scene_rt.tex, rule.as_deref(), p);
+                r.transition(&mut enc, &self.canvas, &self.old_rt.tex, &self.scene_rt.tex, rule.as_deref(), p, self.stage.rule_soft);
             }
             None => r.copy_target(&mut enc, &self.scene_rt, &self.canvas),
         }
-        if self.menu_blur.is_some() && !self.menu_captured {
+        let witch = crate::assets::witch();
+        let mut ui = Vec::new();
+        if witch {
+            // WoH's sub_7FCA0 captures target 0 after the text pass: the window and text are blurred with the scene
+            // (Switch: the page's lines show through the system menu's backdrop, blurred)
+            if !self.movie_by_ui {
+                ui.extend(self.movie_quad());
+            }
+            ui.extend(self.story_movie.as_ref().and_then(|t| t.cover_quad(r)));
+            ui.extend(self.ui_quads(r));
+            if !ui.is_empty() {
+                r.draw(&mut enc, &self.canvas, None, &ui);
+                ui.clear();
+            }
+        }
+        if self.menu_blur.is_some() && !self.menu_captured && !witch {
             // sub_A46F0 copies target 0 in the frame the blur starts, before the composites that frame queued:
             // sub_391A0 draws the window and text into layers 29 / 30 and composites them later (sub_B06C0 ->
             // sub_9FAD0's list), but sub_84E50 draws a choice's backdrop straight into target 0. So the capture is
@@ -4535,7 +5738,22 @@ impl Game {
             Some(a) => {
                 let rt = self.menu_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "menu blur"));
                 if !self.menu_captured {
-                    if self.assets.build == knife_core::exe::Build::Overseas {
+                    if witch {
+                        // sub_7FDB0: the capture drawn at 0.25 into the Defocus buffer (jp_A5330(-2)), sub_78810(1.25)'s
+                        // meshes: 2 ceil(3.75) + 1 = 9 copies of the 480 x 270 image shifted by whole pixels, each at
+                        // its gaussian weight, added horizontally then vertically (sub_7C8D0), and the quarter drawn
+                        // back over the screen (jp_A5690, uv 0..0.25)
+                        let (qw, qh) = (CANVAS_W / 4, CANVAS_H / 4);
+                        let [a, b] = self.menu_quarter.get_or_insert_with(|| {
+                            [r.create_target(qw, qh, "backbuffer defocus"), r.create_target(qw, qh, "defocus pass")]
+                        });
+                        let full = Quad::rect(self.canvas.tex.clone(), [0.0, 0.0, qw as f32, qh as f32], [1.0; 4]);
+                        r.draw(&mut enc, a, Some([0.0, 0.0, 0.0, 1.0]), &[full]);
+                        r.blur(&mut enc, &a.tex, b, [1.0, 0.0], 1.25, BlurMode::FullAdd);
+                        r.blur(&mut enc, &b.tex, a, [0.0, 1.0], 1.25, BlurMode::FullAdd);
+                        let up = Quad::rect(a.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
+                        r.draw(&mut enc, rt, Some([0.0, 0.0, 0.0, 1.0]), &[up]);
+                    } else if self.assets.build == knife_core::exe::Build::Overseas {
                         // sub_9EC50 (its sigma argument unused): the capture scaled to the half-size "filter
                         // Defocus" buffer, then sub_9CCD0(1.25)'s meshes, 2 ceil(3.75) + 1 = 9 quads offset
                         // sigma sqrt(2 pi) k / 1920 (/ 1080) in UV, each at its weight, horizontally and then
@@ -4569,13 +5787,17 @@ impl Game {
             }
             None => self.menu_captured = false,
         }
-        let mut ui = Vec::new();
-        if !self.movie_by_ui {
-            ui.extend(self.movie_quad());
+        if !witch {
+            if !self.movie_by_ui {
+                ui.extend(self.movie_quad());
+            }
+            ui.extend(self.story_movie.as_ref().and_then(|t| t.cover_quad(r)));
+            ui.extend(self.ui_quads(r));
         }
-        ui.extend(self.story_movie.as_ref().and_then(|t| t.cover_quad(r)));
-        ui.extend(self.ui_quads(r));
         overlay(self, r, &mut ui);
+        for (rt, clear, quads) in std::mem::take(&mut self.ui_passes) {
+            r.draw(&mut enc, &rt, clear, &quads);
+        }
         if !ui.is_empty() {
             r.draw(&mut enc, &self.canvas, None, &ui);
         }
@@ -4598,8 +5820,10 @@ impl Game {
     /// Whether the game is at a point that can be saved (a message or a choice).
     pub fn can_save(&self) -> bool {
         // a SELS / SELA question is not a resumable point (knife keeps no record kind for it)
-        let choice_ok = self.choice.as_ref().is_some_and(|c| c.kind == ChoiceKind::Page);
-        (self.wait == Wait::Click || (self.wait == Wait::Choice && choice_ok)) && !self.ended
+        // (Witch on the Holy Night writes its snapshot at the WIK select and the TeaTime menu too: sub_65380's
+        // quick save, sub_745E0's save and title buttons)
+        let choice_ok = self.choice.as_ref().is_some_and(|c| c.kind == ChoiceKind::Page || c.kind == ChoiceKind::Wik);
+        (self.wait == Wait::Click || (self.wait == Wait::Choice && choice_ok) || self.wait == Wait::TeaTime) && !self.ended
     }
 
     /// The snapshot a save writes: the save point (see `save_point`). The exe's record (word_F17FF0) is only
@@ -4640,7 +5864,16 @@ impl Game {
                     parent: l.parent,
                     base: l.stage_base(),
                     absolute: l.stage_absolute(),
-                    quake: l.quake.map(|q| (q.mode, q.delay, q.remaining, q.params)),
+                    // Witch on the Holy Night keeps its one slot's stage words in slot 0: mode = type + 1, delay,
+                    // D, then ax, ay, P and the starting D
+                    quake: if self.assets.build == Build::Witch {
+                        let q = &l.wquake;
+                        let [ax, ay, p, d, delay, e] = q.stage;
+                        let set = q.stage != [0; 6] || q.stage_kind != 0;
+                        [(if set { q.stage_kind + 1 } else { 0 }, delay, d, [ax, ay, p, e, 0, 0]), (0, 0, 0, [0; 6])]
+                    } else {
+                        l.quake.map(|q| (q.mode, q.delay, q.remaining, q.params))
+                    },
                     rule: l.rule,
                     rule_flip: l.rule_flip,
                     noise: l.noise,
@@ -4668,6 +5901,8 @@ impl Game {
                     shift: l.stage_shift,
                     tint: (l.stec_mode != 1 && l.stec_color != [1.0; 3]).then_some(l.stec_color),
                     soxy: l.stage_soxy(),
+                    snx4: l.snx4,
+                    wfade: crate::assets::witch().then(|| [l.wfade[0], l.drawn_alpha(), l.wfade[1], i16::from(l.wfade_ease)]),
                 })
             })
             .collect()
@@ -4687,7 +5922,7 @@ impl Game {
             .page
             .texts
             .last()
-            .map(|t| text::note_text(&resolve_refs(&self.assets, t)))
+            .map(|t| resolve_refs(&self.assets, t))
             .unwrap_or_default();
         SaveData {
             version: 1,
@@ -4708,6 +5943,7 @@ impl Game {
             page_texts,
             choice: None,
             bgm: self.sound.bgm_state(),
+            bgm_word: Some(self.sound.bgm_word),
             loops: self
                 .sound
                 .looping_effects()
@@ -4715,6 +5951,7 @@ impl Game {
                 .map(|(channel, name, volume)| SeSave { channel, name, volume })
                 .collect(),
             se_words: self.sound.se_word.to_vec(),
+            se_loops: self.sound.se_loop.to_vec(),
             se_pans: self.sound.se_pan.to_vec(),
             se_queue: self.se_queue_save(),
             timestamp: crate::save::now(),
@@ -5028,7 +6265,14 @@ impl Game {
         // only the stage word: no load writes render +280
         l.rule = ls.rule;
         l.rule_flip = ls.rule_flip;
-        l.quake = ls.quake.map(|(mode, delay, remaining, params)| crate::stage::Quake::restore(mode, delay, remaining, params));
+        if self.assets.build == Build::Witch {
+            let (mode, delay, d, [ax, ay, p, e, ..]) = ls.quake[0];
+            if mode >= 1 {
+                l.wquake = WitchQuake::restore(mode - 1, [ax, ay, p, d, delay, e]);
+            }
+        } else {
+            l.quake = ls.quake.map(|(mode, delay, remaining, params)| crate::stage::Quake::restore(mode, delay, remaining, params));
+        }
         l.blend = match (ls.stbr, ls.blend) {
             (Some(mode), _) if mode >= 0 => blend_mode(mode).0,
             (_, 1) => Blend::Add,
@@ -5062,6 +6306,14 @@ impl Game {
         l.clip = ls.clip.map(|[x, y, w, h, _]| crate::stage::ClipRect { x, y, w, h, ..Default::default() });
         l.clip_inset = ls.clip.map_or(0, |c| c[4] as i16);
         l.snx = [ls.bright.unwrap_or(1.0), ls.contrast.unwrap_or(1.0)];
+        l.snx4 = ls.snx4;
+        // the commit that presents the restored stage goes on with an STGS fade from the saved drawn alpha
+        if let Some([f, c, n, e]) = ls.wfade {
+            (l.wfade, l.wfade_ease) = ([f, n], e as u8);
+            l.rebuild_fade(c);
+        } else {
+            l.wfade = [(ls.alpha * 255.0).round() as i16, 0];
+        }
         l.pending = false;
         Some(l)
     }
@@ -5281,6 +6533,7 @@ impl Game {
             self.sound.stop_all();
         }
         self.choice = None;
+        self.teatime = None;
         self.sel_opts.clear();
         self.trans = None;
         // sub_2EA70(-1) / sub_3C550: the screen shake and the message quake stop
@@ -5289,9 +6542,11 @@ impl Game {
         let noise = self.stage.noise.take();
         // sub_5BAF0 / sub_5D3A0 never write the render rules (+280): a rewind or the seek keeps them
         let rules = std::mem::take(&mut self.stage.rules);
+        let soft = self.stage.rule_soft;
         self.stage = Stage::new();
         self.stage.noise = noise;
         self.stage.rules = rules;
+        self.stage.rule_soft = soft;
         for (k, v) in self.stage.kept.iter_mut().zip(&d.kept) {
             *k = *v;
         }
@@ -5300,6 +6555,8 @@ impl Game {
         for (k, v) in &d.vars {
             self.vars.insert(k.clone(), *v);
         }
+        // the replayed message's icon kind: the page-break flag WNTY kept in F799 (sub_38EA0)
+        self.wnty = self.var("F799");
         // sub_5BAF0: sub_2E430(F1100) restarts the screen effect from the restored words
         self.ghost.set_mode(self.var("F1100"), self.var("F1120") - 127, self.var("F1121"));
         // and sub_86470(stage byte 6569, 0) the FCLN effect
@@ -5311,13 +6568,20 @@ impl Game {
                 self.stage.set(i as i32, l);
             }
         }
-        // sub_5D3A0(0, -1) presents the restored stage
-        self.stage.commit();
+        // sub_5D3A0(0, -1) presents the restored stage, with the record's backdrop word
+        if self.assets.build == Build::Witch {
+            self.stage.backdrop = u8::from(!crate::savedata::witch_dark_scene(d.scene));
+        }
+        self.commit_stage();
         // sub_5BAF0: the SE channels' volume and pan words and their queued key-68 ops come back (a record
         // without them: the reset words, 100 / centre, with the loops' volumes)
         self.sound.se_word = [100; 20];
         self.sound.se_pan = [0; 20];
+        self.sound.se_loop = [false; 20];
         for se in &d.loops {
+            if let Some(f) = usize::try_from(se.channel).ok().and_then(|c| self.sound.se_loop.get_mut(c)) {
+                *f = true;
+            }
             if let Some(w) = usize::try_from(se.channel).ok().and_then(|c| self.sound.se_word.get_mut(c)) {
                 *w = (se.volume * 100.0).round() as i16;
             }
@@ -5327,6 +6591,13 @@ impl Game {
         }
         for (w, &v) in self.sound.se_pan.iter_mut().zip(&d.se_pans) {
             *w = v;
+        }
+        for (f, &v) in self.sound.se_loop.iter_mut().zip(&d.se_loops) {
+            *f = v;
+        }
+        // sub_82330: the BGM volume word comes back with the record
+        if let Some(w) = d.bgm_word.or_else(|| d.bgm.map(|b| (b.1 * if crate::assets::witch() { 255.0 } else { 100.0 }).round() as i16)) {
+            self.sound.bgm_word = w;
         }
         self.se_delayed = d.se_queue.iter().map(|q| (q.clone(), f32::from(q.frames - 1).max(0.0) * 1000.0 / 60.0, true)).collect();
         self.resume_sound(&SoundState {
@@ -5383,6 +6654,8 @@ impl Game {
         self.last_voice = None;
         self.pending_voice = d.voice.clone();
         self.voice_to_play = d.voice.clone();
+        self.log_voice = false;
+        self.since_restore = 0.0;
         if let Some((var, opts)) = &d.choice {
             let opts = opts.iter().map(|(v, t)| ChoiceOpt { value: *v, text: t.clone(), disabled: false }).collect();
             self.start_choice(Choice::new(var.clone(), ChoiceKind::Page, opts));
@@ -5456,13 +6729,16 @@ impl Game {
         self.focus_saved = 0;
         self.stop_movie();
         self.sound.stop_all();
-        // sub_57240: the SE channels' volume words read 100, their pans 0
+        // sub_57240: the SE channels' volume words read 100, their loop flags and pans 0
         self.sound.se_word = [100; 20];
+        self.sound.se_loop = [false; 20];
         self.sound.se_pan = [0; 20];
         // sub_57450 resets every layer field but the anchor (sub_3D70 starts past it)
         let leftovers = self.reset_leftovers();
+        let soft = self.stage.rule_soft;
         self.stage = Stage::new();
         self.stage.kept = leftovers;
+        self.stage.rule_soft = soft;
         self.stage_backup = None;
         // sub_5A880: the page ring and the scene ring start over, the message text goes
         self.scene_ring.clear();
@@ -5482,6 +6758,7 @@ impl Game {
         self.page.dim = 0.0;
         self.page.dim_vel = 0.0;
         self.choice = None;
+        self.teatime = None;
         self.sel_opts.clear();
         self.trans = None;
         self.fads = None;
@@ -5695,6 +6972,11 @@ impl Game {
 
 /// Variable map key. The exe parses `F`, `G` and `Z` names as an array index (sub_59C60), so `G70` and
 /// `G070` are the same word: those keys are normalised to three or more digits.
+/// sub_7EDA0 (Witch on the Holy Night): the rule wipe edge width, 64 for <= 0 or >= 255.
+fn soft_width(v: f32) -> f32 {
+    if v >= 255.0 || v <= 0.0 { 64.0 } else { v }
+}
+
 pub fn var_key(name: &str) -> String {
     let up = name.to_ascii_uppercase();
     match up.as_bytes() {

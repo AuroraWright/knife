@@ -13,29 +13,145 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::save_tables::{F_BITS, F_BYTES, F_WORDS};
+use crate::save_tables::{F_BITS, F_BYTES, F_WORDS, WITCH_F_BITS, WITCH_F_BYTES, WITCH_F_WORDS};
 
-pub const FILE_SIZE: usize = 0x3E7000;
-pub const SLOTS: usize = 140;
-pub const LIST_SLOTS: usize = 100;
-pub const AUTO_FIRST: usize = 100;
-pub const AUTO_COUNT: usize = 39;
-pub const QUICK_SLOT: usize = 139;
+/// A build's save file layout (`lay()`). Witch on the Holy Night (sub_2F560 writes, sub_2F280 reads) keeps
+/// 5976 bytes of system data in a 7168-byte block, then 138 records of 28112 bytes at 7168 + 30208 n (u16 1000,
+/// u16 1, i32 count, a 14528-byte page entry (jp_5A910), the first 0x34C0 bytes of the previous one, the date
+/// at +28040): 0..119 the save list (6 pages of 20, sub_353B0), 120 the quick save (sub_358C0), 121 only
+/// compared (sub_35970), 122 the title's resume record and auto save (sub_35790); nothing uses 123..137.
+pub struct Layout {
+    pub file_size: usize,
+    pub slots: usize,
+    pub list_slots: usize,
+    /// the auto save record(s): Tsukihime's ring of 39 from 100 (newest first), Witch on the Holy Night's 122
+    pub auto_first: usize,
+    pub auto_count: usize,
+    pub quick_slot: usize,
+    rec_base: usize,
+    rec_stride: usize,
+    pub rec_size: usize,
+    pub magic: u16,
+    pub page_size: usize,
+    prev_size: usize,
+    date_at: usize,
+    pub p_type: usize,
+    pub p_bgm: usize,
+    pub p_bgm_vol: usize,
+    pub p_se_id: usize,
+    pub p_stage: usize,
+    pub p_stage_prev: usize,
+    pub stage_size: usize,
+    pub p_f_words: usize,
+    pub p_f_bits: usize,
+    pub p_f_bytes: usize,
+    pub p_voice: usize,
+    pub p_voice_speaker: usize,
+    pub p_text: usize,
+    pub p_se_vol: usize,
+    pub p_se_loop: usize,
+    pub p_se_pan: usize,
+    pub p_se_state: usize,
+    f_words: &'static [u16],
+    f_bits: &'static [u16],
+    f_bytes: &'static [u16],
+    /// system block (`rec_base` bytes): config, progress words (G), seen bitmap, read keys, the CONTINUE / save
+    /// list cursor
+    pub sys_config: usize,
+    pub config_size: usize,
+    pub sys_g: usize,
+    pub g_words: usize,
+    pub sys_seen: usize,
+    pub seen_bytes: usize,
+    pub sys_read: usize,
+    pub sys_continue: usize,
+    pub st: StageLayout,
+}
 
-const REC_BASE: usize = 6144;
-const REC_STRIDE: usize = 0x7200;
-pub const REC_SIZE: usize = 0x7140;
-pub const RECORD_MAGIC: u16 = 1010;
-/// page-ring entry (off_AE0478, 800 x 15016 bytes) inside a record
-pub const PAGE_AT: usize = 8;
-pub const PAGE_SIZE: usize = 15016;
-/// i32 rewind-ring count min(ring index + 1, 1) and the ring entry it counts (first 0x3688 bytes)
-const COUNT_AT: usize = 4;
-const PREV_AT: usize = PAGE_AT + PAGE_SIZE;
-const PREV_SIZE: usize = 0x3688;
-const DATE_AT: usize = 0x7138;
+/// The stage block (struct of arrays over 40 layers; STCC resets a layer).
+pub struct StageLayout {
+    /// i16 image table index (-1 none)
+    pub image: usize,
+    /// u8 flags: 0x40 SACL absolute
+    pub flags: usize,
+    /// i8 STBR blend mode (-1 none)
+    pub blend: usize,
+    /// f32 position in 640x480 units (script x * 0.5, y * 2/3)
+    pub x: usize,
+    pub y: usize,
+    /// i16 alpha 0..255
+    pub alpha: usize,
+    /// i16 STCP priority
+    pub prio: usize,
+    /// i32 STRT rotation (1/100 degree)
+    pub rot: usize,
+    /// i16 STCH zoom x1000
+    pub zoom: usize,
+    /// f32 image anchor: ImageInfo fields 13 / 14 truncated toward zero (cmd_STCH_impl)
+    pub anchor_x: usize,
+    pub anchor_y: usize,
+    /// i16 words a reset leaves at 1000 and -1
+    pub w_1000: usize,
+    pub w_neg: usize,
+    /// i16 STZ4 zoom x / y x1000
+    pub zoom_x: usize,
+    pub zoom_y: usize,
+    /// i16 STCH arg 11 parent (-1 none)
+    pub parent: usize,
+    /// i16 STTR (rule - 1) | (b << 12) (-1 none)
+    pub rule: usize,
+    /// i16 SBAS transform base (-1 none); Witch on the Holy Night stubs SBAS and has no such word
+    pub base: Option<usize>,
+    /// i16 SOXY draw offset x (1920-wide pixels / 3) and y (x 0.41481)
+    pub soxy_x: usize,
+    pub soxy_y: usize,
+    /// i16 x 4 clip x, y, w, h (STCH args 12..15)
+    pub clip: usize,
+    /// i16 scissor inset (STCH arg 16, motion field 16)
+    pub clip_inset: usize,
+    /// i8 inset mode (STCH arg 17, motion field 15)
+    pub clip_mode: usize,
+    /// i16 STRR / STCH arg 19 clip rotation (1/100 degree, -32768 = follow the layer rotation)
+    pub rot2: usize,
+    /// 12 bytes motion state: u16 id, u16, i32 frame, u8 paused
+    pub motion: usize,
+    /// Tsukihime's quake slots (sub_63520; sub_5D3A0 restores both): slot 0 SQK2 (mode 1), slot 1 SSW2
+    /// (mode 3) / mode 2. u8 mode per slot, i16 fade frames, i16 remaining frames (-1 forever), 6 x i16
+    /// parameters.
+    pub qk_mode: usize,
+    pub qk_fade: usize,
+    pub qk_dur: usize,
+    pub qk_param: usize,
+    /// Witch on the Holy Night's one quake slot (`stage::WitchQuake`): i16 ax, ay, P, D, delay, starting D
+    /// (40 words apart), u8 type
+    pub wq: usize,
+    pub wq_type: usize,
+    /// STNS grain value and its draw mode (Tsukihime: 1 when n > 2, else 3; Witch on the Holy Night sub_10640)
+    pub noise: usize,
+    pub noise_mode: usize,
+    /// i16 STEC mode (1 = colour fill)
+    pub effect: usize,
+    /// f32 x 4: SNX2 brightness (1 + v / 255), SNX3 contrast (1 + v / 100), SNX4's two values (Witch on the
+    /// Holy Night; 0 in Tsukihime)
+    pub tone: usize,
+    /// 18 bytes: i16 0, i16 -anchor x, i16 -anchor y, rgb fill (STEC colour, ff = none), rgb, 6 x 0
+    pub extra: usize,
+    /// Witch on the Holy Night's STGS words: i16 start and current alpha, i16 frames (sub_13ED0 rebuilds the
+    /// fade from them on a load; STCH sets both alphas to the layer's and 0 frames)
+    pub alpha_fade: Option<usize>,
+    /// layer-independent tail: +0 the backdrop colour index (Witch on the Holy Night: 0 black for the scenes
+    /// of `witch_dark_scene`, else 1 white; Tsukihime: always 0), the FCLN byte, the 0x78 byte (sub_1DC40)
+    pub globals: usize,
+    /// i8 FCLN effect (sub_92120; 0 after FCSP), restarted by the load replay
+    pub focus: usize,
+    pub glob_78: usize,
+}
 
-// ---- page entry fields (sub_5A910 / sub_5BAF0) --------------------------------------------------
+pub const LAYERS: usize = 40;
+pub const SE_STATE_IDLE: [u8; 20] = [0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+pub const SE_CHANNELS: usize = 20;
+
+// ---- page entry fields both builds share (sub_5A910 / sub_5BAF0) ---------------------------------
 /// i64 script offset of the `;` before the command the entry was taken at
 pub const P_OFFSET: usize = 8;
 /// i64 script offset just past that command
@@ -48,124 +164,256 @@ pub const P_READ_SUB: usize = 28;
 /// u8 speaker of the last message (off_AE0590) and of the pending voice (off_AE08B8; sub_2360 index)
 pub const P_SPEAKER_LAST: usize = 30;
 pub const P_SPEAKER_NEXT: usize = 31;
-/// u16 entry type: 0 message, 1 stage change, 2 BGM, 3 SE, 6 auto save, 12 / 13 choice
-pub const P_TYPE: usize = 32;
-/// i16 BGM number (-1 none) and volume (`017, 0..100) (word_146E654 / word_146E650, MPLY sub_649E0)
-pub const P_BGM: usize = 34;
-pub const P_BGM_VOL: usize = 36;
-/// i16 x 20: looping sound effect of each channel, SE_NAMES index (-1 none) (off_AE0960)
-pub const P_SE_ID: usize = 38;
-/// stage block (off_AE0250) and the copy taken before the first change since the last commit (off_AE08D0)
-pub const P_STAGE: usize = 80;
-pub const P_STAGE_PREV: usize = 6664;
-pub const STAGE_SIZE: usize = 0x19B8;
-pub const P_F_WORDS: usize = 13314;
-pub const P_F_BITS: usize = 13442;
-pub const P_F_BYTES: usize = 13449;
-/// i32 voice id of the message (sub_23C0, -1 none; sub_6E0D0 from off_AE08B0) and i16 its speaker (-1 in
-/// entries that are not messages)
-pub const P_VOICE: usize = 13752;
-pub const P_VOICE_SPEAKER: usize = 13756;
-/// 0x200 bytes: raw text argument of the current message (byte_146EC28)
-pub const P_TEXT: usize = 13956;
-/// u8 x 20: SE channel volumes (0..100), then u8 x 20 SE channel loop flags
-pub const P_SE_VOL: usize = 14468;
-pub const P_SE_LOOP: usize = 14489;
-/// i16 x 20: SE channel pans (x 1000, byte_146E640 + 220)
-pub const P_SE_PAN: usize = 14510;
-/// 20 x 20 bytes: each SE channel's queued key-68 command (byte_146E640 + 1112 + 20 ch, sub_66200; reset
-/// pattern below): i16 frames, i16 sound id, i32 key 1, u8 type, i8 key 17, u8, u8 loop, i16 key 18, i16,
-/// i32 key 70
-pub const P_SE_STATE: usize = 14612;
-pub const SE_STATE_IDLE: [u8; 20] = [0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
-pub const SE_CHANNELS: usize = 20;
+/// i32 rewind-ring count min(ring index + 1, 1) and the ring entry it counts
+const COUNT_AT: usize = 4;
+/// page-ring entry inside a record
+pub const PAGE_AT: usize = 8;
 
-// ---- stage block (struct of arrays over 40 layers; STCC sub_62140 resets a layer) ---------------
-pub const LAYERS: usize = 40;
-pub mod st {
-    /// i16 image table index (-1 none)
-    pub const IMAGE: usize = 4;
-    /// u8 flags: 0x40 SACL absolute
-    pub const FLAGS: usize = 84;
-    /// i8 STBR blend mode (-1 none)
-    pub const BLEND: usize = 124;
-    /// f32 position in 640x480 units (script x * 0.5, y * 2/3)
-    pub const X: usize = 164;
-    pub const Y: usize = 324;
-    /// i16 alpha 0..255
-    pub const ALPHA: usize = 484;
-    /// i16 STCP priority
-    pub const PRIO: usize = 564;
-    /// i32 STRT rotation (1/100 degree)
-    pub const ROT: usize = 644;
-    /// i16 STCH zoom x1000
-    pub const ZOOM: usize = 804;
-    /// f32 image anchor: ImageInfo fields 13 / 14 truncated toward zero (cmd_STCH_impl)
-    pub const ANCHOR_X: usize = 884;
-    pub const ANCHOR_Y: usize = 1044;
-    pub const W1204: usize = 1204;
-    pub const W1924: usize = 1924;
-    /// i16 STZ4 zoom x / y x1000
-    pub const ZOOM_X: usize = 2004;
-    pub const ZOOM_Y: usize = 2084;
-    /// i16 STCH arg 11 parent (-1 none)
-    pub const PARENT: usize = 2204;
-    /// i16 STTR (rule - 1) | (b << 12) (-1 none)
-    pub const RULE: usize = 2284;
-    /// i16 SBAS transform base (-1 none)
-    pub const BASE: usize = 2364;
-    /// i16 SOXY args 3 / 4: draw offset x (1920-wide pixels / 3) and y (x 0.41481)
-    pub const SOXY_X: usize = 2444;
-    pub const SOXY_Y: usize = 2524;
-    /// i16 x 4 clip x, y, w, h (STCH args 12..15)
-    pub const CLIP: usize = 2604;
-    /// i16 scissor inset (STCH arg 16, motion field 16)
-    pub const CLIP_INSET: usize = 2924;
-    /// i8 inset mode (STCH arg 17, motion field 15)
-    pub const CLIP_MODE: usize = 3004;
-    /// i16 STRR / STCH arg 19 clip rotation (1/100 degree, -32768 = follow the layer rotation)
-    pub const ROT2: usize = 3044;
-    /// 12 bytes motion state: u16 id, u16, i32 frame, u8 paused
-    pub const MOTION: usize = 3124;
-    /// quake slots (sub_63520; sub_5D3A0 restores both): slot 0 SQK2 (mode 1), slot 1 SSW2 (mode 3) /
-    /// mode 2. u8 mode per slot, i16 fade frames, i16 remaining frames (-1 forever), 6 x i16 parameters.
-    pub const QK_MODE: usize = 3604;
-    pub const QK_FADE: usize = 3684;
-    pub const QK_DUR: usize = 3844;
-    pub const QK_PARAM: usize = 4004;
-    /// STNS grain value and its draw mode (1 when n > 2, else 3)
-    pub const NOISE: usize = 5044;
-    pub const NOISE_MODE: usize = 5084;
-    /// i16 STEC mode (1 = colour fill)
-    pub const EFFECT: usize = 5124;
-    /// f32 x 4: SNX2 brightness (1 + v / 255), SNX3 contrast (1 + v / 100), 0, 0
-    pub const TONE: usize = 5204;
-    /// 18 bytes: i16 0, i16 -anchor x, i16 -anchor y, rgb fill (STEC colour, ff = none), rgb, 6 x 0
-    pub const EXTRA: usize = 5844;
-    /// layer-independent tail (tone table, FCLN, quake): 6564..6584
-    pub const GLOBALS: usize = 6564;
-    /// i8 FCLN effect (sub_92120; 0 after FCSP), restarted by the load replay
-    pub const FOCUS: usize = 6569;
+/// Tsukihime: a 0x3E7000-byte image: 6144 bytes of system data at 0 (5952 used; sub_4EC60 writes, sub_4EA30
+/// loads), then 140 records of 0x7200 bytes (0x7140 used) at 6144 + 0x7200 n. A record is a copy of the save
+/// snapshot word_F17FF0: u16 1010, u16 1 (non-zero = slot in use), i32 count of choice-ring entries, the
+/// 15016-byte page-ring entry being saved (sub_5A910 layout), the first 0x3688 bytes of the previous choice-ring
+/// entry, and the date at +0x7138. Records 0..99 are the save list, 100..138 the auto save ring (newest at
+/// 100), 139 the quick save.
+pub static JAPANESE: Layout = Layout {
+    file_size: 0x3E7000,
+    slots: 140,
+    list_slots: 100,
+    auto_first: 100,
+    auto_count: 39,
+    quick_slot: 139,
+    rec_base: 6144,
+    rec_stride: 0x7200,
+    rec_size: 0x7140,
+    magic: 1010,
+    page_size: 15016,
+    prev_size: 0x3688,
+    date_at: 0x7138,
+    // u16 entry type: 0 message, 1 stage change, 2 BGM, 3 SE, 6 auto save, 12 / 13 choice
+    p_type: 32,
+    // i16 BGM number (-1 none) and volume (`017, 0..100) (word_146E654 / word_146E650, MPLY sub_649E0)
+    p_bgm: 34,
+    p_bgm_vol: 36,
+    // i16 x 20: looping sound effect of each channel, SE_NAMES index (-1 none) (off_AE0960)
+    p_se_id: 38,
+    // stage block (off_AE0250) and the copy taken before the first change since the last commit (off_AE08D0)
+    p_stage: 80,
+    p_stage_prev: 6664,
+    stage_size: 0x19B8,
+    p_f_words: 13314,
+    p_f_bits: 13442,
+    p_f_bytes: 13449,
+    // i32 voice id of the message (sub_23C0, -1 none; sub_6E0D0 from off_AE08B0) and i16 its speaker (-1 in
+    // entries that are not messages)
+    p_voice: 13752,
+    p_voice_speaker: 13756,
+    // 0x200 bytes: raw text argument of the current message (byte_146EC28)
+    p_text: 13956,
+    // u8 x 20: SE channel volumes (0..100), then u8 x 20 SE channel loop flags
+    p_se_vol: 14468,
+    p_se_loop: 14489,
+    // i16 x 20: SE channel pans (x 1000, byte_146E640 + 220)
+    p_se_pan: 14510,
+    // 20 x 20 bytes: each SE channel's queued key-68 command (byte_146E640 + 1112 + 20 ch, sub_66200; reset
+    // pattern SE_STATE_IDLE): i16 frames, i16 sound id, i32 key 1, u8 type, i8 key 17, u8, u8 loop, i16 key 18,
+    // i16, i32 key 70
+    p_se_state: 14612,
+    f_words: &F_WORDS,
+    f_bits: &F_BITS,
+    f_bytes: &F_BYTES,
+    sys_config: 4,
+    config_size: 104,
+    // 500 i16 progress words (off_AE04E0): word 5 movie flags, 110+ RDST, 300+ RDED, 400+ edges
+    sys_g: 108,
+    g_words: 500,
+    // seen bitmap (off_AE07A8, 531 bytes): images by sub_774F0 bit, BGM n at bit 3200 + n
+    sys_seen: 1108,
+    seen_bytes: 531,
+    // read keys (off_AE0350 + 13, 4020 bytes): highest message sub-index read per `_ZMsss..`
+    sys_read: 1639,
+    sys_continue: 5662,
+    st: StageLayout {
+        image: 4,
+        flags: 84,
+        blend: 124,
+        x: 164,
+        y: 324,
+        alpha: 484,
+        prio: 564,
+        rot: 644,
+        zoom: 804,
+        anchor_x: 884,
+        anchor_y: 1044,
+        w_1000: 1204,
+        w_neg: 1924,
+        zoom_x: 2004,
+        zoom_y: 2084,
+        parent: 2204,
+        rule: 2284,
+        base: Some(2364),
+        soxy_x: 2444,
+        soxy_y: 2524,
+        clip: 2604,
+        clip_inset: 2924,
+        clip_mode: 3004,
+        rot2: 3044,
+        motion: 3124,
+        qk_mode: 3604,
+        qk_fade: 3684,
+        qk_dur: 3844,
+        qk_param: 4004,
+        wq: 0,
+        wq_type: 0,
+        noise: 5044,
+        noise_mode: 5084,
+        effect: 5124,
+        tone: 5204,
+        extra: 5844,
+        alpha_fade: None,
+        globals: 6564,
+        focus: 6569,
+        glob_78: 6572,
+    },
+};
+
+/// Witch on the Holy Night (see `Layout`): the page entry moves the type and the sound words 4 bytes on (the
+/// ring serial at +4 is an i32), keeps the BGM volume as 255 x percent / 100 at +13276, and its stage block
+/// (0x18C0 bytes) has its own field order.
+pub static WITCH: Layout = Layout {
+    file_size: 0x3FB800,
+    slots: 138,
+    list_slots: 120,
+    auto_first: 122,
+    auto_count: 1,
+    quick_slot: 120,
+    rec_base: 7168,
+    rec_stride: 30208,
+    rec_size: 28112,
+    magic: 1000,
+    page_size: 14528,
+    prev_size: 0x34C0,
+    date_at: 28040,
+    p_type: 36,
+    p_bgm: 38,
+    p_bgm_vol: 13276,
+    p_se_id: 40,
+    p_stage: 84,
+    p_stage_prev: 6420,
+    stage_size: 0x18C0,
+    p_f_words: 12826,
+    p_f_bits: 12954,
+    p_f_bytes: 12961,
+    p_voice: 13264,
+    p_voice_speaker: 13268,
+    p_text: 14016,
+    p_se_vol: 13282,
+    p_se_loop: 13303,
+    p_se_pan: 13324,
+    p_se_state: 13424,
+    f_words: &WITCH_F_WORDS,
+    f_bits: &WITCH_F_BITS,
+    f_bytes: &WITCH_F_BYTES,
+    sys_config: 4,
+    config_size: 320,
+    // 330 words; sub_2F280 ORs the words of off_632680 into the file's and the game's
+    sys_g: 324,
+    g_words: 330,
+    // images below 3200 by jp_644A0's base image, BGM n <= 0x207 at bit 3200 + n (jp_77740)
+    sys_seen: 984,
+    seen_bytes: 524,
+    sys_read: 1508,
+    // u16 save list page and index of the newest list record (sub_2F560 mode 2; the save screen's cursor)
+    sys_continue: 5528,
+    st: StageLayout {
+        image: 4,
+        flags: 84,
+        blend: 124,
+        x: 164,
+        y: 324,
+        alpha: 484,
+        prio: 724,
+        rot: 804,
+        zoom: 964,
+        anchor_x: 1044,
+        anchor_y: 1204,
+        w_1000: 1684,
+        w_neg: 2484,
+        zoom_x: 2564,
+        zoom_y: 2644,
+        parent: 2764,
+        rule: 2844,
+        base: None,
+        soxy_x: 2924,
+        soxy_y: 3004,
+        clip: 3084,
+        clip_inset: 3404,
+        clip_mode: 3484,
+        rot2: 3524,
+        motion: 3604,
+        qk_mode: 0,
+        qk_fade: 0,
+        qk_dur: 0,
+        qk_param: 0,
+        wq: 4084,
+        wq_type: 4564,
+        noise: 4684,
+        noise_mode: 4724,
+        effect: 4764,
+        tone: 4844,
+        extra: 5484,
+        alpha_fade: Some(2244),
+        globals: 6204,
+        focus: 6236,
+        glob_78: 6244,
+    },
+};
+
+/// The save layout of the loaded build.
+pub fn lay() -> &'static Layout {
+    if crate::assets::witch() { &WITCH } else { &JAPANESE }
 }
 
-/// Default stage block: every layer as STCC leaves it.
+/// The stage layout of the loaded build.
+pub fn st() -> &'static StageLayout {
+    &lay().st
+}
+
+/// Witch on the Holy Night's scenes that keep the black backdrop (jp_48AC0 sets stage word 0x183C to 0 for
+/// them, 1 for every other scene, each story frame; sub_3E130 hands it to sub_13A60: clear colour off_6327E0
+/// entry 0 black / 1 white).
+pub fn witch_dark_scene(scene: usize) -> bool {
+    matches!(
+        scene,
+        6..=11 | 0x3B | 0x42 | 0x49 | 0x4A | 0x81..=0x87 | 0x89 | 0x8A | 0xA3 | 0xBB | 0xC0 | 0xC5 | 0xD0 | 0xD2 | 0xD5 | 0xD8 | 0xF7
+    )
+}
+
+/// Default stage block: every layer as a stage reset leaves it (Tsukihime sub_57450, Witch on the Holy Night
+/// jp_57450; the backup copy's backdrop word is 0, the stage's 1).
 pub fn empty_stage() -> Vec<u8> {
-    let mut s = vec![0u8; STAGE_SIZE];
+    let (l, st) = (lay(), st());
+    let mut s = vec![0u8; l.stage_size];
     s[0..2].copy_from_slice(&(-1i16).to_le_bytes());
-    for l in 0..LAYERS {
-        put_i16(&mut s, st::IMAGE + 2 * l, -1);
-        s[st::BLEND + l] = 0xff;
-        for (o, v) in [(st::ZOOM, 1000), (st::W1204, 1000), (st::W1924, -1), (st::ZOOM_X, 1000), (st::ZOOM_Y, 1000)] {
-            put_i16(&mut s, o + 2 * l, v);
+    for i in 0..LAYERS {
+        put_i16(&mut s, st.image + 2 * i, -1);
+        s[st.blend + i] = 0xff;
+        for (o, v) in [(st.zoom, 1000), (st.w_1000, 1000), (st.w_neg, -1), (st.zoom_x, 1000), (st.zoom_y, 1000)] {
+            put_i16(&mut s, o + 2 * i, v);
         }
-        for o in [st::PARENT, st::RULE, st::BASE] {
-            put_i16(&mut s, o + 2 * l, -1);
+        for o in [st.parent, st.rule].into_iter().chain(st.base) {
+            put_i16(&mut s, o + 2 * i, -1);
         }
-        put_f32(&mut s, st::TONE + 16 * l, 1.0);
-        put_f32(&mut s, st::TONE + 16 * l + 4, 1.0);
-        s[st::EXTRA + 18 * l + 6..st::EXTRA + 18 * l + 9].fill(0xff);
+        put_f32(&mut s, st.tone + 16 * i, 1.0);
+        put_f32(&mut s, st.tone + 16 * i + 4, 1.0);
+        s[st.extra + 18 * i + 6..st.extra + 18 * i + 9].fill(0xff);
     }
-    s[st::GLOBALS + 8] = 0x78;
+    s[st.glob_78] = 0x78;
+    if crate::assets::witch() {
+        // the global zoom words 0x183E..0x1850: 0, 0, 1000, 320, 224, 0 x 3, 1000
+        for (o, v) in [(6, 1000), (8, 320), (10, 224), (18, 1000)] {
+            put_i16(&mut s, st.globals + o, v);
+        }
+    }
     s
 }
 
@@ -202,105 +450,130 @@ pub fn clamp16(v: i32) -> i16 {
     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// The F variables a page entry keeps, as (index, value).
+/// The F variables a page entry keeps, as (index, value), in the order the restore writes them (sub_82330 /
+/// jp_82330: words, low bytes, flags), each F once with the value it ends with.
 pub fn read_f(page: &[u8]) -> Vec<(u16, i16)> {
-    let mut v = Vec::with_capacity(F_WORDS.len() + F_BITS.len() + F_BYTES.len());
-    for (k, &n) in F_WORDS.iter().enumerate() {
-        v.push((n, get_i16(page, P_F_WORDS + 2 * k)));
+    let l = lay();
+    let mut v: Vec<(u16, i16)> = Vec::with_capacity(l.f_words.len() + l.f_bits.len() + l.f_bytes.len());
+    let mut put = |n: u16, x: i16| match v.iter_mut().find(|e| e.0 == n) {
+        Some(e) => e.1 = x,
+        None => v.push((n, x)),
+    };
+    for (k, &n) in l.f_words.iter().enumerate() {
+        put(n, get_i16(page, l.p_f_words + 2 * k));
     }
-    for (k, &n) in F_BITS.iter().enumerate() {
-        v.push((n, i16::from(page[P_F_BITS + k / 8] >> (k % 8) & 1)));
+    for (k, &n) in l.f_bytes.iter().enumerate() {
+        put(n, i16::from(page[l.p_f_bytes + k]));
     }
-    for (k, &n) in F_BYTES.iter().enumerate() {
-        v.push((n, i16::from(page[P_F_BYTES + k])));
+    for (k, &n) in l.f_bits.iter().enumerate() {
+        put(n, i16::from(page[l.p_f_bits + k / 8] >> (k % 8) & 1));
     }
     v
 }
 
 /// Set or clear flag `n` of a page's F subset (sub_53F00; no-op for words outside the flag list).
 pub fn set_f_bit(page: &mut [u8], n: u16, on: bool) {
-    if let Some(k) = F_BITS.iter().position(|&b| b == n) {
+    let l = lay();
+    if let Some(k) = l.f_bits.iter().position(|&b| b == n) {
         let m = 1 << (k % 8);
         if on {
-            page[P_F_BITS + k / 8] |= m;
+            page[l.p_f_bits + k / 8] |= m;
         } else {
-            page[P_F_BITS + k / 8] &= !m;
+            page[l.p_f_bits + k / 8] &= !m;
         }
     }
 }
 
 /// Store the F subset (sub_5A910): words whole, flags as bits (non-zero), the rest as their low byte.
 pub fn write_f(page: &mut [u8], f: impl Fn(u16) -> i16) {
-    for (k, &n) in F_WORDS.iter().enumerate() {
-        put_i16(page, P_F_WORDS + 2 * k, f(n));
+    let l = lay();
+    for (k, &n) in l.f_words.iter().enumerate() {
+        put_i16(page, l.p_f_words + 2 * k, f(n));
     }
-    page[P_F_BITS..P_F_BYTES].fill(0);
-    for (k, &n) in F_BITS.iter().enumerate() {
+    page[l.p_f_bits..l.p_f_bytes].fill(0);
+    for (k, &n) in l.f_bits.iter().enumerate() {
         if f(n) != 0 {
-            page[P_F_BITS + k / 8] |= 1 << (k % 8);
+            page[l.p_f_bits + k / 8] |= 1 << (k % 8);
         }
     }
-    for (k, &n) in F_BYTES.iter().enumerate() {
-        page[P_F_BYTES + k] = f(n) as u8;
+    for (k, &n) in l.f_bytes.iter().enumerate() {
+        page[l.p_f_bytes + k] = f(n) as u8;
     }
 }
 
-/// A fresh page entry with the reset values of sub_82330.
+/// A fresh page entry with the reset values of sub_82330 (Witch on the Holy Night: the BGM volume word 255).
 pub fn empty_page() -> Vec<u8> {
-    let mut p = vec![0u8; PAGE_SIZE];
-    put_i16(&mut p, P_BGM, -1);
+    let l = lay();
+    let mut p = vec![0u8; l.page_size];
+    put_i16(&mut p, l.p_bgm, -1);
+    if crate::assets::witch() {
+        put_i16(&mut p, l.p_bgm_vol, 255);
+    }
     for ch in 0..SE_CHANNELS {
-        put_i16(&mut p, P_SE_ID + 2 * ch, -1);
-        p[P_SE_VOL + ch] = 100;
-        p[P_SE_STATE + 20 * ch..P_SE_STATE + 20 * (ch + 1)].copy_from_slice(&SE_STATE_IDLE);
+        put_i16(&mut p, l.p_se_id + 2 * ch, -1);
+        p[l.p_se_vol + ch] = 100;
+        p[l.p_se_state + 20 * ch..l.p_se_state + 20 * (ch + 1)].copy_from_slice(&SE_STATE_IDLE);
     }
     let stage = empty_stage();
-    p[P_STAGE..P_STAGE + STAGE_SIZE].copy_from_slice(&stage);
-    p[P_STAGE_PREV..P_STAGE_PREV + STAGE_SIZE].copy_from_slice(&stage);
-    put_i32(&mut p, P_VOICE, -1);
+    p[l.p_stage..l.p_stage + l.stage_size].copy_from_slice(&stage);
+    p[l.p_stage_prev..l.p_stage_prev + l.stage_size].copy_from_slice(&stage);
+    put_i32(&mut p, l.p_voice, -1);
     p
 }
 
 /// Wrap a page entry into a record dated `ts` (local seconds, `save::now`).
-/// `prev`: the newest rewind-ring entry before this page (sub_527F0 stores count 1 and its first 0x3688
-/// bytes; count 0 and no entry when the ring is empty).
+/// `prev`: the newest rewind-ring entry before this page (sub_527F0 stores count 1 and its first bytes; count 0
+/// and no entry when the ring is empty).
 pub fn record(page: &[u8], prev: Option<&[u8]>, ts: u64) -> Vec<u8> {
-    let mut r = vec![0u8; REC_SIZE];
-    r[0..2].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    let l = lay();
+    let prev_at = PAGE_AT + l.page_size;
+    let mut r = vec![0u8; l.rec_size];
+    r[0..2].copy_from_slice(&l.magic.to_le_bytes());
     r[2..4].copy_from_slice(&1u16.to_le_bytes());
-    r[PAGE_AT..PAGE_AT + PAGE_SIZE].copy_from_slice(page);
+    r[PAGE_AT..PAGE_AT + l.page_size].copy_from_slice(page);
     if let Some(p) = prev {
         r[COUNT_AT..COUNT_AT + 4].copy_from_slice(&1i32.to_le_bytes());
-        r[PREV_AT..PREV_AT + PREV_SIZE].copy_from_slice(&p[..PREV_SIZE]);
+        r[prev_at..prev_at + l.prev_size].copy_from_slice(&p[..l.prev_size]);
     }
     let (y, mo, d, h, mi, s) = civil(ts);
-    r[DATE_AT..DATE_AT + 2].copy_from_slice(&(y as u16).to_le_bytes());
-    r[DATE_AT + 2..DATE_AT + 7].copy_from_slice(&[mo as u8, d as u8, h as u8, mi as u8, s as u8]);
+    r[l.date_at..l.date_at + 2].copy_from_slice(&(y as u16).to_le_bytes());
+    r[l.date_at + 2..l.date_at + 7].copy_from_slice(&[mo as u8, d as u8, h as u8, mi as u8, s as u8]);
     r
 }
 
-/// The page entry of a record in use (u16 1010 header).
+/// The page entry of a record in use (the build's magic: 1010, Witch on the Holy Night 1000).
 pub fn page_of(rec: &[u8]) -> Option<&[u8]> {
-    (get_u16(rec, 0) == RECORD_MAGIC && get_u16(rec, 2) != 0).then(|| &rec[PAGE_AT..PAGE_AT + PAGE_SIZE])
+    let l = lay();
+    (get_u16(rec, 0) == l.magic && get_u16(rec, 2) != 0).then(|| &rec[PAGE_AT..PAGE_AT + l.page_size])
 }
 
 /// The previous rewind-ring entry of a record as a full page entry, as a load puts it back (sub_82330): the
-/// stored 0x3688 bytes with the text cleared; the rest (SE state) is the reset page's.
+/// stored bytes with the text cleared; the rest (SE state) is the reset page's.
 pub fn prev_of(rec: &[u8]) -> Option<Vec<u8>> {
     page_of(rec)?;
     if get_i32(rec, COUNT_AT) < 1 {
         return None;
     }
+    let l = lay();
+    let prev_at = PAGE_AT + l.page_size;
     let mut p = empty_page();
-    p[..PREV_SIZE].copy_from_slice(&rec[PREV_AT..PREV_AT + PREV_SIZE]);
-    p[P_TEXT] = 0;
+    p[..l.prev_size].copy_from_slice(&rec[prev_at..prev_at + l.prev_size]);
+    p[l.p_text] = 0;
     Some(p)
 }
 
 /// Record date as local seconds (`save::now`).
+/// A record's date as stored at +28040: u16 year, then month, day, hour, minute, second.
+pub fn record_date(rec: &[u8]) -> [u16; 6] {
+    let at = lay().date_at;
+    let f = &rec[at + 2..at + 7];
+    [get_u16(rec, at), f[0].into(), f[1].into(), f[2].into(), f[3].into(), f[4].into()]
+}
+
 pub fn record_time(rec: &[u8]) -> u64 {
-    let y = get_u16(rec, DATE_AT) as i64;
-    let f = &rec[DATE_AT + 2..DATE_AT + 7];
+    let at = lay().date_at;
+    let y = get_u16(rec, at) as i64;
+    let f = &rec[at + 2..at + 7];
     let (mo, d) = (f[0] as i64, f[1] as i64);
     // days-from-civil (Howard Hinnant)
     let y2 = if mo <= 2 { y - 1 } else { y };
@@ -328,18 +601,9 @@ fn civil(ts: u64) -> (i64, i64, i64, i64, i64, i64) {
 }
 
 // ---- system block ----------------------------------------------------------------------------------
-pub const SYS_CONFIG: usize = 4;
-pub const CONFIG_SIZE: usize = 104;
-/// 500 i16 progress words (off_AE04E0): word 5 movie flags, 110+ RDST, 300+ RDED, 400+ edges
-pub const SYS_G: usize = 108;
-pub const G_WORDS: usize = 500;
-/// seen bitmap (off_AE07A8, 531 bytes): images by sub_774F0 bit, BGM n at bit 3200 + n
-pub const SYS_SEEN: usize = 1108;
-pub const SEEN_BYTES: usize = 531;
-/// read keys (off_AE0350 + 13, 4020 bytes): highest message sub-index read per `_ZMsss..`
-pub const SYS_READ: usize = 1639;
+/// read keys (off_AE0350 + 13, 4020 bytes): highest message sub-index read per `_ZMsss..`, both builds
 pub const READ_KEYS: usize = 4020;
-pub const SYS_CONTINUE: usize = 5662;
+pub const CONFIG_SIZE: usize = 104;
 /// static config defaults (0x46B080, written by sub_2C810)
 pub const CONFIG_DEFAULTS: [u8; CONFIG_SIZE] = [
     0xff, 0, 0, 0, 40, 0, 100, 0, 40, 0, 10, 0, 0, 0, 35, 0, 15, 0, 0xff, 0xff, 1, 0, 0, 0, 0, 0, 0, 0, 0x98, 0x08, 1, 0,
@@ -347,6 +611,81 @@ pub const CONFIG_DEFAULTS: [u8; CONFIG_SIZE] = [
     50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 50, 0, 0, 0, 0xb8, 0x0b, 0, 0,
     0, 0, 0, 1, 0, 0, 0, 0,
 ];
+/// Witch on the Holy Night's config defaults (0x2EB0B0, 320 bytes; offsets in `wcfg`)
+#[rustfmt::skip]
+pub const WITCH_CONFIG_DEFAULTS: [u8; 320] = [
+    0xff, 0, 2, 0, 0, 0, 0x7f, 0, 1, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0, 0, 0x7f, 0, 0x7f, 0, 0x7f, 0, 0x7f, 0, 0, 0, 0, 0,
+    0x7f, 0, 0x7f, 0, 0xff, 0xff, 1, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x3f,
+    3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0,
+    0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x64, 0, 0x80, 0x3c, 0x36, 0xfe, 0, 0, 1, 0, 0, 0, 1, 0,
+    0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// The build's initial config block.
+pub fn config_defaults() -> Vec<u8> {
+    if crate::assets::witch() { WITCH_CONFIG_DEFAULTS.to_vec() } else { CONFIG_DEFAULTS.to_vec() }
+}
+
+/// The config language word's offset in the build's config block.
+pub fn language_at() -> usize {
+    if crate::assets::witch() { wcfg::LANGUAGE } else { cfg::LANGUAGE }
+}
+
+/// Witch on the Holy Night's config words (sub_10130 applies them, sub_10470 / sub_D700 store them).
+pub mod wcfg {
+    /// i16 0..255 sliders through sub_FF70's curve (k at 127, 255 at 255): BGM (k 102), voice (96), SE (102),
+    /// system SE (32), movie (0x54, 102); sub_10130 keeps 100 x curve / 255 percent (AE0350 + 8 / + 9 / + 10
+    /// / + 11 / + 7)
+    pub const BGM: usize = 0x14;
+    pub const VOICE: usize = 0x16;
+    pub const SE: usize = 0x18;
+    pub const SYS_SE: usize = 0x1A;
+    pub const MOVIE: usize = 0x54;
+    /// i16 text speed 0..255 (255 instant; jp_81B30 / jp_82170)
+    pub const TEXT_SPEED: usize = 0x20;
+    /// i16 game language (-1 the system's)
+    pub const LANGUAGE: usize = 0x24;
+    /// i16 auto mode wait level 0..255: 510 - 2 v frames at a click wait (jp_81B30)
+    pub const AUTO_WAIT: usize = 0x2E;
+    /// i16 skip only read text (jp_40ED0)
+    pub const SKIP_READ_ONLY: usize = 0x30;
+    /// u32 voice rows on (bit r, 15 rows; sub_76440)
+    pub const VOICE_BITS: usize = 0x3C;
+    /// i16 the voice stops on advance (jp_802C0)
+    pub const VOICE_STOP: usize = 0x4E;
+    /// i16 the message glyph edge (sub_A7790 -> sub_9D6DC / sub_9D704; config page case 3)
+    pub const TEXT_EDGE: usize = 0x26;
+    /// i16 the message colour mode (jp_6E0D0, jp_391A0, jp_40ED0; config page case 5): 1 read text 0xDC6D
+    pub const TEXT_COLOUR: usize = 0x2A;
+    /// i16 the message window's opacity 0..255 (jp_391A0: x / 255 for window types 0..2; the config's
+    /// transparency slider is 255 - it)
+    pub const WINDOW_ALPHA: usize = 0x10;
+    /// i16 BGM auto adjust: the BGM ducks while a voice plays (jp_48AC0)
+    pub const BGM_AUTO: usize = 0x1C;
+    /// i16 the mode panel's previous / next scene buttons (jp_4E170); only the defaults write it (1)
+    pub const SCENE_JUMP: usize = 0x32;
+    /// i16 the button help balloons (jp_ADC40)
+    pub const HELP: usize = 0x34;
+    /// i16 the voices' master switch: 0 mutes every scene voice (jp_6E0D0 / jp_6E950) and the backlog's
+    /// replay (sub_A700); nothing in the config pages shows it, only the voice page's reset writes it (1)
+    pub const VOICE_ALL: usize = 0x36;
+    /// i16 skip mode stops at a choice (jp_83E50)
+    pub const CHOICE_SKIP_STOP: usize = 0x44;
+    /// i16 x 15 voice row volumes, percent (sub_76440: x the voice slider / 255)
+    pub const CHAR_VOICE: usize = 0x76;
+    pub const VOICE_ROWS: usize = 15;
+}
+
+/// sub_FF70's slider curve: 0..127 -> 0..k, 127..255 -> k..255.
+pub fn witch_curve(v: i16, k: i32) -> i32 {
+    let v = i32::from(v);
+    if v > 127 { k + (v - 127) * (k ^ 0xff) / 128 } else { k * v / 127 }
+}
 
 /// Config byte offsets (sub_2A730 stores the config screen objects; sub_2A550 loads them).
 pub mod cfg {
@@ -380,6 +719,8 @@ pub mod cfg {
     /// u16 all voices (radio 91: 100, else 0), u16 stop voice on advance (radio 93)
     pub const VOICE_ALL: usize = 6;
     pub const VOICE_STOP: usize = 46;
+    /// u16 the message glyph edge and shadow (sub_A7790 -> sub_C1060 / sub_C1074)
+    pub const TEXT_EDGE: usize = 20;
     /// u16 x 19 character voice volumes 0..100 (objects 99 + 5i), u32 voice enable bits (mute 97 + 5i clears)
     pub const CHAR_VOICE: usize = 52;
     pub const VOICE_BITS: usize = 36;
@@ -411,22 +752,23 @@ fn system_language() -> i16 {
 impl SaveFile {
     /// An empty file: no records, default config, no CONTINUE record.
     pub fn new() -> Self {
-        let mut buf = vec![0u8; FILE_SIZE];
-        buf[SYS_CONFIG..SYS_CONFIG + CONFIG_SIZE].copy_from_slice(&CONFIG_DEFAULTS);
+        let l = lay();
+        let mut buf = vec![0u8; l.file_size];
+        buf[l.sys_config..l.sys_config + l.config_size].copy_from_slice(&config_defaults());
         put_i16(&mut buf, 2, 1);
-        // sub_4EA30 fills a negative language word from the system language (sub_2DE00)
-        put_i16(&mut buf, SYS_CONFIG + cfg::LANGUAGE, system_language());
+        // sub_4EA30 (jp_2F280) fills a negative language word from the system language (sub_2DE00)
+        put_i16(&mut buf, l.sys_config + language_at(), system_language());
         Self { buf }
     }
 
     /// The config language word (sub_2DE70 resolves it, `Assets::resolve_language`).
     pub fn language(&self) -> i16 {
-        get_i16(&self.buf, SYS_CONFIG + cfg::LANGUAGE)
+        get_i16(&self.buf, lay().sys_config + language_at())
     }
 
     /// Set the config language word (the overseas config's language buttons, sub_2D910 state 10).
     pub fn set_language(&mut self, word: i16) {
-        put_i16(&mut self.buf, SYS_CONFIG + cfg::LANGUAGE, word);
+        put_i16(&mut self.buf, lay().sys_config + language_at(), word);
     }
 
     pub fn path() -> PathBuf {
@@ -435,17 +777,18 @@ impl SaveFile {
 
     pub fn load_from(path: &Path) -> Result<Self> {
         let buf = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if buf.len() != FILE_SIZE {
-            bail!("{}: {} bytes, expected {FILE_SIZE}", path.display(), buf.len());
+        let l = lay();
+        if buf.len() != l.file_size {
+            bail!("{}: {} bytes, expected {}", path.display(), buf.len(), l.file_size);
         }
         let mut f = Self { buf };
         // the system block counts only when u16 +2 is set (sub_4EA30)
         if get_u16(&f.buf, 2) == 0 {
             let fresh = Self::new();
-            f.buf[..REC_BASE].copy_from_slice(&fresh.buf[..REC_BASE]);
+            f.buf[..l.rec_base].copy_from_slice(&fresh.buf[..l.rec_base]);
         }
-        if get_i16(&f.buf, SYS_CONFIG + cfg::LANGUAGE) < 0 {
-            put_i16(&mut f.buf, SYS_CONFIG + cfg::LANGUAGE, system_language());
+        if f.language() < 0 {
+            f.set_language(system_language());
         }
         Ok(f)
     }
@@ -479,25 +822,26 @@ impl SaveFile {
     }
 
     fn rec_range(n: usize) -> std::ops::Range<usize> {
-        let o = REC_BASE + REC_STRIDE * n;
-        o..o + REC_SIZE
+        let l = lay();
+        let o = l.rec_base + l.rec_stride * n;
+        o..o + l.rec_size
     }
 
     /// Record n when its slot is in use (u16 +2 non-zero, sub_52BF0).
     pub fn record(&self, n: usize) -> Option<&[u8]> {
-        (n < SLOTS)
+        (n < lay().slots)
             .then(|| &self.buf[Self::rec_range(n)])
             .filter(|r| get_u16(r, 0) != 0 && get_u16(r, 2) != 0)
     }
 
     /// sub_4EEB0: the manual records (0..100) whose u16 +2 is set; the title opens on LOAD GAME when any is.
     pub fn manual_count(&self) -> usize {
-        (0..AUTO_FIRST).filter(|&n| get_u16(&self.buf[Self::rec_range(n)], 2) != 0).count()
+        (0..lay().list_slots).filter(|&n| get_u16(&self.buf[Self::rec_range(n)], 2) != 0).count()
     }
 
     pub fn set_record(&mut self, n: usize, rec: &[u8]) {
         let r = Self::rec_range(n);
-        self.buf[r].copy_from_slice(&rec[..REC_SIZE]);
+        self.buf[r].copy_from_slice(&rec[..lay().rec_size]);
     }
 
     /// sub_50FC0 state 23 (overseas): a deleted record's magic, used word and date (u32 at +0x7138 and
@@ -505,62 +849,91 @@ impl SaveFile {
     pub fn delete_record(&mut self, n: usize) {
         let r = Self::rec_range(n);
         self.buf[r.start..r.start + 4].fill(0);
-        self.buf[r.start + DATE_AT..r.start + DATE_AT + 7].fill(0);
+        let at = r.start + lay().date_at;
+        self.buf[at..at + 7].fill(0);
     }
 
-    /// sub_52AA0: records 100..137 move up one (138 drops out) to make room for a new auto save at 100.
+    /// sub_52AA0: records 100..137 move up one (138 drops out) to make room for a new auto save at 100
+    /// (Witch on the Holy Night overwrites its one auto save record).
     pub fn shift_auto(&mut self) {
-        for k in (AUTO_FIRST..AUTO_FIRST + AUTO_COUNT - 1).rev() {
+        let l = lay();
+        for k in (l.auto_first..l.auto_first + l.auto_count - 1).rev() {
             let (src, dst) = (Self::rec_range(k), Self::rec_range(k + 1));
             self.buf.copy_within(src, dst.start);
         }
     }
 
     pub fn config(&self) -> &[u8] {
-        &self.buf[SYS_CONFIG..SYS_CONFIG + CONFIG_SIZE]
+        let l = lay();
+        &self.buf[l.sys_config..l.sys_config + l.config_size]
     }
 
     pub fn config_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[SYS_CONFIG..SYS_CONFIG + CONFIG_SIZE]
+        let l = lay();
+        &mut self.buf[l.sys_config..l.sys_config + l.config_size]
     }
 
     pub fn g(&self, n: usize) -> i16 {
-        get_i16(&self.buf, SYS_G + 2 * n)
+        get_i16(&self.buf, lay().sys_g + 2 * n)
     }
 
     pub fn set_g(&mut self, n: usize, v: i16) {
-        put_i16(&mut self.buf, SYS_G + 2 * n, v);
+        put_i16(&mut self.buf, lay().sys_g + 2 * n, v);
     }
 
     pub fn seen(&self) -> &[u8] {
-        &self.buf[SYS_SEEN..SYS_SEEN + SEEN_BYTES]
+        let l = lay();
+        &self.buf[l.sys_seen..l.sys_seen + l.seen_bytes]
     }
 
     pub fn seen_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[SYS_SEEN..SYS_SEEN + SEEN_BYTES]
+        let l = lay();
+        &mut self.buf[l.sys_seen..l.sys_seen + l.seen_bytes]
     }
 
     pub fn read_keys(&self) -> &[u8] {
-        &self.buf[SYS_READ..SYS_READ + READ_KEYS]
+        let at = lay().sys_read;
+        &self.buf[at..at + READ_KEYS]
     }
 
     pub fn read_keys_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[SYS_READ..SYS_READ + READ_KEYS]
+        let at = lay().sys_read;
+        &mut self.buf[at..at + READ_KEYS]
     }
 
     /// sub_4EC60 mode 2: CONTINUE resumes the newest record of 0..138 (never the quick save; the first of
-    /// equal dates), 0 when there is none.
+    /// equal dates), 0 when there is none. Witch on the Holy Night's sub_2F560 mode 2 keeps the newest of the
+    /// list records 0..119 as a save screen page (0..5) and index (0..19), 0 / 0 when there is none.
     pub fn update_continue(&mut self) {
-        let newest = (0..QUICK_SLOT)
+        let l = lay();
+        let end = if crate::assets::witch() { l.list_slots } else { l.quick_slot };
+        let newest = (0..end)
             .filter_map(|n| self.record(n).map(|r| (record_time(r), std::cmp::Reverse(n))))
             .max()
             .map_or(0, |(_, n)| n.0);
-        put_i16(&mut self.buf, SYS_CONTINUE, newest as i16);
+        if crate::assets::witch() {
+            put_i16(&mut self.buf, l.sys_continue, (newest / 20) as i16);
+            put_i16(&mut self.buf, l.sys_continue + 2, (newest % 20) as i16);
+        } else {
+            put_i16(&mut self.buf, l.sys_continue, newest as i16);
+        }
     }
 
-    pub fn continue_slot(&self) -> Option<usize> {
-        usize::try_from(get_i16(&self.buf, SYS_CONTINUE)).ok().filter(|&n| self.record(n).is_some())
+    /// Witch on the Holy Night's save screen cursor at install (sub_2F280(0)): the newest list record's page
+    /// and index as sub_2F560 mode 2 keeps them.
+    pub fn continue_cursor(&self) -> (i16, i16) {
+        let at = lay().sys_continue;
+        (get_i16(&self.buf, at).clamp(0, 5), get_i16(&self.buf, at + 2).clamp(0, 19))
     }
+
+    /// The record the title's CONTINUE resumes: Tsukihime's newest (`update_continue`), Witch on the Holy
+    /// Night's auto save record 122 (sub_35790).
+    pub fn continue_slot(&self) -> Option<usize> {
+        let l = lay();
+        let n = if crate::assets::witch() { l.auto_first as i16 } else { get_i16(&self.buf, l.sys_continue) };
+        usize::try_from(n).ok().filter(|&n| self.record(n).is_some())
+    }
+
 }
 
 impl Default for SaveFile {
@@ -578,7 +951,7 @@ mod tests {
         let ts = 1_792_390_104; // 2026-10-19 06:08:24 UTC
         let page = empty_page();
         let r = record(&page, None, ts);
-        assert_eq!(&r[DATE_AT..DATE_AT + 7], &[0xEA, 0x07, 10, 19, 6, 8, 24]);
+        assert_eq!(&r[JAPANESE.date_at..JAPANESE.date_at + 7], &[0xEA, 0x07, 10, 19, 6, 8, 24]);
         assert_eq!(record_time(&r), ts);
         assert_eq!(get_i32(&r, COUNT_AT), 0);
         assert!(prev_of(&r).is_none());
@@ -589,19 +962,19 @@ mod tests {
         let page = empty_page();
         let mut prev = empty_page();
         put_i16(&mut prev, P_SCENE, 12);
-        prev[P_TEXT] = b'x';
+        prev[JAPANESE.p_text] = b'x';
         let r = record(&page, Some(&prev), 0);
         assert_eq!(get_i32(&r, COUNT_AT), 1);
         let p = prev_of(&r).unwrap();
-        assert_eq!((get_i16(&p, P_SCENE), p[P_TEXT]), (12, 0));
+        assert_eq!((get_i16(&p, P_SCENE), p[JAPANESE.p_text]), (12, 0));
     }
 
     #[test]
     fn fresh_file_and_continue() {
         let mut f = SaveFile::new();
         // a fresh Switch profile (savedata000_introvideo): CONTINUE 0, word_F1F43C 0, language 0
-        assert_eq!((get_i16(&f.buf, SYS_CONTINUE), get_i16(&f.buf, SYS_CONTINUE + 4)), (0, 0));
-        assert_eq!(get_i16(&f.buf, SYS_CONFIG + cfg::LANGUAGE), 0);
+        assert_eq!((get_i16(&f.buf, JAPANESE.sys_continue), get_i16(&f.buf, JAPANESE.sys_continue + 4)), (0, 0));
+        assert_eq!(f.language(), 0);
         assert_eq!(f.continue_slot(), None);
         let page = empty_page();
         f.set_record(5, &record(&page, None, 100));
@@ -632,5 +1005,67 @@ mod tests {
         });
         let f: std::collections::HashMap<u16, i16> = read_f(&page).into_iter().collect();
         assert_eq!((f[&22], f[&110], f[&998], f[&201], f[&23]), (7, 486, 1, 0xff, 0));
+    }
+
+    /// Runs `f` with the Witch on the Holy Night layout selected.
+    fn witch<T>(f: impl FnOnce() -> T) -> T {
+        crate::assets::TEST_WITCH.set(true);
+        let r = f();
+        crate::assets::TEST_WITCH.set(false);
+        r
+    }
+
+    #[test]
+    fn witch_layout_fits() {
+        for l in [&JAPANESE, &WITCH] {
+            assert!(l.rec_base + l.rec_stride * (l.slots - 1) + l.rec_size <= l.file_size);
+            assert!(PAGE_AT + l.page_size + l.prev_size <= l.date_at && l.date_at + 7 <= l.rec_size);
+            assert!(l.p_stage + l.stage_size <= l.p_stage_prev && l.p_stage_prev + l.stage_size <= l.prev_size);
+            assert!(l.p_text + 0x200 <= l.page_size);
+        }
+        witch(|| {
+            let f = SaveFile::new();
+            assert_eq!(f.buf.len(), 0x3FB800);
+            // the BGM volume word of a fresh entry, and the WoH extras of an empty stage
+            assert_eq!(get_i16(&empty_page(), WITCH.p_bgm_vol), 255);
+            assert_eq!(get_i16(&empty_stage(), WITCH.st.globals + 6), 1000);
+        });
+    }
+
+    #[test]
+    fn witch_record_and_continue() {
+        witch(|| {
+            let page = empty_page();
+            let r = record(&page, Some(&page), 1_792_390_104);
+            assert_eq!(&r[WITCH.date_at..WITCH.date_at + 7], &[0xEA, 0x07, 10, 19, 6, 8, 24]);
+            assert_eq!((get_i32(&r, COUNT_AT), record_time(&r)), (1, 1_792_390_104));
+            let mut f = SaveFile::new();
+            f.set_record(45, &record(&page, None, 100));
+            f.set_record(3, &record(&page, None, 50));
+            // a quick / auto record does not move the save list cursor
+            f.set_record(WITCH.quick_slot, &record(&page, None, 200));
+            f.update_continue();
+            assert_eq!((get_i16(&f.buf, WITCH.sys_continue), get_i16(&f.buf, WITCH.sys_continue + 2)), (2, 5));
+            // CONTINUE resumes the auto save record
+            assert_eq!(f.continue_slot(), None);
+            f.set_record(WITCH.auto_first, &record(&page, None, 10));
+            assert_eq!(f.continue_slot(), Some(122));
+        });
+    }
+
+    #[test]
+    fn witch_f_subset_round_trip() {
+        witch(|| {
+            let mut page = empty_page();
+            write_f(&mut page, |n| match n {
+                3 => 486,
+                298 => 7,
+                998 => 1,
+                _ => 0,
+            });
+            let f: std::collections::HashMap<u16, i16> = read_f(&page).into_iter().collect();
+            assert_eq!((f[&3], f[&298], f[&998], f[&110]), (486, 7, 1, 0));
+            assert_eq!(get_i16(&page, WITCH.p_f_words + 2 * 3), 486);
+        });
     }
 }

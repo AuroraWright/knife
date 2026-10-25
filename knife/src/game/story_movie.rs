@@ -31,6 +31,9 @@ pub(super) struct StoryMovie {
     cover: f32,
     /// the game language (the overseas prologue times its skip check and fade-out for English)
     language: usize,
+    /// Witch on the Holy Night's opening task (kind 0: init sub_21AD0, update sub_21BE0, no draw, end
+    /// sub_21DE0)
+    witch: bool,
 }
 
 impl StoryMovie {
@@ -47,7 +50,17 @@ impl StoryMovie {
             pressed: false,
             cover: if entry | 0x20 == 0x25 { 1.0 } else { 0.0 },
             language,
+            witch: false,
         }
+    }
+
+    /// Witch on the Holy Night's opening task: no watched flag, no cover, and B / Plus always counts.
+    pub(super) fn witch_opening(language: usize) -> Self {
+        Self { witch: true, skippable: true, ..Self::new(-1, -1, language, None, true) }
+    }
+
+    pub(super) fn is_witch(&self) -> bool {
+        self.witch
     }
 
     /// Fade-in rate, fade-out start frame and fade-out rate per frame (sub_40480 v7 / v5 / v4).
@@ -82,6 +95,9 @@ impl StoryMovie {
 
     /// The cover drawn over the movie (sub_40940).
     pub(super) fn cover_quad(&self, r: &Renderer) -> Option<Quad> {
+        if self.witch {
+            return None;
+        }
         let a = 1.0 - self.vis;
         (a > 0.0).then(|| {
             let c = self.cover;
@@ -104,6 +120,9 @@ impl Game {
 
     /// Returns true when the task ends (sub_3F4A0).
     fn step_story_movie(&mut self, t: &mut StoryMovie, dt: f32) -> bool {
+        if t.witch {
+            return self.step_witch_opening(t, dt);
+        }
         let Some(m) = &self.movie else { return true };
         let (fade_in, out_at, fade_out) = t.rates();
         let frames = dt * 0.06;
@@ -204,6 +223,76 @@ impl Game {
                     t.state = 6;
                     return false;
                 }
+            }
+        }
+    }
+
+    /// Witch on the Holy Night's sub_21BE0, counting frames (a1+52) from the movie's start: B / Plus is taken
+    /// from frame 240; at frame 11249 (or once the movie stops, or after a press) SE01004 starts looping on
+    /// channel 2; a press then fades the BGM out (jp_9C9B0(0.55556)) and jumps the movie to 193 s (sub_15B0),
+    /// and the task ends once the movie has closed. Returns true when it ends (jp_3F4A0).
+    fn step_witch_opening(&mut self, t: &mut StoryMovie, dt: f32) -> bool {
+        let Some(m) = &self.movie else { return true };
+        // sub_1A30: the player runs; jp_19E0: it is still open
+        let (ready, playing) = (m.ready(), !m.closed);
+        t.frame += dt * 0.06;
+        let pressed = t.pressed;
+        loop {
+            match t.state {
+                // jp_B4540, then on into state 1
+                0 => t.state = 1,
+                1 => {
+                    if ready {
+                        t.frame = 0.0;
+                        t.skip_req = false;
+                        t.state = 2;
+                    }
+                    return false;
+                }
+                2 => {
+                    if t.frame >= 240.0 {
+                        t.state = 3;
+                    }
+                    return false;
+                }
+                3 => {
+                    if !playing || t.frame > 11249.0 {
+                        t.state = 4;
+                        continue;
+                    }
+                    if pressed {
+                        t.skip_req = true;
+                        t.state = 4;
+                    }
+                    return false;
+                }
+                4 => {
+                    // jp_9CF30(2, 1); jp_9CBF0(2, 2, SE01004, 50, 0, 0.1): the player's own loop at 50, rising
+                    // 0.1 points a frame (its nn::atk fade 1000 frames)
+                    if let Some(pcm) = self.assets.sound_effect("SE01004") {
+                        self.sound.play_se(2, "SE01004", pcm, 0.5, 1666.7 / 0.1 / 1000.0, true, 0.0);
+                        self.sound.unlist_loop(2);
+                    }
+                    t.state = if playing { 5 } else { 6 };
+                    return false;
+                }
+                5 => {
+                    if !playing {
+                        self.sound.stop_bgm_rate(0.55556);
+                        t.state = 6;
+                    } else if t.frame >= 11580.0 {
+                        t.state = 6;
+                    } else if t.skip_req || pressed {
+                        self.sound.stop_bgm_rate(0.55556);
+                        if let Some(m) = &mut self.movie {
+                            m.seek(193.0);
+                        }
+                        self.sound.seek_movie_audio(193.0);
+                        t.state = 6;
+                    }
+                    return false;
+                }
+                _ => return !playing,
             }
         }
     }

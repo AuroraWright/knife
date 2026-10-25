@@ -37,7 +37,8 @@ enum Cmd {
         all: bool,
     },
     /// Write the executable ranges knife uses (knife_core::exe::Layout::bundled) as knife's bundled tables
-    /// (knife/data/exe_tables_overseas.bin for switch_exefs_eng/uncompressed_main)
+    /// (knife/data/exe_tables_overseas.bin for switch_exefs_eng/uncompressed_main, exe_tables_witch.bin for
+    /// switch_exefs_woh/uncompressed_main)
     ExeTables {
         #[arg(long, default_value = "switch_exefs/uncompressed_main")]
         exe: PathBuf,
@@ -93,9 +94,14 @@ fn main() -> Result<()> {
                 for im in &t.images {
                     println!("{} {} {} {} {} {}", im.name, im.width, im.height, im.center_x, im.center_y, im.kind);
                 }
+                for (i, id) in t.scene_ids.iter().enumerate() {
+                    println!("scene {i} id {id}");
+                }
             } else {
                 for i in [0usize, 604, 2352, 10780] {
-                    println!("{:?}", t.images[i]);
+                    if let Some(im) = t.images.get(i) {
+                        println!("{im:?}");
+                    }
                 }
             }
         }

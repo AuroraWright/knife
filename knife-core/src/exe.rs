@@ -16,6 +16,9 @@ use anyhow::{Context, Result, bail};
 pub enum Build {
     Japanese,
     Overseas,
+    /// Witch on the Holy Night (`witch_na.nss`, Release_NA, NintendoSDK 14.3.0): the same engine running another
+    /// game, with Japanese, English, Simplified / Traditional Chinese and Korean data (`jallpac` archives).
+    Witch,
 }
 
 /// Where a build keeps the tables knife reads.
@@ -26,27 +29,29 @@ pub struct Layout {
     image_names: u64,
     image_info: u64,
     image_count: usize,
-    /// STRA haze parameters (sub_91520): 10 floats per id, ids 1..=557.
+    /// STRA haze parameters (sub_91520): 10 floats per id, ids 1..=haze_count.
     haze: u64,
-    /// u16 scene ids
+    pub haze_count: usize,
+    /// u16 scene ids (scene_load's search runs over scene_count of them)
     scene_ids: u64,
+    pub scene_count: usize,
     /// STMA motion keys (64-byte records), motion key ends and lengths (u32 per motion id) and field masks
     /// (u64 per motion id, sub_99960; overseas sub_97070).
     pub motion_keys: u64,
     pub motion_ends: u64,
     pub motion_lens: u64,
     pub motion_masks: u64,
+    /// key records (sub_9A010's bound + 1), motion ids (ends / lengths, sub_9A060's bound) and mask entries
+    /// (sub_99960's bound + 1)
+    pub motion_key_count: usize,
+    pub motion_count: usize,
+    pub motion_mask_count: usize,
     /// nn::font's line breaking (sub_148988, UAX #14): u16 first code point, u8 length - 1, u8 class per range
     /// (LINE_BREAK_RANGES), and the 30 x 30 i32 class pair table it uses (a4 byte 5 clear; JP 0x3D3AE4)
     pub line_break_classes: u64,
     pub line_break_pairs: u64,
 }
 
-pub const HAZE_COUNT: usize = 557;
-const SCENE_ID_COUNT: usize = 549;
-pub const MOTION_KEY_COUNT: usize = 0x118E1;
-pub const MOTION_COUNT: usize = 0xBD * 128;
-pub const MOTION_MASK_COUNT: usize = 0x5E81;
 /// sub_148988's binary search runs over entries 0..1986.
 pub const LINE_BREAK_RANGES: usize = 1986;
 pub const LINE_BREAK_CLASSES: usize = 30;
@@ -58,11 +63,16 @@ pub const JAPANESE: Layout = Layout {
     image_info: 0x46f830,
     image_count: 14713,
     haze: 0x352bd4,
+    haze_count: 557,
     scene_ids: 0x350D58,
+    scene_count: 549,
     motion_keys: 0x65CE18,
     motion_ends: 0x3B1940,
     motion_lens: 0x399F40,
     motion_masks: 0x36AB38,
+    motion_key_count: 0x118E1,
+    motion_count: 0xBD * 128,
+    motion_mask_count: 0x5E81,
     line_break_classes: 0x3D0DCA,
     line_break_pairs: 0x3D3AE4,
 };
@@ -77,24 +87,57 @@ pub const OVERSEAS: Layout = Layout {
     image_info: 0x35F0B8,
     image_count: 14744,
     haze: 0x23761C,
+    haze_count: 557,
     scene_ids: 0x235744,
+    scene_count: 549,
     motion_keys: 0x54C940,
     motion_ends: 0x296388,
     motion_lens: 0x27E988,
     motion_masks: 0x24F580,
+    motion_key_count: 0x118E1,
+    motion_count: 0xBD * 128,
+    motion_mask_count: 0x5E81,
     line_break_classes: 0x2B58FC,
     line_break_pairs: 0x2B8614,
+};
+
+const BUILD_ID_WITCH: [u8; 8] = [0x59, 0x88, 0x64, 0x36, 0xb3, 0x29, 0x25, 0x0b];
+
+/// Witch on the Holy Night (re/NOTES_WOH.md): 10821 images (the names jp_55AC0 hashes until the first empty one;
+/// jo_AE09B8 at 0x3CF510 is a separate 2880-entry list only searched for BG_ERROR), 249 scenes (sub_3A860 searches 249 ids), 51 haze
+/// entries (sub_6E8D0), 0x6DED motion keys (sub_731A0), 0x20B4 motion ids (sub_73140 / sub_73170) and masks
+/// (sub_72C60); the line break tables are nn::font's, byte for byte the Japanese build's.
+pub const WITCH: Layout = Layout {
+    build: Build::Witch,
+    build_id: BUILD_ID_WITCH,
+    image_names: 0x4049A0,
+    image_info: 0x2F1068,
+    image_count: 10821,
+    haze: 0x262FC8,
+    haze_count: 51,
+    scene_ids: 0x2623E0,
+    scene_count: 249,
+    motion_keys: 0x45A770,
+    motion_ends: 0x27E5D0,
+    motion_lens: 0x276300,
+    motion_masks: 0x265D58,
+    motion_key_count: 0x6DED,
+    motion_count: 0x20B4,
+    motion_mask_count: 0x20B5,
+    line_break_classes: 0x28E22A,
+    line_break_pairs: 0x290F44,
 };
 
 impl Layout {
     /// The layout of an executable by its build ID.
     pub fn of(build_id: &[u8]) -> Result<&'static Layout> {
-        [&JAPANESE, &OVERSEAS].into_iter().find(|l| build_id.starts_with(&l.build_id)).with_context(|| {
+        [&JAPANESE, &OVERSEAS, &WITCH].into_iter().find(|l| build_id.starts_with(&l.build_id)).with_context(|| {
             format!(
-                "unsupported executable build {:02x?}; this reimplementation targets {:02x?} and {:02x?}",
+                "unsupported executable build {:02x?}; this reimplementation targets {:02x?}, {:02x?} and {:02x?}",
                 &build_id[..8.min(build_id.len())],
                 JAPANESE.build_id,
-                OVERSEAS.build_id
+                OVERSEAS.build_id,
+                WITCH.build_id
             )
         })
     }
@@ -104,12 +147,12 @@ impl Layout {
         [
             (self.image_names, 32 * self.image_count),
             (self.image_info, 72 * self.image_count),
-            (self.scene_ids, 2 * SCENE_ID_COUNT),
-            (self.haze, 40 * (HAZE_COUNT + 1)),
-            (self.motion_keys, 64 * MOTION_KEY_COUNT),
-            (self.motion_ends, 4 * MOTION_COUNT),
-            (self.motion_lens, 4 * MOTION_COUNT),
-            (self.motion_masks, 8 * MOTION_MASK_COUNT),
+            (self.scene_ids, 2 * self.scene_count),
+            (self.haze, 40 * (self.haze_count + 1)),
+            (self.motion_keys, 64 * self.motion_key_count),
+            (self.motion_ends, 4 * self.motion_count),
+            (self.motion_lens, 4 * self.motion_count),
+            (self.motion_masks, 8 * self.motion_mask_count),
             (self.line_break_classes, 4 * LINE_BREAK_RANGES),
             (self.line_break_pairs, 4 * LINE_BREAK_CLASSES * LINE_BREAK_CLASSES),
         ]
@@ -252,7 +295,9 @@ pub struct ImageInfo {
     /// Overseas +67 bit 1 (sub_77330 there): the texture stacks one copy per game language (sub_9A700 strips,
     /// top to bottom in language order); a layer draws strip `language` (sub_374F0 / sub_375D0, sub_34440 and
     /// the save preview sub_89AD0 divide the height by the strip count). The Japanese build has no such images
-    /// (its +67 bit 1, which no image sets, is the HD art flag that the overseas build moved to bit 2).
+    /// (its +67 bit 1, which no image sets, is the HD art flag that the overseas build moved to bit 2). Witch on
+    /// the Holy Night tests the same bit (jp_77330, 84 images such as the IMG0000 logo; jp_9A700 = SYSMES_TEXT's
+    /// four languages).
     pub language_strips: bool,
 }
 
@@ -270,6 +315,7 @@ impl ImageInfo {
 
 pub struct ExeTables {
     pub build: Build,
+    haze_count: usize,
     pub images: Vec<ImageInfo>,
     pub scene_ids: Vec<u16>,
     /// Indexed by STRA id; entry 0 is unused.
@@ -300,22 +346,22 @@ impl ExeTables {
                 level: nso.u16(rec + 70).map_or(0, |v| v as i16),
                 no_shake: nso.bytes(rec + 65, 1).is_some_and(|b| b[0] & 2 != 0),
                 own_blend: nso.bytes(rec + 65, 1).is_some_and(|b| b[0] & 1 != 0),
-                language_strips: l.build == Build::Overseas && nso.bytes(rec + 67, 1).is_some_and(|b| b[0] & 2 != 0),
+                language_strips: matches!(l.build, Build::Overseas | Build::Witch) && nso.bytes(rec + 67, 1).is_some_and(|b| b[0] & 2 != 0),
             });
         }
-        let scene_ids = (0..SCENE_ID_COUNT)
+        let scene_ids = (0..l.scene_count)
             .map(|i| nso.u16(l.scene_ids + 2 * i as u64).unwrap_or(0xFFFF))
             .collect();
-        let haze = (0..=HAZE_COUNT)
+        let haze = (0..=l.haze_count)
             .map(|id| std::array::from_fn(|k| nso.f32(l.haze + 40 * id as u64 + 4 * k as u64).unwrap_or(0.0)))
             .collect();
         let line_break = std::sync::Arc::new(crate::linebreak::LineBreak::load(nso)?);
-        Ok(Self { build: l.build, images, scene_ids, haze, line_break })
+        Ok(Self { build: l.build, haze_count: l.haze_count, images, scene_ids, haze, line_break })
     }
 
-    /// Haze entry for a STRA id (sub_91520: ids outside 1..=557 have none).
+    /// Haze entry for a STRA id (sub_91520: ids outside 1..=557 have none; Witch on the Holy Night 1..=51).
     pub fn haze(&self, id: i32) -> Option<&[f32; 10]> {
-        if (1..=HAZE_COUNT as i32).contains(&id) { self.haze.get(id as usize) } else { None }
+        if (1..=self.haze_count as i32).contains(&id) { self.haze.get(id as usize) } else { None }
     }
 
     pub fn scene_index(&self, id: u16) -> Option<usize> {
@@ -327,13 +373,14 @@ impl ExeTables {
 mod tests {
     use super::*;
 
-    /// The bundled ranges read back as the executable's own bytes (needs `switch_exefs/uncompressed_main` and
-    /// `switch_exefs_eng/uncompressed_main`).
+    /// The bundled ranges read back as the executable's own bytes (needs `switch_exefs/uncompressed_main`,
+    /// `switch_exefs_eng/uncompressed_main`, `switch_exefs_woh/uncompressed_main`).
     #[test]
     fn bundle_matches_executable() {
-        let builds: [(&str, &[u8]); 2] = [
+        let builds: [(&str, &[u8]); 3] = [
             ("switch_exefs", include_bytes!("../../knife/data/exe_tables.bin")),
             ("switch_exefs_eng", include_bytes!("../../knife/data/exe_tables_overseas.bin")),
+            ("switch_exefs_woh", include_bytes!("../../knife/data/exe_tables_witch.bin")),
         ];
         for (dir, bundle) in builds {
             let path = format!("{}/../{dir}/uncompressed_main", env!("CARGO_MANIFEST_DIR"));

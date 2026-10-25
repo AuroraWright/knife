@@ -15,6 +15,7 @@ use crate::{
 
 mod pad;
 mod touch;
+mod witch;
 
 pub use pad::Pad;
 
@@ -35,6 +36,9 @@ fn gs() -> f32 {
 pub const SAVE_PITCH: f32 = 93.748 * H / 448.0;
 /// Trackpad travel (canvas px on screen) that scrolls the save list a row.
 pub const SAVE_WHEEL_ROW: f32 = 1.5 * SAVE_PITCH;
+/// Trackpad travel (canvas px on screen) that steps Witch on the Holy Night's backlog an entry: 1.5 entry pitches
+/// (116 units), as the save list's.
+const WITCH_LOG_ROW: f32 = 1.5 * 116.0 * H / 448.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Confirm {
@@ -67,25 +71,44 @@ impl Confirm {
     /// SYSMES message (sub_49710 -> table dword_3C9340) and whether the cursor starts on "No"
     /// (sub_4AD40's second argument selects the initial button; 1 = No).
     fn message(self) -> (usize, bool) {
-        match self {
+        let (dialog, no) = match self {
+            Confirm::Jump(..) => return (1497, false),
+            Confirm::Ending(i) => return (crate::gallery::ENDINGS[i].2, true),
+            Confirm::Defaults => return (160, true),
+            c => c.dialog().unwrap_or_default(),
+        };
+        // sub_49710 -> sub_9A8C0(0, n): Witch on the Holy Night's own table (dword_2868A0)
+        let table: &[usize] = if crate::assets::witch() { &WITCH_DIALOG_SYSMES } else { &DIALOG_SYSMES };
+        (table[dialog], no)
+    }
+
+    /// The dialog id (sub_49710's row) and whether the cursor starts on "No"; None for the messages that are
+    /// not rows of the table.
+    fn dialog(self) -> Option<(usize, bool)> {
+        Some(match self {
             // sub_4CEA0 cases 3 / 4 open dialogs 12 and 8 on Yes (sub_49710(n, 0))
-            Confirm::Title => (229, false),
-            Confirm::EndReplay => (234, false),
-            Confirm::Overwrite(_) => (180, true),
+            Confirm::Title => (8, false),
+            Confirm::EndReplay => (12, false),
+            Confirm::Overwrite(_) => (2, true),
             // sub_50FC0 load mode: sub_49710(0, 0), Yes first (Switch: title LOAD GAME)
-            Confirm::Load(_) => (179, false),
-            Confirm::Jump(..) => (1497, false),
-            Confirm::PrevScene => (233, true),
-            Confirm::NextScene => (232, true),
-            Confirm::QuickLoad => (230, true),
-            Confirm::Ending(i) => (crate::gallery::ENDINGS[i].2, true),
-            Confirm::Defaults => (160, true),
-            Confirm::BacklogJump => (231, true),
+            Confirm::Load(_) => (0, false),
+            Confirm::PrevScene => (11, true),
+            Confirm::NextScene => (10, true),
+            Confirm::QuickLoad => (9, true),
+            Confirm::BacklogJump => (23, true),
             // sub_50FC0 (overseas): sub_49710(21, 1)
-            Confirm::Delete(_) => (182, true),
-        }
+            Confirm::Delete(_) => (21, true),
+            Confirm::Jump(..) | Confirm::Ending(_) | Confirm::Defaults => return None,
+        })
     }
 }
+
+/// SYSMES message per dialog id (sub_49710: dword_3C9340; 0 where the table has -1).
+const DIALOG_SYSMES: [usize; 24] =
+    [179, 178, 180, 199, 198, 200, 211, 194, 229, 230, 232, 233, 234, 0, 235, 0, 0, 0, 0, 0, 0, 182, 181, 231];
+/// Witch on the Holy Night (dword_2868A0).
+const WITCH_DIALOG_SYSMES: [usize; 24] =
+    [155, 154, 156, 175, 174, 176, 187, 170, 204, 205, 207, 208, 209, 0, 210, 0, 0, 0, 0, 0, 0, 158, 157, 206];
 
 /// Boot and caution screens: the logo movie and notice (sub_B5650), and the title's PRESS ANY BUTTON
 /// follow-up (sub_8E200 states 10..20). Alphas run at the exe's per-frame speeds (60 Hz).
@@ -136,6 +159,8 @@ pub enum Screen {
     /// viewing the `pos`-th unlocked CG of a gallery group
     CgView { group: usize, pos: usize },
     Confirm(Confirm),
+    /// a Witch on the Holy Night system screen (`witch`: the task in `Ui::w`)
+    Witch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -420,6 +445,16 @@ pub struct Ui {
     load_popup: Option<usize>,
     /// a load picked in the title's load window: the window closes first (sub_50FC0 state 19 -> 5 -> 27)
     load_after_close: Option<usize>,
+    /// Witch on the Holy Night's title (`witch::title`)
+    wt: witch::WitchTitle,
+    /// The other WoH screens (`witch`)
+    w: witch::WUi,
+    /// the WoH title starts over at the next update (jp_8D2E0 on the mode manager's return to mode 0)
+    wt_reinit: bool,
+    /// a button or touch for a WoH splash state
+    wt_any: bool,
+    /// the record the WoH title loads after its fade (states 21 / 25 -> 23)
+    wt_loaded: Option<usize>,
     /// an in-game load is applied and the list fades out (sub_50FC0 states 5 -> 27); then the system menu cuts
     /// away at once (sub_4D340 result 2: backdrop speed -0.0333, then sub_49630(0, 0) zeroes it)
     load_cut: bool,
@@ -528,8 +563,20 @@ pub struct Ui {
     conf_hold_dirty: bool,
     /// the confirm button is held (a held A with left / right drags a config slider)
     pub enter_held: bool,
+    /// controller buttons held (bit per `Pad`)
+    pub pads_held: u32,
     /// touch ripples, story gestures and the mode panel
     touch: touch::Touch,
+}
+
+/// The shared system fonts as one atlas (sub_CAA50's set): the first font, the rest filling in its missing glyphs.
+pub(crate) fn shared_font_atlas(r: &Renderer, fonts: Vec<Vec<u8>>) -> Option<FontAtlas> {
+    let mut fonts = fonts.into_iter();
+    let mut atlas = FontAtlas::new(r, fonts.next()?).map_err(|e| tracing::warn!("system font: {e:#}")).ok()?;
+    for d in fonts {
+        atlas.add_fallback(d).unwrap_or_else(|e| tracing::warn!("system font fallback: {e:#}"));
+    }
+    Some(atlas)
 }
 
 fn rect_hit(r: [f32; 4], p: (f32, f32)) -> bool {
@@ -1059,6 +1106,11 @@ impl Ui {
             cont_slot: None,
             load_popup: None,
             load_after_close: None,
+            wt: Default::default(),
+            w: Default::default(),
+            wt_reinit: false,
+            wt_any: false,
+            wt_loaded: None,
             load_cut: false,
             title_ui_hidden: false,
             banner: None,
@@ -1112,6 +1164,7 @@ impl Ui {
             lang_ms: 0.0,
             conf_hold_dirty: false,
             enter_held: false,
+            pads_held: 0,
             touch: touch::Touch::new(),
             help_t: 0.0,
             font_sys: None,
@@ -1227,7 +1280,7 @@ impl Ui {
     /// The record into the in-memory save file only (the auto save's shift included).
     fn put_record(&mut self, game: &mut Game, slot: usize, data: &SaveData) -> anyhow::Result<()> {
         let rec = game.encode_record(data).ok_or_else(|| anyhow::anyhow!("position not saveable"))?;
-        if slot == save::AUTO_FIRST {
+        if slot == save::auto_first() {
             self.file.shift_auto();
         }
         self.file.set_record(slot, &rec);
@@ -1322,6 +1375,8 @@ impl Ui {
             knife_core::exe::Build::Japanese => (533..=556).all(|n| crate::game::get_bit(&game.endings, n)),
             // sub_FF40: every record's completed node
             knife_core::exe::Build::Overseas => (0..24).all(|i| Self::ending_ok(game, i)),
+            // Witch on the Holy Night has no Q&A corner
+            knife_core::exe::Build::Witch => false,
         }
     }
 
@@ -1428,6 +1483,7 @@ impl Ui {
                 let (a, b) = crate::gallery::EN_ENDING_DONE[i];
                 [a, b].into_iter().any(|n| n >= 0 && get_bit(&game.endings, n as usize))
             }
+            knife_core::exe::Build::Witch => false,
         }
     }
 
@@ -1788,7 +1844,7 @@ impl Ui {
 
     /// The slots' records again, keeping their thumbnails.
     fn reload_slots(&mut self, game: &mut Game) {
-        self.slots = (0..save::SLOTS)
+        self.slots = (0..save::slots())
             .map(|n| {
                 let rec = self.file.record(n)?;
                 let d = game.decode_record(rec);
@@ -1859,6 +1915,23 @@ impl Ui {
             return;
         }
         if self.debug_intro(game, r, name) {
+            return;
+        }
+        // Witch on the Holy Night's save screen: the title's Load (state 25), else the system menu's entry
+        if crate::assets::witch() && matches!(name, "save" | "load") {
+            let save = name == "save";
+            if self.screen == Screen::Title {
+                if !save {
+                    self.wt.st = 25;
+                    self.ws_open(game, r, false);
+                    self.w.save.title = true;
+                }
+                return;
+            }
+            self.wm_open(game, r);
+            self.w.menu.cur = if save { 0 } else { 1 };
+            self.w.menu.st = 4;
+            self.w.menu.a = 0.0;
             return;
         }
         // the title's NEW GAME / CONTINUE, and the system menu's title return (after its confirmation)
@@ -2052,17 +2125,7 @@ impl Ui {
     /// 0x183040): the 0x80000 / 0x200000 font index (+55436) does not change it. The shared fonts are the
     /// language's (`Assets::shared_font_names`); falls back to the UI font (TsukuGo) when the assets dir has none.
     fn sys_font(game: &Game, r: &Renderer) -> Option<FontAtlas> {
-        for name in game.assets.shared_font_names() {
-            let path = &game.assets.romfs.join(name);
-            match std::fs::read(path) {
-                Ok(data) => {
-                    let data = knife_core::format::bfttf::decode(&data).unwrap_or(data);
-                    return FontAtlas::new(r, data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok();
-                }
-                Err(e) => tracing::warn!("system font {}: {e}", path.display()),
-            }
-        }
-        Self::ui_font(game, r, "2")
+        shared_font_atlas(r, game.assets.shared_fonts()).or_else(|| Self::ui_font(game, r, "2"))
     }
 
     /// A font of the language's folders (`Assets::font_path`).
@@ -2126,6 +2189,16 @@ impl Ui {
         if a <= 0.0 || self.busy() || self.popup.is_some() {
             return;
         }
+        self.draw_help_at(game, r, out, id, pos, rc, flags, a);
+    }
+
+    /// The balloon of SYSMES `id` for an object at `pos` with touch rect `rc` and object flags `flags` (640x448
+    /// units), at alpha `a`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_help_at(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, id: usize, pos: [f32; 2], rc: [f32; 4], flags: u32, a: f32) {
+        if a <= 0.0 {
+            return;
+        }
         if self.sysmes.is_empty() {
             self.sysmes = game.assets.sysmes();
         }
@@ -2170,12 +2243,14 @@ impl Ui {
         if q == 0 || q == 3 {
             y -= 13.0;
         }
+        // Witch on the Holy Night's jp_AE590: the backing 0.41625 high, the text slot at y + 0
+        let witch = crate::assets::witch();
         if let Some(t) = self.tex.get("mode_help") {
-            let (bw, bh) = (t.width as f32 * (w + 40.0) / 640.0, t.height as f32 * 0.41489);
+            let (bw, bh) = (t.width as f32 * (w + 40.0) / 640.0, t.height as f32 * if witch { 0.41625 } else { 0.41489 });
             out.push(Quad::rect(t.clone(), [(x - 20.0) * 3.0, y * H / 448.0, bw * 3.0, bh * H / 448.0], [1.0, 1.0, 1.0, a * 0.7]));
         }
         // sub_AB710: the slot at (x + 2, y + 3), white text with a dark rim
-        let (tx, base) = ((x + 2.0) * 3.0, (y + 3.0) * H / 448.0 + SYS_ASCENT * gs() * SIZE[1]);
+        let (tx, base) = ((x + 2.0) * 3.0, (y + if witch { 0.0 } else { 3.0 }) * H / 448.0 + SYS_ASCENT * gs() * SIZE[1]);
         for (ddx, ddy, c) in [(-1.5, 0.0, 0.0), (1.5, 0.0, 0.0), (0.0, -1.5, 0.0), (0.0, 1.5, 0.0), (0.0, 0.0, 1.0)] {
             font.draw_str_slot(r, out, &text, SIZE, SPACING, [tx + ddx, base + ddy], [c, c, c, if c > 0.0 { a } else { a * 0.6 }]);
         }
@@ -2187,6 +2262,10 @@ impl Ui {
     /// movie and the notice play before the title (`skip_intro` leaves them out). Before that the prologue
     /// scene (id 260) starts right away; its end returns to a title that asks for PRESS ANY BUTTON.
     pub fn boot(&mut self, game: &mut Game, r: &Renderer, skip_intro: bool) {
+        if crate::assets::witch() {
+            self.wt_boot(game, r, skip_intro);
+            return;
+        }
         if crate::game::get_bit(&game.nodes, 485) {
             self.boot_flag = false;
             if skip_intro {
@@ -2216,6 +2295,7 @@ impl Ui {
 
     /// Show the title, fading in from black (sub_8E200 state 2: 0.012 / frame).
     fn enter_title(&mut self) {
+        self.wt_reinit = crate::assets::witch();
         self.screen = Screen::Title;
         // the title's entries take the UI focus (sub_8E200)
         self.sys_focus = false;
@@ -2277,7 +2357,7 @@ impl Ui {
             // notice per language, and state 8 then steps past the other three (qword_1835524 = 4 - language)
             let index = match game.assets.build {
                 knife_core::exe::Build::Overseas => 1 + if game.assets.language() > 3 { 1 } else { game.assets.language() },
-                knife_core::exe::Build::Japanese => 1,
+                knife_core::exe::Build::Japanese | knife_core::exe::Build::Witch => 1,
             };
             self.notice = game.assets.parts_texture(r, index);
         }
@@ -2482,6 +2562,10 @@ impl Ui {
                 // byte_1536158: the cursor comes back on GALLERY
                 self.hover = self.title_cursor(Action::OpenExtra);
             }
+            Screen::Title if crate::assets::witch() => match self.load_after_close.take() {
+                Some(i) => self.wt_loaded_from_list(game, i),
+                None => self.wt_back(),
+            },
             Screen::Title => {
                 self.menu_bg.fade(-0.02);
                 if let Some(i) = self.load_after_close.take() {
@@ -2662,6 +2746,8 @@ impl Ui {
                 v
             }
             // sub_4AE90: buttons 0 (Yes) at 330 and 1 (No) at 252, y 249.01 (640x448 units), 216x56
+            // the WoH screens hit-test their own objects (`witch`)
+            Screen::Witch => Vec::new(),
             Screen::Confirm(c) => {
                 // sub_4AE90: Yes (object 0) at x 330, No (object 1) at 252, y 249.01 of 448 (261.46 under a
                 // thumbnail); touch rect (0, -2)-(72, 24) (unk_590F08)
@@ -3235,7 +3321,8 @@ impl Ui {
     fn conf_slider(&self, game: &Game, i: usize) -> (f32, f32, f32) {
         let st = &game.settings;
         match (self.conf_tab, i) {
-            (0, 0 | 1) => (st.text_ms[i], 250.0, 1.0),
+            // Witch on the Holy Night: its 0..255 text speed (`Game::chars_per_frame`)
+            (0, 0 | 1) => (st.text_ms[i], if game.assets.build == knife_core::exe::Build::Witch { 255.0 } else { 250.0 }, 1.0),
             (0, 2) => (st.auto_page_ms, 10000.0, 50.0),
             (0, _) => (st.auto_click_ms, 10000.0, 50.0),
             (_, 0) => (game.sound.vol.bgm * 100.0, 100.0, 1.0),
@@ -3679,6 +3766,17 @@ impl Ui {
     }
 
     pub fn mouse_move(&mut self, game: &mut Game, x: f32, y: f32) {
+        // the WoH screens: a pointer that has not moved (the events a trackpad scroll sends) is no hover, so
+        // it does not take the cursor back to the entry under it
+        if self.screen == Screen::Witch || (self.screen == Screen::Title && crate::assets::witch()) {
+            if (x, y) == self.mouse {
+                return;
+            }
+            self.mouse = (x, y);
+            self.touch_move();
+            self.witch_mouse_move();
+            return;
+        }
         let before = self.cursor();
         self.sounded = false;
         self.mouse_move_inner(game, x, y);
@@ -3806,6 +3904,10 @@ impl Ui {
         if self.busy() {
             return;
         }
+        if self.screen == Screen::Title && crate::assets::witch() {
+            self.wt_click();
+            return;
+        }
         if self.screen == Screen::Intro || (self.screen == Screen::Title && self.press) {
             self.intro_input(game);
             return;
@@ -3868,6 +3970,8 @@ impl Ui {
             Screen::Game if game.in_movie() => game.skip_movie(),
             // sub_40ED0: nothing until the first message after a story start or a load (dword_AFFCA4)
             Screen::Game if game.menu_lock => {}
+            Screen::Game if crate::assets::witch() => self.wm_open(game, r),
+            Screen::Witch => self.w.inp.pressed |= witch::pad_bit(Pad::B),
             Screen::Game => {
                 if self.sysmes.is_empty() {
                     self.sysmes = game.assets.sysmes();
@@ -3877,6 +3981,7 @@ impl Ui {
                 self.push(Screen::Menu);
                 self.menu_bg.fade(0.0555);
             }
+            Screen::Title if crate::assets::witch() => self.wt_pad(game, r, Pad::B, false),
             Screen::Title | Screen::Intro => self.intro_input(game),
             // B in a gallery mode's content gives the focus back to the mode buttons; on the buttons it leaves
             s if Self::gal_mode(s).is_some() && !self.gal_side && !self.busy() => {
@@ -3927,7 +4032,7 @@ impl Ui {
                 return;
             }
             if dy != 0 {
-                game.choice_move(dy);
+                game.choice_move(dy, self.nav_repeat);
             }
             if enter {
                 game.advance();
@@ -4408,7 +4513,16 @@ impl Ui {
     /// which steps a save at once per `rows` (a wheel notch, or a trackpad drag of one frame's height on
     /// screen), like the stick's steps (a held tilt there steps at a fixed rate and runs on after the trackpad
     /// stops). It has no Switch control.
-    pub fn wheel(&mut self, lines: f32, rows: f32) {
+    pub fn wheel(&mut self, lines: f32, rows: f32, trackpad: bool) {
+        // Witch on the Holy Night reads the exe's own mouse wheel (`WIn::wheel`), not the stick; the backlog
+        // steps by the travel instead (a notch an entry; the trackpad's travel over an entry's height on screen)
+        if crate::assets::witch() {
+            self.w.inp.wheel(lines);
+            if self.screen == Screen::Witch && self.w.scr == witch::WScr::Backlog {
+                self.w.inp.wheel_rows(if trackpad { rows * SAVE_WHEEL_ROW / WITCH_LOG_ROW } else { rows });
+            }
+            return;
+        }
         if self.busy() || self.popup.is_some() {
             self.wheel = 0.0;
             self.wheel_steps = 0.0;
@@ -4464,10 +4578,10 @@ impl Ui {
             return order.clone();
         }
         let mut used: Vec<(u64, usize)> =
-            self.slots.iter().enumerate().take(save::LIST_SLOTS).filter_map(|(i, s)| s.as_ref().map(|s| (s.timestamp, i))).collect();
+            self.slots.iter().enumerate().take(save::list_slots()).filter_map(|(i, s)| s.as_ref().map(|s| (s.timestamp, i))).collect();
         used.sort_by(|a, b| b.cmp(a));
         let mut v = Vec::new();
-        if save && let Some(free) = (0..save::LIST_SLOTS).find(|&i| self.slots.get(i).is_none_or(|s| s.is_none())) {
+        if save && let Some(free) = (0..save::list_slots()).find(|&i| self.slots.get(i).is_none_or(|s| s.is_none())) {
             v.push(free);
         }
         v.extend(used.into_iter().map(|(_, i)| i));
@@ -4564,8 +4678,9 @@ impl Ui {
             Action::OpenLoad | Action::OpenSave if self.screen == Screen::Menu && game.var("F025") != 0 => self.snd(game, 2),
             Action::OpenLoad => {
                 self.refresh_slots(game);
-                // title case 2 / system menu tab 1 (sub_4CEA0; sound 2 while saving is disabled, sub_47B10)
-                self.snd(game, 1);
+                // title case 2 / system menu tab 1 (sub_4CEA0; sound 2 while saving is disabled, sub_47B10); WoH's
+                // title case 2 sound 0
+                self.snd(game, if crate::assets::witch() && self.screen == Screen::Title { 0 } else { 1 });
                 if self.screen == Screen::Title {
                     self.menu_bg.fade(0.02);
                 }
@@ -4584,8 +4699,8 @@ impl Ui {
                 }
             }
             Action::OpenConfig => {
-                // title case 3 / system menu tab 2: system sound 1
-                self.snd(game, 1);
+                // title case 3 / system menu tab 2: system sound 1 (WoH's title case 3: 0)
+                self.snd(game, if crate::assets::witch() && self.screen == Screen::Title { 0 } else { 1 });
                 if self.screen == Screen::Title {
                     self.menu_bg.fade(0.02);
                 }
@@ -4650,6 +4765,17 @@ impl Ui {
                 self.flow_press(game);
             }
             Action::GalleryBack => self.gallery_back(game, r),
+            // Witch on the Holy Night (jp_48AC0 mode 2 state 2, mode 5 state 10): a story ended by a TeaTime's
+            // archive button (G009) opens the Archive (jp_47AE0) under the title's BGM at once
+            Action::TitleNow if crate::assets::witch() && game.var("G009") != 0 => {
+                self.black_speed = 0.0;
+                self.store_global(game);
+                game.reset();
+                game.play_bgm(if crate::ui::witch::title_complete(game) { 42 } else { 65 }, 1.0, 0.0);
+                self.title_movie = false;
+                self.black = 0.0;
+                self.warc_init(game, false);
+            }
             Action::TitleNow => {
                 self.black_speed = 0.0;
                 // nothing on the way to the title stops the BGM (sub_48AC0 case 2 state 2): the script's end already
@@ -5092,6 +5218,10 @@ impl Ui {
         self.black_speed = 0.02;
         self.black_top = 1.0;
         self.black_then = Some(if game.var("F024") != 0 { Action::GalleryBack } else { Action::TitleNow });
+        // Witch on the Holy Night: sub_7320 takes the Archive's cursors for the replayed scene (F026)
+        if crate::assets::witch() && game.var("F024") != 0 {
+            self.warc_restore(game.var("F026"));
+        }
     }
 
     /// sub_47A90 after a replay: the stage goes (the system data is written first after a result 2 end, RDED or
@@ -5099,6 +5229,17 @@ impl Ui {
     /// on the mode it closed with, its content focused on the replayed entry (sub_6124 / sub_7F38 with
     /// off_AE0288[1]).
     fn gallery_back(&mut self, game: &mut Game, r: &Renderer) {
+        if crate::assets::witch() {
+            // jp_48AC0 mode 2 state 3, jp_47A90: the title's BGM at once, the Archive with its panel up
+            self.store_global(game);
+            game.reset();
+            game.play_bgm(if crate::ui::witch::title_complete(game) { 42 } else { 65 }, 1.0, 0.0);
+            self.title_movie = false;
+            self.black = 0.0;
+            self.black_speed = 0.0;
+            self.warc_init(game, true);
+            return;
+        }
         let done = game.replay_done;
         if done {
             self.store_global(game);
@@ -5177,6 +5318,10 @@ impl Ui {
             Confirm::QuickLoad => {
                 self.quick_load(game, r);
                 self.close_panel_after_quick_load();
+                // Witch on the Holy Night's Minus (byte_649884): sub_2F280(1, 1), jp_527A0(120), sound 13
+                if crate::assets::witch() {
+                    game.play_sys_sound(13);
+                }
             }
             Confirm::Defaults => {
                 self.conf_change(game, Ctl::Default.code(), 0);
@@ -5303,7 +5448,7 @@ impl Ui {
         let list = self.save_list(save);
         let count = list.len();
         let used = list.iter().filter(|&&i| self.slots.get(i).is_some_and(|s| s.is_some())).count();
-        let (scroll, cur) = if count < 5 || used >= save::LIST_SLOTS { (0, usize::from(count > 1 && count <= 4)) } else { (1, 0) };
+        let (scroll, cur) = if count < 5 || used >= save::list_slots() { (0, usize::from(count > 1 && count <= 4)) } else { (1, 0) };
         self.screen = Screen::SaveLoad { save, scroll };
         self.hover = Some(cur);
         self.save_seen = Some((save, self.hover, scroll));
@@ -5359,15 +5504,50 @@ impl Ui {
         }
         // sub_52860 (mode panel): written silently, the Quick Save banner shows; sub_4E170 then sets
         // dword_AFFCC4 to 180 (sub_40E70)
-        if game.can_save() && self.write_quiet(game, r, save::QUICK_SLOT) {
+        if game.can_save() && self.write_quiet(game, r, save::quick_slot()) {
             self.show_banner(1);
         }
         self.save_cool = 180;
     }
 
+    /// Witch on the Holy Night's mask [14] (Plus | L3; sub_40ED0 at a click wait, jp_83E50 / sub_65380 in a
+    /// choice): sound 1 while saving is off (F025), the cooldown runs (jp_40E90), in a TeaTime scene
+    /// (sub_3A800) or with the quick record already at this point (sub_359F0); else sound 0, the Saved banner
+    /// (sub_1D4A0(1)), the quick record and the file written (sub_358C0), cooldown 180, sound 13.
+    pub(super) fn witch_quick_save(&mut self, game: &mut Game, r: &Renderer) {
+        let same = game
+            .save_data()
+            .zip(self.slots.get(save::quick_slot()).and_then(Option::as_ref))
+            .is_some_and(|(a, b)| a.scene == b.scene && a.pc == b.pc);
+        if game.var("F025") != 0 || self.save_cool > 0 || game.teatime_scene() || same {
+            self.snd(game, 1);
+            return;
+        }
+        self.snd(game, 0);
+        self.show_banner(1);
+        if game.can_save() {
+            self.write_quiet(game, r, save::quick_slot());
+        }
+        self.save_cool = 180;
+        game.play_sys_sound(13);
+    }
+
+    /// Witch on the Holy Night's mask [15] (Minus, sub_40ED0): with a quick record (sub_35B30(120)), sound 1
+    /// while saving is off or in a TeaTime scene, else dialog 9 with the record's preview (jp_884F0).
+    pub(super) fn witch_quick_load(&mut self, game: &mut Game, r: &Renderer) {
+        if !self.slots.get(save::quick_slot()).is_some_and(Option::is_some) {
+            return;
+        }
+        if game.var("F025") != 0 || game.teatime_scene() {
+            self.snd(game, 1);
+            return;
+        }
+        self.wd_ask(game, r, Confirm::QuickLoad);
+    }
+
     pub fn quick_load(&mut self, game: &mut Game, r: &Renderer) {
-        if matches!(self.screen, Screen::Game | Screen::Title) && self.slots.get(save::QUICK_SLOT).is_some_and(|s| s.is_some()) {
-            self.load(game, r, save::QUICK_SLOT);
+        if matches!(self.screen, Screen::Game | Screen::Title) && self.slots.get(save::quick_slot()).is_some_and(|s| s.is_some()) {
+            self.load(game, r, save::quick_slot());
         }
     }
 
@@ -5400,7 +5580,7 @@ impl Ui {
         // sub_52A20: no new auto save (and no banner) when the record matches the newest auto save
         let same = game
             .save_data()
-            .zip(self.slots.get(save::AUTO_FIRST).and_then(Option::as_ref))
+            .zip(self.slots.get(save::auto_first()).and_then(Option::as_ref))
             .is_some_and(|(a, b)| a.scene == b.scene && a.pc == b.pc);
         // without a new auto save straight to state 21, else the banner first (state 18); either way the menu
         // and its backdrop fade out at 1/30 per frame and the title follows once both are done (sub_4D7E0)
@@ -5410,8 +5590,8 @@ impl Ui {
             // sub_52AA0 puts the record in the list either way; with dword_AFFCC4 running it returns before
             // the file write (sub_4EC60(2)) and so without the banner. The caller then sets 180.
             if self.save_cool > 0 {
-                self.write_memory(game, save::AUTO_FIRST);
-            } else if self.write_quiet(game, r, save::AUTO_FIRST) {
+                self.write_memory(game, save::auto_first());
+            } else if self.write_quiet(game, r, save::auto_first()) {
                 self.show_banner(2);
             }
             self.save_cool = 180;
@@ -5507,7 +5687,8 @@ impl Ui {
     /// Auto mode toggled from the keyboard; turning it on shows the Auto banner (sub_40ED0).
     pub fn toggle_auto(&mut self, game: &mut Game) {
         game.auto = !game.auto;
-        if game.auto {
+        // (Witch on the Holy Night's banner only says Saved; its mode display is sub_1D670)
+        if game.auto && !crate::assets::witch() {
             self.show_banner(3);
         }
     }
@@ -5519,6 +5700,13 @@ impl Ui {
         let (k0, k1) = (BANNER_KEYS[k.min(9)], BANNER_KEYS[(k + 1).min(9)]);
         let sx = k0[0] * (1.0 - f) + k1[0] * f;
         let sy = k0[1] * (1.0 - f) + k1[1] * f;
+        if crate::assets::witch() {
+            // Witch on the Holy Night's sub_3B4B0: popup_ja (DISP_PARTS 6) row "Saved" (0, 4)-(450, 80) whatever
+            // the banner, anchor 3 (left, middle) at (0, 424), x 0.85 of the 1/3 x 0.41481 scale (native pixels)
+            let (w, h) = (450.0 * 0.85 * sx, 76.0 * 0.85 * sy);
+            self.sprite(out, "popup_ja", [0.0, 424.0 * H / 448.0 - h / 2.0, w, h], Some([0.0, 4.0, 450.0, 76.0]));
+            return;
+        }
         let [x0, y0, x1, y1] = BANNER_SRC[b.idx];
         // anchor top-left at (0, 32) of 640x448
         self.sprite(out, "popup_ja", [0.0, 32.0 * H / 448.0, (x1 - x0) * sx, (y1 - y0) * sy], Some([x0, y0, x1 - x0, y1 - y0]));
@@ -5546,6 +5734,28 @@ impl Ui {
             } else {
                 game.choice_save_closed();
             }
+            // the TeaTime menu: its save button (states 3 / 4), the title button's write
+            match game.take_teatime_req() {
+                // (a Witch on the Holy Night menu: its own save screen)
+                Some(crate::game::TeaReq::Save) => {
+                    self.ws_open(game, r, true);
+                    self.push(Screen::Witch);
+                    self.w.scr = witch::WScr::Save;
+                }
+                // sub_35790(1): the resume record and the system data are written whatever the cooldown,
+                // which is then 180 (sub_40E70); sub_1D4A0(1) the Saved banner
+                Some(crate::game::TeaReq::TitleSave) => {
+                    if game.can_save() {
+                        self.write_quiet(game, r, save::auto_first());
+                    } else {
+                        self.store_global(game);
+                    }
+                    self.save_cool = 180;
+                    self.show_banner(1);
+                }
+                Some(crate::game::TeaReq::Store) => self.store_global(game),
+                None => game.teatime_save_closed(),
+            }
         }
         // sub_2B5C0: leaving the config stops its test SE and test voice
         if self.screen != Screen::Config && !self.stack.contains(&Screen::Config) {
@@ -5560,6 +5770,15 @@ impl Ui {
         while self.lang_ms >= 1000.0 / 60.0 {
             self.lang_ms -= 1000.0 / 60.0;
             self.lang_frame(game, r);
+        }
+        if crate::assets::witch() && self.screen == Screen::Title {
+            if std::mem::take(&mut self.wt_reinit) {
+                self.wt_reenter(game, r);
+            }
+            self.wt_update(game, r, dt);
+        }
+        if crate::assets::witch() && self.screen != Screen::Title && (self.screen == Screen::Witch || self.w.dlg.shown()) {
+            self.witch_update(game, r, dt);
         }
         // dt is in milliseconds; the UI clocks run in seconds
         let secs = dt / 1000.0;
@@ -5703,7 +5922,9 @@ impl Ui {
         let f60 = secs * 60.0;
         let backlog = matches!(self.screen, Screen::Backlog { .. })
             || self.stack.iter().any(|s| matches!(s, Screen::Backlog { .. }));
-        if (self.screen == Screen::Menu || backlog) && self.stack.contains(&Screen::Game) && game.menu_blur.is_none() {
+        if self.screen == Screen::Witch {
+            // the WoH screens set the blur themselves (`witch_update`)
+        } else if (self.screen == Screen::Menu || backlog) && self.stack.contains(&Screen::Game) && game.menu_blur.is_none() {
             game.menu_blur = Some(0.001);
         } else if let Some(a) = &mut game.menu_blur {
             let over_game = self.screen == Screen::Game || self.stack.contains(&Screen::Game);
@@ -5713,7 +5934,8 @@ impl Ui {
                 *a = (*a + f60 / 12.0).min(1.0);
             }
         }
-        game.hide_text = backlog || game.menu_blur.is_some() || self.touch.hidden;
+        // (WoH's capture takes the window and text along, sub_7FCA0)
+        game.hide_text = backlog || (game.menu_blur.is_some() && !crate::assets::witch()) || self.touch.hidden;
         game.touch_hidden = self.touch.hidden;
         if let Some(t) = self.playing_track.filter(|_| !self.music_paused) {
             // sub_1D314: the BGM loops between the track's loop points; with repeat the clock wraps back by the
@@ -5867,7 +6089,8 @@ impl Ui {
             self.conf_preview_update(game, f);
         }
         self.back_btn = (self.back_btn + if self.back_btn_on() { 0.04 } else { -0.04 } * f).clamp(0.0, 1.0);
-        let on_title = self.screen == Screen::Title;
+        // WoH's title keeps its own BGM and has no stage or movie (`witch::title`)
+        let on_title = self.screen == Screen::Title && !crate::assets::witch();
         if on_title != self.on_title {
             self.on_title = on_title;
             game.title_stage_step(self.boot_flag);
@@ -5877,7 +6100,7 @@ impl Ui {
                 game.play_title_bgm();
             }
         }
-        if self.screen == Screen::Title && !self.press && !self.title_movie {
+        if on_title && !self.press && !self.title_movie {
             self.title_movie = true;
             game.play_title_movie(r);
         }
@@ -5960,6 +6183,11 @@ impl Ui {
             self.end_story(game);
         }
         self.touch_update(game, r, secs, f);
+    }
+
+    /// The frame's held input for `Game::set_held`: any controller button, and the advance (A or a touch).
+    pub fn held_input(&self) -> (bool, bool) {
+        (self.pads_held != 0, self.enter_held || self.touch.down)
     }
 
     pub fn game_paused(&self) -> bool {
@@ -6173,7 +6401,19 @@ impl Ui {
     /// The title screen (sub_8D5D0): background (title_bg0 in PRESS ANY BUTTON mode, else the title movie),
     /// the logo particles, the logo in three slices, the lumi glow, the menu or the blinking PRESS ANY
     /// BUTTON, and the copyright.
-    fn draw_title(&mut self, game: &mut Game, _r: &Renderer, out: &mut Vec<Quad>) {
+    fn draw_title(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
+        if crate::assets::witch() {
+            self.wt_draw(game, r, out);
+            // jp_8D5D0 then the load screen (state 25), the dialog and the popup
+            if self.wt.st == 25 {
+                self.ws_draw(game, r, out);
+            }
+            // sub_BD90 (layer 21)
+            self.wc_draw(game, r, out);
+            self.wd_draw(game, r, out);
+            self.wp_draw(game, r, out);
+            return;
+        }
         if self.press {
             // title_bg0 (2670x1266) centred at (960, 508) at 0.94 (B0460(0.47, 0.4735) in 960x544)
             self.sprite(out, "title_bg0", [-294.9, -86.8, 2509.8, 1190.04], None);
@@ -6230,9 +6470,9 @@ impl Ui {
             }
         }
         self.sprite(out, "titlemenu_(c)type-moon", [872.0, 1008.0, 184.0, 64.0], None);
-        self.draw_complete(game, _r, out);
+        self.draw_complete(game, r, out);
         if self.black_under && self.black > 0.0 {
-            out.push(Quad::rect(_r.white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, self.black.min(1.0)]));
+            out.push(Quad::rect(r.white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, self.black.min(1.0)]));
         }
         self.draw_menu_layer(out);
     }
@@ -6350,12 +6590,19 @@ impl Ui {
     /// 0.82667 * 0.825 x 53 * 1.0859 * 0.825 units hanging from (320, 202) (English 214) over a black frame 2
     /// units wider each side, once it is made.
     fn draw_dialog_thumb(&self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>) {
-        let Some(d) = self.slots.get(save::QUICK_SLOT).cloned().flatten() else { return };
-        let Some(t) = game.preview(save::QUICK_SLOT, &d) else { return };
+        let Some(d) = self.slots.get(save::quick_slot()).cloned().flatten() else { return };
+        let Some(t) = game.preview(save::quick_slot(), &d) else { return };
         let (w, h) = (100.0 * 0.82667 * 0.825, 53.0 * 1.0859 * 0.825);
         let (ux, uy) = (W / 640.0, H / 448.0);
-        // the frame's top: 212 for English (the longer message), else 200
-        let y = if crate::text::english() { 212.0 } else { 200.0 };
+        // the frame's top: 212 for English (the longer message), else 200; Witch on the Holy Night's jp_4AE90
+        // puts it at 179.79 for every language
+        let y = if crate::assets::witch() {
+            179.79259
+        } else if crate::text::english() {
+            212.0
+        } else {
+            200.0
+        };
         out.push(Quad::rect(r.white.clone(), [(318.0 - w / 2.0) * ux, y * uy, (w + 4.0) * ux, (h + 4.0) * uy], [0.0, 0.0, 0.0, 1.0]));
         out.push(Quad::rect(t, [(320.0 - w / 2.0) * ux, (y + 2.0) * uy, w * ux, h * uy], [1.0; 4]));
     }
@@ -6421,6 +6668,10 @@ impl Ui {
         if self.screen == Screen::Game {
             self.draw_choice_dialog(game, r, out);
             self.draw_touch_game(r, out);
+            // a story dialog still fading out after its answer (`wd_ask`)
+            if crate::assets::witch() && self.w.dlg.shown() {
+                self.wd_draw(game, r, out);
+            }
         }
         self.draw_ripples(r, out);
     }
@@ -6435,6 +6686,7 @@ impl Ui {
             // the backdrop fading out after the system menu closed
             Screen::Game => self.draw_menu_layer(out),
             Screen::Intro => self.draw_intro(game, r, out),
+            Screen::Witch => self.witch_draw(game, r, out),
             Screen::Title => self.draw_title(game, r, out),
             Screen::Menu => {
                 // sub_4C370 (640x448 units scaled to the canvas): title band, scene band, underline,
@@ -6504,7 +6756,7 @@ impl Ui {
                     self.draw_digits(out, "savedate_number", &dd, gy);
                     self.draw_digits(out, "savetime_number", &tt, gy);
                     // sub_4F240 labels auto save records (>= 100); the list never holds them on Switch
-                    if slot >= save::AUTO_FIRST {
+                    if slot >= save::auto_first() {
                         self.sprite(out, "saveauto", [fx + 744.0, fy + 26.0, 192.0, 32.0], None);
                     }
                     let var = |k: &str| d.vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map_or(0, |v| v.1);
@@ -6556,16 +6808,20 @@ impl Ui {
                         size,
                         // character spacing -5 + 4 (English -4 + 4, sub_50B10)
                         spacing: if crate::text::english() { 0.0 } else { -1.0 },
+                        sx: 1.0,
                         line_height: crate::text::line_feed() * size / crate::text::BASE_SIZE + 7.0,
                         ascent: crate::text::msg_ascent(crate::game::LAYOUT.ascent * 60.0 * 0.4 / crate::game::LAYOUT.size),
+                        ruby_y: crate::text::RUBY_Y,
                     };
                     let runs = crate::text::parse_markup_edge(self.save_notes.as_deref().unwrap_or(""), false);
                     let mut placed = Vec::new();
                     let font = game.font_mut();
                     let top = 259.259 * H / 448.0 + lay.ascent;
                     crate::text::layout(font, &lay, &runs, lay.left, top, 0, &mut placed);
-                    // colour 0 (black); sub_A8330(38, 4): the writer shows 4 lines
-                    let shown = |pc: &&crate::text::PlacedChar| pc.baseline < top + 3.5 * lay.line_height;
+                    // colour 0 (black); sub_A8330(38, 4): the writer shows 4 lines. Flag 0x2000 is style bit 1, for
+                    // which sub_BDC2C lays the ruby out but keeps it hidden (+287, slot +101007 = !(a4 & 1)):
+                    // Switch, the train page's note without the まえぶ over 前触
+                    let shown = |pc: &&crate::text::PlacedChar| pc.baseline < top + 3.5 * lay.line_height && pc.size == lay.size;
                     for pc in placed.iter().filter(shown) {
                         if let Some(q) = font.placed_quad(r, pc, 0.0, 0.0, [0.0, 0.0, 0.0, 1.0]) {
                             out.push(q);
@@ -7029,7 +7285,11 @@ impl Ui {
                     q.rule = game
                         .assets
                         .rule(r, if next { "RULE_27" } else { "RULE_26" })
-                        .map(|i| knife_render::RuleMask { invert: true, ..knife_render::RuleMask::new(i.tex.clone(), c) });
+                        .map(|i| knife_render::RuleMask {
+                            invert: true,
+                            soft: game.stage.rule_soft,
+                            ..knife_render::RuleMask::new(i.tex.clone(), c)
+                        });
                     out.push(q);
                 }
                 self.fade_quads(out, n0, a);

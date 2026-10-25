@@ -25,6 +25,9 @@ pub enum ChoiceKind {
     Hint,
     /// SELA: "save your progress?" (SYSMES 216); Yes opens the save screen, nothing is stored
     Save,
+    /// SEWI (Witch on the Holy Night, jp_92800 mode 6): the WIK chapter select, 14 figures (values 0..13) over
+    /// black (sub_656A0)
+    Wik,
 }
 
 pub struct Choice {
@@ -53,6 +56,8 @@ pub struct Choice {
     top: f32,
     /// the blurred option texts (texture 5) need drawing
     glow_dirty: bool,
+    /// Witch on the Holy Night: each option's text lines (jp_A8780)
+    lines: Vec<usize>,
 }
 
 /// Pulse step per frame (0x3C3A1D9C).
@@ -77,6 +82,7 @@ impl Choice {
             reveal: vec![0.0; n],
             top: choice_top(),
             glow_dirty: true,
+            lines: vec![1; n],
         }
     }
 
@@ -112,6 +118,53 @@ fn choice_top() -> f32 {
     (if crate::text::english() { 54.178 } else { 63.881 }) * UY + msg_layout().ascent
 }
 
+/// Witch on the Holy Night's option text slots (SELD 0x5f318: jp_AB4D0(20 + n, text, white, 0x801000, 560, 64,
+/// 0, 0, 0.65, 0.65)): 560 units wide, glyphs 0.65 of W / 32 (English 0.9 of that), (0 + 4) px character and
+/// (0 + 14) px line spacing (jp_A7790's C3944), shown at once (0x1000). Laid out from x 0, baseline 0; each line
+/// is centred on x 0 (jp_AB710's 0x100).
+fn witch_option_layout() -> Layout {
+    let base = msg_layout();
+    let size = base.size * 0.65 / 0.74;
+    Layout {
+        left: 0.0,
+        right: 560.0 * UX,
+        size,
+        spacing: 4.0,
+        sx: 1.0,
+        line_height: text::line_feed() * size / text::BASE_SIZE + 14.0,
+        ascent: base.ascent * 0.65 / 0.74,
+        ..base
+    }
+}
+
+/// sel_win (DISP_PARTS 7, image slot 57) rects (x0, y0, x1, y1): one / two-line bars, plain (unk_4594A8 /
+/// 4594A0), focused (4594D0 / 4594C0) and picked (4594D8 / 4594C8).
+const SEL_WIN: [[[f32; 4]; 2]; 3] = [
+    [[30.0, 44.0, 1506.0, 148.0], [30.0, 172.0, 1506.0, 322.0]],
+    [[30.0, 364.0, 1506.0, 468.0], [30.0, 492.0, 1506.0, 642.0]],
+    [[30.0, 684.0, 1506.0, 788.0], [30.0, 812.0, 1506.0, 962.0]],
+];
+
+impl Choice {
+    /// sub_64F10: option `i`'s row top (640x448 units) and x offset. Rows start at 113.66 (26.963 higher for
+    /// each option past four) and take 53.926 per text line (9 less from the second line on); while the
+    /// alpha is below 1 every option but the picked one slides from / to the left (x - 320 (1 - alpha)).
+    fn witch_rows(&self) -> Vec<(f32, f32)> {
+        let n = self.opts.len();
+        let mut y = if n <= 3 { 113.66 } else { 113.66 - 26.963 * (n - 4) as f32 };
+        (0..n)
+            .map(|i| {
+                let picked = self.hover == Some(i) && self.state == 4;
+                let x = if !picked && self.alpha < 1.0 { 320.0 - 320.0 * (2.0 - self.alpha) } else { 0.0 };
+                let row = (x, y);
+                let l = self.lines[i];
+                y += l as f32 * 53.926 + if l > 1 { 9.0 - 9.0 * l as f32 } else { 0.0 };
+                row
+            })
+            .collect()
+    }
+}
+
 impl Game {
     /// A SYSMES line (the table is read once).
     fn sysmes_line(&mut self, i: usize) -> String {
@@ -123,6 +176,11 @@ impl Game {
     /// (EN 0x766b0, case 0x454C52) writes the script text reference "$0439xx" instead, line 43960 + n (43959
     /// from the tenth on): "１．" in Japanese, "1. " (with a space) in the other languages.
     pub(super) fn cmd_selr(&mut self, value: i32, text: &str, disabled: bool) {
+        // Witch on the Holy Night's SELR (0x5aa70) keeps the text alone
+        if crate::assets::witch() {
+            self.sel_opts.push(ChoiceOpt { value, text: text.to_string(), disabled });
+            return;
+        }
         let n = self.sel_opts.len();
         let prefix = if self.assets.build == knife_core::exe::Build::Overseas {
             format!("${:06}", if n >= 9 { 43959 } else { 43960 + n })
@@ -137,10 +195,13 @@ impl Game {
         let kind = match name {
             "SELS" => ChoiceKind::Hint,
             "SELA" => ChoiceKind::Save,
+            "SEWI" => ChoiceKind::Wik,
             _ => ChoiceKind::Page,
         };
         let opts = match kind {
             ChoiceKind::Page => std::mem::take(&mut self.sel_opts),
+            // jp_92800: 14 options, values 0..13 (off_6324E0), no choice id (off_6324D8 = -1)
+            ChoiceKind::Wik => (0..14).map(|value| ChoiceOpt { value, text: String::new(), disabled: false }).collect(),
             // sub_92800 / sub_92930: two buttons, values 0 and 1 (off_AE09D8 = 0x10000)
             _ => (0..2).map(|value| ChoiceOpt { value, text: String::new(), disabled: false }).collect(),
         };
@@ -148,7 +209,11 @@ impl Game {
             tracing::debug!("{name} without options");
             return;
         }
-        if kind == ChoiceKind::Page {
+        if kind == ChoiceKind::Page && crate::assets::witch() {
+            // Witch on the Holy Night's SELD writes no history entries
+            let shown: Vec<String> = opts.iter().map(|o| self.resolve_text(&o.text)).collect();
+            crate::text_stream::choices(shown.iter().map(String::as_str));
+        } else if kind == ChoiceKind::Page {
             // SELD writes every option to the message history as a type 12 entry (the backlog lists them)
             // each option's record keeps F(847 + its index on the page) (`Page::extras`)
             let at = self.page.texts.len() + self.page.choice_texts.len();
@@ -157,6 +222,12 @@ impl Game {
             self.page.choice_texts.extend(opts.iter().map(|o| o.text.clone()));
             let shown: Vec<String> = opts.iter().map(|o| self.resolve_text(&o.text)).collect();
             crate::text_stream::choices(shown.iter().map(String::as_str));
+        } else if kind == ChoiceKind::Wik {
+            // sub_63EB0: the message text goes (jp_53AB0(1)), F823 = 0, F1103 = 1; wik_sel_parts loads into image
+            // slots 4640.. (jp_9A940)
+            self.clear_page(true);
+            self.set_var("F823", 0);
+            self.set_var("F1103", 1);
         } else {
             // sub_83B20: the message text goes (sub_53AB0(1)), F823 = 0, F1103 = 1
             self.page.visible = false;
@@ -196,6 +267,32 @@ impl Game {
     /// Lay out the options of a page choice from its top (text slots 20+, sub_84E50; the overseas sub_7D0C0
     /// lays them out again in the new language after a language change).
     fn place_choice(&self, c: &mut Choice) {
+        if crate::assets::witch() {
+            let lay = witch_option_layout();
+            c.placed.clear();
+            c.lines.clear();
+            for o in &c.opts {
+                let mut placed = Vec::new();
+                let runs = text::parse_markup(&self.resolve_text(&o.text));
+                text::layout(&self.font, &lay, &runs, 0.0, 0.0, 0, &mut placed);
+                let mut rows: Vec<(f32, f32)> = Vec::new();
+                for p in &placed {
+                    let end = p.x + p.width();
+                    match rows.iter_mut().find(|r| r.0 == p.baseline) {
+                        Some(r) => r.1 = r.1.max(end),
+                        None => rows.push((p.baseline, end)),
+                    }
+                }
+                for p in &mut placed {
+                    let w = rows.iter().find(|r| r.0 == p.baseline).map_or(0.0, |r| r.1);
+                    p.x -= w / 2.0;
+                }
+                c.lines.push(rows.len());
+                c.placed.push(placed);
+            }
+            c.reveal = c.placed.iter().map(|p| p.len() as f32).collect();
+            return;
+        }
         let lay = choice_layout();
         c.placed = c
             .opts
@@ -231,7 +328,7 @@ impl Game {
 
     /// A SELS / SELA question dialog is up (sub_85680 / sub_85C10), which turns the mode panel off.
     pub fn choice_question(&self) -> bool {
-        self.choice.as_ref().is_some_and(|c| c.kind != ChoiceKind::Page)
+        self.choice.as_ref().is_some_and(|c| matches!(c.kind, ChoiceKind::Hint | ChoiceKind::Save))
     }
 
     /// The choice takes input (state 3).
@@ -263,7 +360,8 @@ impl Game {
         let (kind, var, value) = (c.kind, c.var.clone(), c.opts[i].value);
         c.hover = Some(i);
         match kind {
-            ChoiceKind::Page => {
+            ChoiceKind::Page | ChoiceKind::Wik if crate::assets::witch() => c.state = 4,
+            ChoiceKind::Page | ChoiceKind::Wik => {
                 c.state = 4;
                 c.flash = 1.0;
             }
@@ -276,14 +374,19 @@ impl Game {
             // sub_83E50 / sub_85690 keep the index in off_AE0AA0
             self.last_pick = i as i32;
         }
-        // sub_83E50 plays system sound 4 for a SELD pick, sub_85690 / sub_85C20 sound 1 for a button
-        self.play_sys_sound(if kind == ChoiceKind::Page { 4 } else { 1 });
+        // sub_83E50 plays system sound 4 for a SELD pick, sub_85690 / sub_85C20 sound 1 for a button (Witch on the
+        // Holy Night's jp_83E50: 0)
+        self.play_sys_sound(match kind {
+            ChoiceKind::Page | ChoiceKind::Wik if crate::assets::witch() => 0,
+            ChoiceKind::Page | ChoiceKind::Wik => 4,
+            _ => 1,
+        });
     }
 
-    /// System sound 0 when the focus moved (sub_83E50 / sub_85690).
+    /// System sound 0 when the focus moved (sub_83E50 / sub_85690; Witch on the Holy Night's jp_83E50: 2).
     fn choice_moved(&mut self, before: Option<usize>) {
         if self.choice.as_ref().is_some_and(|c| c.hover != before) {
-            self.play_sys_sound(0);
+            self.play_sys_sound(if crate::assets::witch() { 2 } else { 0 });
         }
     }
 
@@ -293,17 +396,37 @@ impl Game {
 
     /// Up / down (sub_83E50 state 3: wrap, skipping disabled options; from no focus down takes the first
     /// option, up the last). SELS / SELA (sub_85690) toggle the two buttons.
-    pub fn choice_move(&mut self, delta: i32) {
+    pub fn choice_move(&mut self, delta: i32, repeat: bool) {
         let before = self.choice_hover();
-        self.choice_move_inner(delta);
+        self.choice_move_inner(delta, repeat);
         self.choice_moved(before);
     }
 
-    fn choice_move_inner(&mut self, delta: i32) {
+    fn choice_move_inner(&mut self, delta: i32, repeat: bool) {
         if !self.choice_input() {
             return;
         }
         let Some(c) = &mut self.choice else { return };
+        // sub_65380: up takes the first figure, down the last
+        if c.kind == ChoiceKind::Wik {
+            c.set_hover(Some(if delta < 0 { 0 } else { 13 }));
+            return;
+        }
+        // Witch on the Holy Night's jp_83E50 wraps only on a fresh press, not on key repeat
+        if c.kind == ChoiceKind::Page && crate::assets::witch() {
+            let n = c.opts.len() as i32;
+            let h = c.hover.map_or(-1, |h| h as i32);
+            let next = match delta < 0 {
+                true if h < 1 => (!repeat).then_some(n - 1),
+                true => Some(h - 1),
+                false if h >= n - 1 => (!repeat).then_some(0),
+                false => Some(h + 1),
+            };
+            if let Some(h) = next {
+                c.set_hover(Some(h as usize));
+            }
+            return;
+        }
         if c.kind != ChoiceKind::Page {
             let h = match (c.hover, delta < 0) {
                 (Some(1), true) | (None, false) => 0,
@@ -326,11 +449,24 @@ impl Game {
     }
 
     /// Left / right on the SELS / SELA buttons: No (0) / Yes (1).
-    pub fn choice_side(&mut self, right: bool) {
+    pub fn choice_side(&mut self, right: bool, repeat: bool) {
         let before = self.choice_hover();
+        // sub_65380: left / right step through the figures, wrapping only on a fresh press
         if self.choice_input()
             && let Some(c) = &mut self.choice
-            && c.kind != ChoiceKind::Page
+            && c.kind == ChoiceKind::Wik
+        {
+            let h = c.hover.map_or(-1, |h| h as i32);
+            let next = match right {
+                false if h > 0 => h - 1,
+                false => if repeat { 0 } else { 13 },
+                true if h < 13 => h + 1,
+                true => if repeat { 13 } else { 0 },
+            };
+            c.set_hover(Some(next as usize));
+        } else if self.choice_input()
+            && let Some(c) = &mut self.choice
+            && !matches!(c.kind, ChoiceKind::Page | ChoiceKind::Wik)
         {
             c.set_hover(Some(usize::from(right)));
         }
@@ -342,6 +478,15 @@ impl Game {
         let Some(c) = &self.choice else { return Vec::new() };
         let lay = choice_layout();
         match c.kind {
+            // Witch on the Holy Night: input regions 190 + n (sub_63B20 / sub_64F10) at the row's x offset and
+            // top + 22, x 35..606, 42 units high (64 for two lines)
+            ChoiceKind::Page if crate::assets::witch() => c
+                .witch_rows()
+                .iter()
+                .zip(&c.lines)
+                .map(|(&(x, y), &l)| [(x + 35.0) * UX, (y + 22.0) * UY, 571.0 * UX, if l >= 2 { 64.0 } else { 42.0 } * UY])
+                .collect(),
+            ChoiceKind::Wik => WIK_RECTS.iter().map(|&[x0, y0, x1, y1]| [x0 * UX, y0 * UY, (x1 - x0) * UX, (y1 - y0) * UY]).collect(),
             ChoiceKind::Page => (0..c.opts.len())
                 .map(|i| {
                     let top = c.top + i as f32 * lay.line_height - lay.ascent;
@@ -357,7 +502,12 @@ impl Game {
         if !self.choice_input() {
             return;
         }
-        let h = self.choice_rects().iter().position(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]);
+        let rects = self.choice_rects();
+        // jp_AE840 takes the first region under the pointer in id order: SEWI's region 190 + k is figure
+        // dword_26291C[k]
+        let wik = self.choice.as_ref().is_some_and(|c| c.kind == ChoiceKind::Wik);
+        let order: Vec<usize> = if wik { WIK_REGIONS.to_vec() } else { (0..rects.len()).collect() };
+        let h = order.into_iter().find(|&i| rects.get(i).is_some_and(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]));
         let before = self.choice_hover();
         if let Some(c) = &mut self.choice
             && let Some(h) = h
@@ -388,6 +538,59 @@ impl Game {
             *r = if instant { p.len() as f32 } else { (*r + 16.667 / ms * f).min(p.len() as f32) };
         }
         let page = c.kind == ChoiceKind::Page;
+        // jp_83E50: with config 0x44 a shown choice takes skip mode off (AE0660 bit 1) each input frame and as
+        // the WIK select finishes fading in
+        let stop = crate::assets::witch() && self.settings.choice_skip_stop && c.alpha >= 1.0 && c.state == 3;
+        if stop {
+            self.skip_mode = false;
+        }
+        let Some(c) = &mut self.choice else { return };
+        if c.kind == ChoiceKind::Wik {
+            // jp_83E50 mode 6: 0.02 a frame in and out; at 0 the message goes (jp_53AB0(1)) and wik_sel_parts is
+            // released (jp_9AC00)
+            match c.state {
+                1 => {
+                    c.alpha += 0.02 * f;
+                    if c.alpha >= 1.0 {
+                        c.alpha = 1.0;
+                        c.state = 3;
+                    }
+                }
+                4 => {
+                    c.alpha -= 0.02 * f;
+                    if c.alpha <= 0.0 {
+                        self.choice = None;
+                        self.wait = Wait::None;
+                        self.clear_page(true);
+                        self.wik_parts = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if page && crate::assets::witch() {
+            // jp_83E50: 0.08 a frame in (then input) and out after the pick; at 0 the message goes (jp_53AB0(1))
+            match c.state {
+                1 => {
+                    c.alpha += 0.08 * f;
+                    if c.alpha >= 1.0 {
+                        c.alpha = 1.0;
+                        c.state = 3;
+                    }
+                }
+                4 => {
+                    c.alpha -= 0.08 * f;
+                    if c.alpha <= 0.0 {
+                        self.choice = None;
+                        self.wait = Wait::None;
+                        self.clear_page(true);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match c.state {
             // SELD fades in at 0.04 per frame, SELS / SELA at 0.1
             1 => {
@@ -451,7 +654,7 @@ impl Game {
     pub fn choice_dialog(&self) -> Option<(usize, Option<usize>, f32, f32)> {
         let c = self.choice.as_ref()?;
         let msg = match c.kind {
-            ChoiceKind::Page => return None,
+            ChoiceKind::Page | ChoiceKind::Wik => return None,
             ChoiceKind::Hint => (1445 + self.var("F027")).max(0) as usize,
             ChoiceKind::Save => 216,
         };
@@ -471,7 +674,7 @@ impl Game {
     pub(super) fn render_choice_glow(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
         let (lay, band) = (choice_layout(), self.glow_band());
         let Some(c) = &mut self.choice else { return };
-        if c.kind != ChoiceKind::Page || !c.glow_dirty {
+        if c.kind != ChoiceKind::Page || !c.glow_dirty || crate::assets::witch() {
             return;
         }
         c.glow_dirty = false;
@@ -534,6 +737,9 @@ impl Game {
     /// pixels) at the choice alpha x `page_alpha` (sub_84E50 draws it straight into target 0, unlike the
     /// window and text that sub_391A0 composites later, so a menu blur capture keeps it).
     pub(super) fn choice_backdrop(&mut self, r: &Renderer, page_alpha: f32) -> Option<Quad> {
+        if crate::assets::witch() {
+            return None;
+        }
         let alpha = self.choice.as_ref().filter(|c| c.kind == ChoiceKind::Page)?.alpha;
         let t = self.select_parts(r).get(5).cloned()?;
         let uv = t.uv_max();
@@ -546,6 +752,10 @@ impl Game {
     pub(super) fn choice_quads(&mut self, r: &Renderer, out: &mut Vec<Quad>, page_alpha: f32) {
         let Some(c) = &self.choice else { return };
         if c.kind != ChoiceKind::Page {
+            return;
+        }
+        if crate::assets::witch() {
+            self.witch_choice_quads(r, out, page_alpha);
             return;
         }
         let parts = self.select_parts(r);
@@ -652,6 +862,114 @@ impl Game {
             if let Some(t) = tex(1) {
                 out.push(add(rect(&t, 5.0 * UX, first - 377.9 * UY + pitch * picked, 1.0, 1.0, [1.0, 0.75, 1.0, a])));
             }
+        }
+    }
+}
+
+/// sub_63EB0's input regions (unk_4594E0..: x0, y0, x1, y1 in 640x448 units) per figure (region 190 + k is
+/// figure dword_26291C[k]).
+const WIK_RECTS: [[f32; 4]; 14] = [
+    [0.0, 91.0, 66.0, 447.0], [64.0, 108.0, 109.0, 447.0], [93.0, 63.0, 144.0, 447.0], [143.0, 76.0, 192.0, 447.0],
+    [185.0, 41.0, 237.0, 447.0], [235.0, 68.0, 293.0, 447.0], [266.0, 119.0, 316.0, 447.0], [316.0, 141.0, 358.0, 447.0],
+    [317.0, 7.0, 395.0, 447.0], [366.0, 90.0, 417.0, 447.0], [417.0, 89.0, 470.0, 447.0], [463.0, 57.0, 520.0, 447.0],
+    [517.0, 87.0, 560.0, 447.0], [560.0, 91.0, 640.0, 447.0],
+];
+
+/// dword_26291C: the figure of input region 190 + k.
+const WIK_REGIONS: [usize; 14] = [7, 6, 1, 0, 13, 9, 10, 12, 3, 5, 2, 11, 4, 8];
+
+/// Figure positions (unk_262954, 640x448 units, top-left; the images at native scale, 0.33333 x 0.41481).
+const WIK_POS: [(f32, f32); 14] = [
+    (-10.0, 91.0), (46.0, 108.0), (58.0, 63.0), (99.0, 76.0), (140.0, 41.0), (213.0, 68.0), (253.0, 119.0),
+    (303.0, 141.0), (297.0, 7.0), (353.0, 90.0), (398.0, 89.0), (441.0, 57.0), (486.0, 87.0), (530.0, 91.0),
+];
+
+/// sub_656A0's draw order of the unfocused figures.
+const WIK_ORDER: [usize; 14] = [8, 4, 11, 2, 5, 3, 12, 10, 9, 13, 0, 1, 6, 7];
+
+impl Game {
+    /// sub_656A0 (SEWI, drawn after the page text): black over the screen, the figures (wik_sel_parts: entry 2n
+    /// in colour for the focused one, 2n + 1 mono for the rest), then black at 1 - the choice alpha.
+    pub(super) fn wik_quads(&mut self, r: &Renderer, out: &mut Vec<Quad>) {
+        let Some(c) = &self.choice else { return };
+        if c.kind != ChoiceKind::Wik {
+            return;
+        }
+        let (alpha, hover) = (c.alpha, c.hover);
+        if self.wik_parts.is_none() {
+            self.wik_parts = Some(match self.assets.ui_textures(r, "WIK_SEL_PARTS") {
+                Ok(t) => t.into_iter().map(|(_, t)| t).collect(),
+                Err(e) => {
+                    tracing::warn!("WIK_SEL_PARTS: {e:#}");
+                    Vec::new()
+                }
+            });
+        }
+        let parts = self.wik_parts.clone().unwrap_or_default();
+        let black = |a: f32| Quad::rect(r.white.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [0.0, 0.0, 0.0, a]);
+        out.push(black(1.0));
+        if alpha > 0.0 {
+            let fig = |i: usize, colour: bool| {
+                let t = parts.get(2 * i + usize::from(!colour))?;
+                let (x, y) = WIK_POS[i];
+                let uv = t.uv_max();
+                Some(
+                    Quad::rect(t.clone(), [x * UX, y * UY, t.width as f32, t.height as f32], [1.0; 4])
+                        .with_uv_rect(0.0, 0.0, uv[0], uv[1]),
+                )
+            };
+            for &i in &WIK_ORDER {
+                if hover != Some(i) {
+                    out.extend(fig(i, false));
+                }
+            }
+            if let Some(h) = hover {
+                out.extend(fig(h, true));
+            }
+        }
+        if alpha < 1.0 {
+            out.push(black(1.0 - alpha));
+        }
+    }
+
+    /// sub_64F10 (Witch on the Holy Night, 640x448 units): per option the sel_win bar (shader 27, anchor 1 = top
+    /// centre, scale 0.42333 x 0.41481) centred at x + 320, top y + 22, then its text slot centred there with its
+    /// top at y + 32 (two lines: 31; English 3 lower), all at alpha choice x window alpha.
+    fn witch_choice_quads(&mut self, r: &Renderer, out: &mut Vec<Quad>, page_alpha: f32) {
+        let Some(c) = &self.choice else { return };
+        let a = c.alpha * page_alpha;
+        if a <= 0.0 {
+            return;
+        }
+        let lay = witch_option_layout();
+        let bar = self.disp.get(7).cloned();
+        let rows = c.witch_rows();
+        let en = text::english();
+        let mut glyphs = Vec::new();
+        for (i, &(x, y)) in rows.iter().enumerate() {
+            let l = c.lines[i];
+            let two = usize::from(l > 1);
+            let look = if c.hover != Some(i) { 0 } else if c.state == 4 { 2 } else { 1 };
+            if let Some(t) = &bar {
+                let [x0, y0, x1, y1] = SEL_WIN[look][two];
+                let (w, h) = ((x1 - x0) * 0.42333 * UX, (y1 - y0) * 0.41481 * UY);
+                let (tw, th) = (t.width as f32, t.height as f32);
+                out.push(
+                    Quad::rect(t.clone(), [(x + 320.0) * UX - w / 2.0, (y + 22.0) * UY, w, h], [1.0, 1.0, 1.0, a])
+                        .with_uv_rect(x0 / tw, y0 / th, x1 / tw, y1 / th),
+                );
+            }
+            let top = y + if l > 1 { 31.0 } else { 32.0 } + if en { 3.0 } else { 0.0 };
+            let (dx, dy) = ((x + 320.0) * UX, top * UY + lay.ascent);
+            for p in &c.placed[i] {
+                let mut p = *p;
+                p.x += dx;
+                p.baseline += dy;
+                glyphs.push(p);
+            }
+        }
+        for p in &glyphs {
+            Self::rimmed_glyph(&mut self.font, r, out, p, a);
         }
     }
 }

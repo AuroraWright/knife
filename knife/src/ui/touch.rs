@@ -149,6 +149,8 @@ pub struct Touch {
     /// The buttons' object flag 2 (objects 207..214, sub_ADE80): previous scene / next scene / Q.SAVE /
     /// Q.LOAD unavailable, auto lit. The objects start without it (unk_5918C8: flags 0x320).
     pflags: [bool; 8],
+    /// Witch on the Holy Night: the buttons' object states (jp_AE840's crossfade)
+    wbtn: [super::witch::WBtn; 8],
     /// The panel's selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad,
     /// which the next opening starts on (LODWORD)
     pub panel_key: Option<usize>,
@@ -193,6 +195,7 @@ impl Touch {
             held_frames: 0.0,
             flash: [0.0; 8],
             pflags: [false; 8],
+            wbtn: Default::default(),
             panel_key: None,
             // sub_4DCC0: the panel's cursor starts on fast forward
             panel_last: 3,
@@ -257,9 +260,16 @@ impl Ui {
     /// sub_4E170 state 3 closed by a button (0x4e460): the last touch's y (+0x30, and the pointer's +0x18) goes to
     /// 120 so a touch that opened the panel from the top 25 units does not open it again in state 1, and the
     /// press is used up for the frame (off_AE0490 = 1).
+    /// Witch on the Holy Night (jp_4E170) puts it at 224 and sets off_632388, so a ZL that closed the panel
+    /// does not rewind until it is let go.
     pub(super) fn close_panel_by_button(&mut self) {
         self.touch.panel = Panel::Closing;
-        self.touch.at[1] = 120.0;
+        if crate::assets::witch() {
+            self.touch.at[1] = 224.0;
+            self.w.zl_block = true;
+        } else {
+            self.touch.at[1] = 120.0;
+        }
     }
 
     /// sub_4E170 case 6, after the quick load (sub_527A0(139)): the mode panel slides shut from where it is
@@ -302,6 +312,20 @@ impl Ui {
         self.touch.trail = [self.units(); 2];
         if !matches!(self.intro, Some(super::Intro::Logo { .. } | super::Intro::Notice { .. })) {
             self.touch.spawn(x, y);
+        }
+        if self.screen == Screen::Witch {
+            self.touch.down = true;
+            self.touch.at = self.units();
+            self.witch_mouse_down();
+            return;
+        }
+        if self.screen == Screen::Title && crate::assets::witch() {
+            self.witch_mouse_down();
+            // the load screen (state 25) and the popups take the touch through the input word only
+            if self.wt.st == 25 || self.w.popup.busy != 0 {
+                self.touch.down = true;
+                return;
+            }
         }
         self.touch.hovered = true;
         self.touch.visible = 256.0;
@@ -347,6 +371,13 @@ impl Ui {
 
     pub fn mouse_up(&mut self, game: &mut Game, r: &Renderer) {
         self.touch.down = false;
+        if self.screen == Screen::Witch {
+            self.witch_mouse_up();
+            return;
+        }
+        if self.screen == Screen::Title && crate::assets::witch() {
+            self.witch_mouse_up();
+        }
         self.drag.release();
         self.bar = None;
         let Some(start) = self.touch.press.take() else { return };
@@ -378,6 +409,13 @@ impl Ui {
             return;
         }
         let [x, y] = self.units();
+        // the TeaTime menu: a tap released on its focused button presses it, or sends the Saved banner away
+        if game.teatime_active() {
+            if !self.touch.dragged && !swallow {
+                game.teatime_click();
+            }
+            return;
+        }
         if self.touch.dragged {
             self.flick(game, r, start, [x, y]);
             return;
@@ -427,6 +465,14 @@ impl Ui {
                 if down && start[1] <= 99.0 {
                     // a downward flick from the top opens the mode panel (sub_4E090(1))
                     self.touch.panel = Panel::Opening;
+                } else if crate::assets::witch() {
+                    // Witch on the Holy Night (jp_40ED0) the other way round: a right flick from x < 100 the
+                    // backlog, a left flick from x >= 541 the system menu
+                    if right && start[0] < 100.0 && self.wl_ok(game) {
+                        self.wl_open(game, r);
+                    } else if left && start[0] >= 541.0 {
+                        self.cancel(game, r);
+                    }
                 } else if right && start[0] <= 99.0 {
                     // from the left edge: the system menu (off_AE0678)
                     self.cancel(game, r);
@@ -456,6 +502,22 @@ impl Ui {
         }
     }
 
+    /// TeaTime state 10 (ZL or the drag to the left): the menu returns 2 and sub_40ED0 starts the rewind
+    /// (off_AE05B8 = 1) with a step that frame (sub_814C0); it goes on while ZL or the drag holds.
+    pub(super) fn teatime_rewind(&mut self, game: &mut Game, r: &Renderer) {
+        if !game.teatime_rewind() {
+            return;
+        }
+        self.touch.rewind = 1;
+        self.touch.rewind_t = 0.0;
+        game.speed = 1;
+        game.rewind_frame();
+        game.rewinding = true;
+        if game.settled() {
+            game.rewind_step(r);
+        }
+    }
+
     /// Show the hidden message window by other means than a touch: like the exe (0x41E1C, 0x42158, 0x421C4,
     /// 0x4223C) the remembered touch moves out of the bottom 40 units (y 409+ -> 398) so it does not hide
     /// the window again.
@@ -473,14 +535,25 @@ impl Ui {
             return None;
         }
         let i = self.touch.panel_hover.or(self.touch.panel_key)?;
+        let pos = [PANEL_X0 + PANEL_DX * i as f32, self.panel_y() + PANEL_BTN_Y];
+        // Witch on the Holy Night: table 0x3cdfd8, SYSMES 145..152, rect (5, -4)-(70, 35)
+        if crate::assets::witch() {
+            return Some((super::witch::PANEL_HELP[i], pos, [5.0, -4.0, 70.0, 35.0], 0x320));
+        }
         let id = [169, 171, 173, 172, 170, 174, 175, 176][i];
-        Some((id, [PANEL_X0 + PANEL_DX * i as f32, self.panel_y() + PANEL_BTN_Y], [4.0, -10.0, 70.0, 36.0], 0x320))
+        Some((id, pos, [4.0, -10.0, 70.0, 36.0], 0x320))
     }
 
     /// sub_40ED0 enables the mode panel (sub_4E080(1)) in the story, also over a choice list; only the SELS / SELA
     /// question dialogs (byte_14715B0 / byte_14715B1), a scene countdown and the engine tasks turn it off.
-    fn panel_allowed(&self, game: &Game) -> bool {
-        self.screen == Screen::Game && !game.choice_question() && self.touch.scene_cd.is_none() && !game.mode_task()
+    /// Witch on the Holy Night's state 1 also waits out a choice (jp_83B00: AE04B8 0x10 or a question) and a
+    /// TeaTime scene (sub_3A820, which also covers the story movie's F036).
+    pub(super) fn panel_allowed(&self, game: &Game) -> bool {
+        self.screen == Screen::Game
+            && !game.choice_question()
+            && self.touch.scene_cd.is_none()
+            && !game.mode_task()
+            && !(crate::assets::witch() && (game.in_choice() || game.teatime_scene()))
     }
 
         fn panel_y(&self) -> f32 {
@@ -489,20 +562,44 @@ impl Ui {
         -43.14 - 43.14 * t * (t - 2.0)
     }
 
+    /// Witch on the Holy Night hit-tests the objects' rect (5, -4)-(70, 35), inclusive (jp_AE840).
     fn panel_button(&self) -> Option<usize> {
         let [x, y] = self.units();
         let top = self.panel_y() + PANEL_BTN_Y;
         (0..8).find(|&i| {
             let x0 = PANEL_X0 + PANEL_DX * i as f32;
+            if crate::assets::witch() {
+                let (x0, y0) = ((x0 as i32 + 5).max(0) as f32, (top as i32 - 4).max(0) as f32);
+                return (x0..=x0 + 65.0).contains(&x.trunc()) && (y0..=top.trunc() + 35.0).contains(&y.trunc());
+            }
             x >= x0 && x < x0 + BTN_W / UX && y >= top && y < top + BTN_H / UY
         })
+    }
+
+    /// Witch on the Holy Night: button `i`'s object state (jp_AE840): 4 pressed, 1 / 3 focused (3 with flag 2),
+    /// 2 flag 2 (unavailable; auto lit), else 0. Only the open panel's buttons take the focus, and none while a
+    /// dialog has it.
+    fn wpanel_state(&self, i: usize) -> u8 {
+        let dialog = self.screen == Screen::Witch || self.w.dlg.busy();
+        let focus = self.touch.panel_hover.or(self.touch.panel_key).filter(|_| !dialog && self.touch.panel == Panel::Open);
+        let on = self.touch.pflags[i];
+        if self.touch.flash[i] > 0.0 {
+            4
+        } else if focus == Some(i) {
+            if on { 3 } else { 1 }
+        } else if on {
+            2
+        } else {
+            0
+        }
     }
 
     /// Panel buttons 4..6 that sub_4E0C0 leaves enabled: next scene except in a gallery flowchart replay
     /// (sub_50F0), Q.SAVE / Q.LOAD unless saving is off (F025, sub_47B10).
     pub(super) fn panel_ok(&self, game: &Game, b: usize) -> bool {
         match b {
-            4 => self.gal_ret[0] != 2,
+            // (Witch on the Holy Night has no gallery replay: nothing sets object 184's flag)
+            4 => crate::assets::witch() || self.gal_ret[0] != 2,
             5 | 6 => game.var("F025") == 0,
             _ => true,
         }
@@ -526,6 +623,10 @@ impl Ui {
 
     /// A tapped mode panel button (sub_4E170 state 3 cases 0..7; 1 and 3 act while held, see `touch_update`).
     pub(super) fn panel_press(&mut self, game: &mut Game, r: &Renderer, b: usize) {
+        if crate::assets::witch() {
+            self.witch_panel_press(game, r, b);
+            return;
+        }
         self.touch.flash[b] = 10.0;
         // sub_4E170: a button that acts plays system sound 1 (before its dialog), an unavailable one sound 2
         match b {
@@ -551,13 +652,79 @@ impl Ui {
                 self.quick_save(game, r);
             }
             // case 6: sound 2 without a quick save (sub_52BF0(139) < 1)
-            6 if self.panel_ok(game, 6) && self.slots.get(save::QUICK_SLOT).is_some_and(Option::is_some) => {
+            6 if self.panel_ok(game, 6) && self.slots.get(save::quick_slot()).is_some_and(Option::is_some) => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::QuickLoad);
             }
             0 | 4 | 5 | 6 => self.snd(game, 2),
             7 => game.replay_voice(),
             _ => {}
+        }
+    }
+
+    /// Witch on the Holy Night's jp_4E170 state 3 cases 0..7: a button that acts plays sound 0 and is pressed
+    /// for 10 frames (jp_AE040, not while its flag 2 is on); previous / next scene want config 0x32 and sound 6
+    /// while unavailable, then ask when sub_53980 allows the jump (jp_40ED0 states 4 / 1: dialogs 11 / 10);
+    /// Q.SAVE wants saving on (F025), the cooldown out (jp_40E90), a resumable point and no quick record at
+    /// this point already (sub_359F0), else sound 1; Q.LOAD wants saving on and a quick record (sub_35B30(120)),
+    /// else sound 1.
+    fn witch_panel_press(&mut self, game: &mut Game, r: &Renderer, b: usize) {
+        let jumps = game.settings.scene_jump;
+        let acted = match b {
+            0 | 4 if !jumps => false,
+            0 | 4 if self.touch.pflags[b] => {
+                self.snd(game, 6);
+                false
+            }
+            0 | 4 => {
+                self.snd(game, 0);
+                let next = b == 4;
+                if if next { game.next_scene_allowed() } else { game.prev_scene_allowed() } {
+                    game.drop_capture();
+                    self.wd_ask(game, r, if next { Confirm::NextScene } else { Confirm::PrevScene });
+                }
+                true
+            }
+            2 => {
+                self.snd(game, 0);
+                self.toggle_auto(game);
+                true
+            }
+            5 => {
+                let same = game
+                    .save_data()
+                    .zip(self.slots.get(save::quick_slot()).and_then(Option::as_ref))
+                    .is_some_and(|(a, b)| a.scene == b.scene && a.pc == b.pc);
+                if game.var("F025") == 0 && self.save_cool == 0 && game.can_save() && !same {
+                    self.snd(game, 0);
+                    self.show_banner(1);
+                    self.write_quiet(game, r, save::quick_slot());
+                    self.save_cool = 180;
+                    game.play_sys_sound(13);
+                    true
+                } else {
+                    self.snd(game, 1);
+                    false
+                }
+            }
+            6 => {
+                if game.var("F025") == 0 && self.slots.get(save::quick_slot()).is_some_and(Option::is_some) {
+                    self.snd(game, 0);
+                    self.wd_ask(game, r, Confirm::QuickLoad);
+                    true
+                } else {
+                    self.snd(game, 1);
+                    false
+                }
+            }
+            7 => {
+                game.replay_voice();
+                true
+            }
+            _ => false,
+        };
+        if acted && !self.touch.pflags[b] {
+            self.touch.flash[b] = 10.0;
         }
     }
 
@@ -577,7 +744,11 @@ impl Ui {
         }
         // no story touches during a scene countdown (sub_40ED0 returns first)
         // nor during the staff roll task (off_AE0650 = 1; only taps and ZR act)
-        let in_game = self.screen == Screen::Game && !game.in_choice() && self.touch.scene_cd.is_none() && !game.mode_task();
+        let in_game = self.screen == Screen::Game
+            && !game.in_choice()
+            && !game.teatime_active()
+            && self.touch.scene_cd.is_none()
+            && !game.mode_task();
         let panel_game = self.panel_allowed(game);
         let held = self.touch.press.is_some();
         let [x, y] = self.touch.at;
@@ -597,6 +768,13 @@ impl Ui {
         }
         for v in &mut self.touch.flash {
             *v = (*v - f).max(0.0);
+        }
+        if crate::assets::witch() {
+            self.wmp_load(game, r);
+            for i in 0..8 {
+                let st = self.wpanel_state(i);
+                self.touch.wbtn[i].step(st, f);
+            }
         }
 
         // drag arrow (sub_40ED0): a touch that started in the middle of the screen; the stretch is
@@ -622,6 +800,16 @@ impl Ui {
             self.touch.arrow_a = (self.touch.arrow_a - 0.03 * f).max(0.0);
         }
 
+        // the TeaTime menu (sub_74190) reads the drag arrow's stretch (off_632508, x - start): 45 units to the
+        // left rewinds
+        if self.screen == Screen::Game
+            && game.teatime_active()
+            && self.touch.press.is_some_and(|p| (121.0..=519.0).contains(&p[0]) && (125.0..=383.0).contains(&p[1]))
+            && ((x - self.touch.press.unwrap()[0]).clamp(-260.0, 260.0) as i32) <= -45
+        {
+            self.teatime_rewind(game, r);
+        }
+
         // mode panel buttons held: rewind (case 1, speed ramping over 8..107 frames up to 64) and
         // skip (case 3, speed 64)
         let mut panel_rewind = None;
@@ -642,6 +830,12 @@ impl Ui {
                 }
                 Some(3) => panel_skip = true,
                 _ => self.touch.held_frames = 0.0,
+            }
+            // Witch on the Holy Night: cases 1 / 3 press their object every held frame (jp_AE040(.., 10))
+            if let Some(b @ (1 | 3)) = held_button
+                && crate::assets::witch()
+            {
+                self.touch.flash[b] = 10.0;
             }
         } else {
             self.touch.held_frames = 0.0;
@@ -665,7 +859,11 @@ impl Ui {
         } else {
             None
         };
-        let zl = if in_game && self.touch.panel == Panel::Closed { self.touch.zl.map(ramp) } else { None };
+        // (Witch on the Holy Night: not while off_632388 holds it after a screen closed with ZL)
+        if self.touch.zl.is_none() {
+            self.w.zl_block = false;
+        }
+        let zl = if in_game && self.touch.panel == Panel::Closed && !self.w.zl_block { self.touch.zl.map(ramp) } else { None };
         // forward: skip at the speed (unread text still stops it unless the config allows it);
         // backward: rewind, one ring entry a frame without running the script
         let fwd = if panel_skip { 64 } else { zr.unwrap_or(speed.max(0) as u32) };
@@ -768,8 +966,11 @@ impl Ui {
                 }
             }
             Panel::Opening => {
-                if self.touch.panel_t == 0.0 && game.assets.build == knife_core::exe::Build::Overseas {
-                    // overseas sub_4E170 state 1: sub_4E0C0 and sub_4F100 before the slide
+                if self.touch.panel_t == 0.0
+                    && matches!(game.assets.build, knife_core::exe::Build::Overseas | knife_core::exe::Build::Witch)
+                {
+                    // overseas sub_4E170 state 1: sub_4E0C0 and sub_4F100 before the slide (Witch on the Holy
+                    // Night: objects 185 / 186 and sub_2E8C0)
                     self.panel_flags_save(game);
                     self.panel_flags_scene(game);
                 }
@@ -790,13 +991,14 @@ impl Ui {
                 // state 3, as the other menus' cursors: the pointed button takes the focus (sound 0 when it
                 // changes) and is the one the pad goes on from (qword_B35A1C); a pointer moved off the buttons
                 // leaves none lit, the pad's focus (HIDWORD(qword_B35A14)) only stays until the pointer moves
-                if hovered {
+                // (Witch on the Holy Night: sound 2; a story dialog over the panel takes the pointer)
+                if hovered && self.screen != Screen::Witch {
                     let before = self.touch.panel_hover.or(self.touch.panel_key);
                     self.touch.panel_hover = self.panel_button();
                     self.touch.panel_key = None;
                     if let Some(h) = self.touch.panel_hover {
                         if before != Some(h) {
-                            game.play_sys_sound(0);
+                            game.play_sys_sound(if crate::assets::witch() { 2 } else { 0 });
                         }
                         self.touch.panel_last = h;
                     }
@@ -896,7 +1098,9 @@ impl Ui {
             let (x, y) = (X[icon] * UX, 38.163 * UY);
             self.sprite_c(out, "mode_disp", [x - 44.0, y - 44.0, 88.0, 88.0], Some([CELL[icon], 0.0, 88.0, 88.0]), a, Blend::Alpha);
         }
-        if self.touch.panel_t > 0.0 {
+        if self.touch.panel_t > 0.0 && crate::assets::witch() {
+            self.wmp_draw(out, self.panel_y(), &self.touch.wbtn);
+        } else if self.touch.panel_t > 0.0 {
             let y = self.panel_y();
             self.spr(out, "modepanel_window", 0.0, y * UY, None);
             let top = (y + PANEL_BTN_Y) * UY;

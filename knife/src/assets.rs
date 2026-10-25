@@ -42,9 +42,9 @@ pub struct Image {
 impl Image {
     /// The stage anchor cmd_STCH_impl gives a layer showing this image: its centre cut to whole units (stage
     /// float 221 + layer = (int)centre, shift word 2923 + 9 * layer = (int)-centre), what the draw zooms and
-    /// turns about.
+    /// turns about. Witch on the Holy Night's STCH (jp_60840) takes the exact centre.
     pub fn anchor(&self) -> [f32; 2] {
-        [self.center_x.trunc(), self.center_y.trunc()]
+        if witch() { [self.center_x, self.center_y] } else { [self.center_x.trunc(), self.center_y.trunc()] }
     }
 }
 
@@ -88,6 +88,8 @@ pub struct Assets {
     /// list pictures IMG6000..6026 and 140 other images allpac lacks, with their thumbnails
     pub allpacml: Option<Arc<Archive>>,
     pub allpachd: Option<Arc<Archive>>,
+    /// Witch on the Holy Night's allpachdml (archive 11): the HD pictures of more than one language
+    pub allpachdml: Option<Arc<Archive>>,
     pub allpaccg: Option<Arc<Archive>>,
     pub allui: Arc<Archive>,
     pub tables: ExeTables,
@@ -100,9 +102,16 @@ pub struct Assets {
     sounds: HashMap<String, Option<Arc<Pcm>>>,
 }
 
-/// The build a romfs belongs to: the overseas data names its archives `w_allpac` / `w_allui` / ... (sub_AE050).
+/// The build a romfs belongs to: the overseas data names its archives `w_allpac` / `w_allui` / ... (sub_AE050),
+/// Witch on the Holy Night's `jallpac` / `jallpachd` (WoH sub_89A80).
 pub fn detect_build(romfs: &Path) -> Build {
-    if romfs.join("w_allpac.nam").exists() { Build::Overseas } else { Build::Japanese }
+    if romfs.join("w_allpac.nam").exists() {
+        Build::Overseas
+    } else if romfs.join("jallpac.nam").exists() {
+        Build::Witch
+    } else {
+        Build::Japanese
+    }
 }
 
 /// The executable's tables for a build, compiled in (`kdu exe-tables` writes them; knife_core::exe).
@@ -110,6 +119,7 @@ pub fn exe_tables(build: Build) -> Result<Nso> {
     Nso::from_bundle(match build {
         Build::Japanese => include_bytes!("../data/exe_tables.bin"),
         Build::Overseas => include_bytes!("../data/exe_tables_overseas.bin"),
+        Build::Witch => include_bytes!("../data/exe_tables_witch.bin"),
     })
 }
 
@@ -140,6 +150,9 @@ pub const TITLE: &str = "月姫 -A piece of blue glass moon-";
 const OVERSEAS_TITLES: [&str; 4] =
     [TITLE, "TSUKIHIME A piece of blue glass moon", "月姬 -A piece of blue glass moon-", "月姬 -A piece of blue glass moon-"];
 
+/// Witch on the Holy Night's application titles by game language.
+const WITCH_TITLES: [&str; 4] = ["魔法使いの夜", "WITCH ON THE HOLY NIGHT", "魔法使之夜", "魔法使之夜"];
+
 /// The SYSMES message the overseas build inserts at 217 (the "deleted" popup, `jp_50FC0` state 25). knife keeps
 /// the Japanese numbering and moves it here, past the Japanese build's 1498 messages.
 pub const SYSMES_DELETED: usize = 1498;
@@ -152,16 +165,44 @@ pub fn overseas() -> bool {
     OVERSEAS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The loaded executable is Witch on the Holy Night's.
+static WITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the build before anything reads the save file, whose layout depends on it (Assets::open sets the
+/// same flags).
+pub fn select_build(build: Build) {
+    OVERSEAS.store(build == Build::Overseas, std::sync::atomic::Ordering::Relaxed);
+    WITCH.store(build == Build::Witch, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn witch() -> bool {
+    #[cfg(test)]
+    if TEST_WITCH.get() {
+        return true;
+    }
+    WITCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests of Witch on the Holy Night's tables switch the build on for their own thread.
+    pub static TEST_WITCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Assets {
     /// `language` is the config word (`cfg::LANGUAGE`); `language()` resolves it like sub_2DE70.
     pub fn open(romfs: &Path, nso: &Nso, language: i16) -> Result<Self> {
         let tables = ExeTables::load(nso)?;
         let build = tables.build;
-        // sub_AE050: the overseas archives allpac / allpacml / allui / allpaccg carry a `w_` prefix
+        // sub_AE050: the overseas archives allpac / allpacml / allui / allpaccg carry a `w_` prefix; Witch on the
+        // Holy Night (WoH sub_89A80) opens jallpac (8), allpacml (9), jallpachd (10), allpachdml (11), allui (12)
+        // and parts (25), with no CG archive
         let w = |base: &str| match build {
             Build::Overseas => format!("w_{base}"),
-            Build::Japanese => base.to_string(),
+            Build::Witch if base == "allpac" => "jallpac".to_string(),
+            Build::Japanese | Build::Witch => base.to_string(),
         };
+        let hd = if build == Build::Witch { "jallpachd" } else { "allpachd" };
         let image_index = tables
             .images
             .iter()
@@ -170,7 +211,8 @@ impl Assets {
             .collect();
         let scenes = SceneArchive::parse(&std::fs::read(romfs.join("allscr.mrg")).context("reading allscr.mrg")?)?;
         let script_text = std::fs::read(romfs.join("script_text.mrg")).context("reading script_text.mrg")?;
-        let sar = SoundArchive::parse(std::fs::read(romfs.join("knife1.bfsar")).context("reading knife1.bfsar")?)?;
+        let sar_name = if build == Build::Witch { "witch.bfsar" } else { "knife1.bfsar" };
+        let sar = SoundArchive::parse(std::fs::read(romfs.join(sar_name)).with_context(|| format!("reading {sar_name}"))?)?;
         let allui = Arc::new(Archive::open(romfs, &w("allui"))?);
         let languages = Self::sysmes_file(&allui, build).map_or(1, |d| sysmes_u32(&d, 0).unwrap_or(1).max(1) as usize);
         let mut a = Self {
@@ -182,8 +224,9 @@ impl Assets {
             script_text,
             allpac: Arc::new(Archive::open(romfs, &w("allpac"))?),
             allpacml: Archive::open(romfs, &w("allpacml")).ok().map(Arc::new),
-            allpachd: Archive::open(romfs, "allpachd").ok().map(Arc::new),
-            allpaccg: Archive::open(romfs, &w("allpaccg")).ok().map(Arc::new),
+            allpachd: Archive::open(romfs, hd).ok().map(Arc::new),
+            allpachdml: if build == Build::Witch { Archive::open(romfs, "allpachdml").ok().map(Arc::new) } else { None },
+            allpaccg: if build == Build::Witch { None } else { Archive::open(romfs, &w("allpaccg")).ok().map(Arc::new) },
             allui,
             tables,
             image_index,
@@ -195,8 +238,26 @@ impl Assets {
         };
         crate::text::set_line_break(a.tables.line_break.clone());
         OVERSEAS.store(a.build == Build::Overseas, std::sync::atomic::Ordering::Relaxed);
-        a.set_language(language)?;
+        WITCH.store(a.build == Build::Witch, std::sync::atomic::Ordering::Relaxed);
+        // the first language may be the one the text was parsed in, which `set_language` skips: the fonts'
+        // metrics still apply (Witch on the Holy Night's Japanese font pairs to a 49 px line feed, not 50)
+        if !a.set_language(language)? {
+            a.apply_font_metrics();
+        }
         Ok(a)
+    }
+
+    /// Hand the language's font metrics (`font_metrics`) to the text layout.
+    fn apply_font_metrics(&self) {
+        let (msg, bubble) = self.font_metrics();
+        // Tsukihime's bubble font is in the message font list (`<folder>3`), whose line feed it shares
+        let bubble_feed = if self.build == Build::Witch { bubble.line_feed } else { msg.line_feed };
+        crate::text::set_font_metrics(msg.line_feed, msg.ascent, msg.baseline, bubble.ascent, bubble_feed);
+    }
+
+    /// jp_9A700: the languages the data declares.
+    pub fn languages(&self) -> usize {
+        self.languages
     }
 
     /// sub_2DE70: the game language for a config word (negative or past the data's languages: the system's).
@@ -217,6 +278,7 @@ impl Assets {
     pub fn title(&self) -> &'static str {
         match self.build {
             Build::Overseas => OVERSEAS_TITLES.get(self.language).copied().unwrap_or(TITLE),
+            Build::Witch => WITCH_TITLES.get(self.language).copied().unwrap_or(WITCH_TITLES[0]),
             Build::Japanese => TITLE,
         }
     }
@@ -232,8 +294,7 @@ impl Assets {
         self.text = ScriptText::parse(&self.script_text, language)?;
         self.language = language;
         crate::text::set_language(language);
-        let (msg, bubble) = self.font_metrics();
-        crate::text::set_font_metrics(msg.line_feed, msg.ascent, msg.baseline, bubble.ascent);
+        self.apply_font_metrics();
         let strips: Vec<String> = self
             .images
             .keys()
@@ -316,6 +377,41 @@ impl Assets {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Witch on the Holy Night's HD lookup (jp_A90C0(name, 1)): jallpachd's list (jd_18C0514 = 2), then
+    /// allpachdml's (3), then allui's (4).
+    fn hd_archives(&self) -> Vec<Arc<Archive>> {
+        [self.allpachd.as_ref(), self.allpachdml.as_ref(), Some(&self.allui)].into_iter().flatten().cloned().collect()
+    }
+
+    /// Whether jp_A90C0(name, 1) finds `name` (CG mode's pictures).
+    pub fn has_image_hd(&self, name: &str) -> bool {
+        self.hd_archives().iter().any(|a| a.find_stem(name).is_some())
+    }
+
+    /// A picture through the HD lookup (CG mode's textures 285 / 286, jp_B6A20 after sub_83E00(2 / 3)), sized
+    /// by its texels: the HD files are stored at the 1920x1080 size the tables give.
+    pub fn image_hd(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
+        let (name, grade, key) = Self::image_key(name, Bake::NONE);
+        let key = format!("HD {key}");
+        if let Some(i) = self.images.get(&key) {
+            return i.clone();
+        }
+        let pixels = Self::decode_pixels(&self.hd_archives(), &name, grade, self.strip(&name));
+        let img = match pixels.and_then(|p| self.upload_pixels(r, &name, p)) {
+            Ok(mut i) => {
+                i.width = i.tex.width as f32;
+                i.height = i.tex.height as f32;
+                Some(Arc::new(i))
+            }
+            Err(e) => {
+                tracing::warn!("image {name}: {e:#}");
+                None
+            }
+        };
+        self.images.insert(key, img.clone());
+        img
     }
 
     fn image_bytes(archives: &[Arc<Archive>], name: &str) -> Option<Vec<u8>> {
@@ -458,6 +554,20 @@ impl Assets {
         };
         let no_shake = self.image_info(name).is_some_and(|i| i.no_shake);
         let (width, height, center_x, center_y, level) = match self.image_info(name) {
+            // Witch on the Holy Night's layer draw (sub_1A090 -> jp_B0460 / sub_16210 / jp_36520) sizes the quad by
+            // the altered texture, (u32)(size / 0.66667) px (jp_A3180) in the 1920x1080 space, a language-strip
+            // image's height over the strip count; the ImageInfo gives only the centre (+52 / +56) the position is
+            // offset by. Its width / height can disagree (SOU_L_12_10_00_01_01: 228 x 384 units, texture 402 x 860).
+            // The save thumbnails (jp_89AD0) size their 1/6 copies by texture / 0.16667 in the 1280x720 thumbnail
+            // surface, 1.5 times that in the 1920 space the previews are laid out in.
+            Some(i) if witch() => {
+                let n = self.strip(name).map_or(1, |(_, n)| n as u32);
+                let (k, m) = if name.starts_with(THUMB) { (0.16667, 1.5) } else { (0.66667, 1.0) };
+                let alt = |v: u32| (v as f32 / k) as u32 as f32 * m;
+                let w = alt(tex.width) / 3.0;
+                let h = alt(tex.height * n) / n as f32 * 362.0 / 1080.0;
+                (w, h, i.center_x, i.center_y, i.level_scale())
+            }
             Some(i) => (i.width, i.height, i.center_x, i.center_y, i.level_scale()),
             None => {
                 // 1280x720 textures map to 640 units
@@ -555,10 +665,11 @@ impl Assets {
         load().map_err(|e| tracing::warn!("parts #{index}: {e:#}")).ok()
     }
 
-    /// The SYSMES file: SYSMES_TEXT in the Japanese allui, SYSMES_TEXT_ML in the overseas w_allui (jp_9A420).
+    /// The SYSMES file: SYSMES_TEXT in the Japanese allui, SYSMES_TEXT_ML in the overseas w_allui (jp_9A420);
+    /// Witch on the Holy Night's SYSMES_TEXT holds four languages (no Korean, though allui has _KO atlases).
     fn sysmes_file(allui: &Archive, build: Build) -> Option<Vec<u8>> {
         let stem = match build {
-            Build::Japanese => "SYSMES_TEXT",
+            Build::Japanese | Build::Witch => "SYSMES_TEXT",
             Build::Overseas => "SYSMES_TEXT_ML",
         };
         allui.read(allui.find_stem(stem)?).ok()
@@ -568,10 +679,15 @@ impl Assets {
     /// u64 0, then per language a u64 offset of a table of u64 offsets of NUL-terminated UTF-8 strings; entry 0
     /// is the language's folder name). The overseas file's message 217 moves to `SYSMES_DELETED`.
     pub fn sysmes(&self) -> Vec<String> {
+        self.sysmes_in(self.language)
+    }
+
+    /// `sysmes` in language `lang` (jp_9A780(id, lang)).
+    pub fn sysmes_in(&self, lang: usize) -> Vec<String> {
         let parse = || -> Option<Vec<String>> {
             let d = Self::sysmes_file(&self.allui, self.build)?;
             let n = sysmes_u32(&d, 4)? as usize;
-            let table = sysmes_u64(&d, 0x10 + 8 * self.language)?;
+            let table = sysmes_u64(&d, 0x10 + 8 * lang)?;
             let mut v = (0..n)
                 .map(|i| {
                     let o = sysmes_u64(&d, table + 8 * i)?;
@@ -646,18 +762,46 @@ impl Assets {
             });
         let ja = sfnt::SetMetrics { height: 50, ascent: 41, line_feed: 50, baseline: 41 };
         let msg = set(&["", "2", "3"]).map_or(ja, |m| sfnt::pair_metrics(m, ex));
-        let bubble = set(&["3"]).map_or(msg, |m| sfnt::pair_metrics(m, ex));
+        let bubble = match set(&["3"]) {
+            Some(m) => sfnt::pair_metrics(m, ex),
+            // Witch on the Holy Night's bubble variant is the shared system font (`Game::load_fonts`)
+            None if self.build == Build::Witch => self
+                .shared_fonts()
+                .first()
+                .and_then(|d| sfnt::metrics(d))
+                .and_then(|m| sfnt::set_metrics(&[m], crate::text::BASE_SIZE))
+                .map_or(msg, |m| sfnt::pair_metrics(m, ex)),
+            None => msg,
+        };
         (msg, bubble)
     }
 
-    /// The console shared font sub_AB0F0 asks for (sub_C9F3C: nn::pl::GetSharedFont with the language code of
-    /// dword_3C97F0[language]: ja / en-US share the standard font, zh-Hans / zh-Hant get the Chinese ones).
+    /// The console shared fonts sub_AB0F0 asks for, in their order of priority (sub_C9F3C: nn::pl::GetSharedFont
+    /// with the language code of dword_3C97F0[language]: ja / en-US the standard font, zh-Hans / zh-Hant the
+    /// Chinese ones first). sub_CAA50 puts them all in each font set, so the later ones fill in missing glyphs.
     pub fn shared_font_names(&self) -> &'static [&'static str] {
         match self.language {
-            2 => &["nintendo_udsg-r_org_zh-cn_003.bfttf", "nintendo_udsg-r_std_003.bfttf"],
+            2 => &[
+                "nintendo_udsg-r_org_zh-cn_003.bfttf",
+                "nintendo_udsg-r_ext_zh-cn_003.bfttf",
+                "nintendo_udsg-r_std_003.bfttf",
+            ],
             3 => &["nintendo_udjxh-db_zh-tw_003.bfttf", "nintendo_udsg-r_std_003.bfttf"],
             _ => &["nintendo_udsg-r_std_003.bfttf"],
         }
+    }
+
+    /// The shared fonts there are (`shared_font_names`, decoded), in order; a missing one is reported.
+    pub fn shared_fonts(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for name in self.shared_font_names() {
+            let path = self.romfs.join(name);
+            match std::fs::read(&path) {
+                Ok(d) => out.push(knife_core::format::bfttf::decode(&d).unwrap_or(d)),
+                Err(e) => tracing::warn!("system font {}: {e}", path.display()),
+            }
+        }
+        out
     }
 
     /// A per-language romfs file (sub_AB0F0 fonts, the save icon, movies): `<stem>` in Japanese, else

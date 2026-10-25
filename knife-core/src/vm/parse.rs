@@ -24,6 +24,9 @@ pub struct Command {
     pub args: Vec<String>,
     /// Byte offset of the command in the scene text.
     pub offset: usize,
+    /// The offset earlier knife versions gave it, counting each 0xFF byte before it as the 3 bytes of a
+    /// U+FFFD (their save records keep that)
+    pub legacy_offset: usize,
 }
 
 impl Command {
@@ -83,6 +86,12 @@ pub fn eval_int(s: &str) -> Option<i32> {
     };
     for c in s.chars() {
         match c {
+            // a 0xFF byte (some scenes pad arguments with them): the exe's tokenizer (sub_3160) stops at any
+            // character it does not know, and args_int evaluates what it read, 0 when nothing
+            '\u{FFFD}' => {
+                flush(&mut cur, &mut total, sign, &mut any)?;
+                return Some(total as i32);
+            }
             '+' | '-' if !cur.is_empty() => {
                 flush(&mut cur, &mut total, sign, &mut any)?;
                 sign = if c == '-' { -1 } else { 1 };
@@ -104,20 +113,27 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn parse(text: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(text);
-        let bytes = text.as_bytes();
+    pub fn parse(bytes: &[u8]) -> Self {
+        // scanned as bytes, so offsets are the exe's (save records keep them): some scenes carry 0xFF bytes in
+        // their arguments, which a lossy UTF-8 decoding of the whole text would widen; the syntax is ASCII and
+        // never inside a multi-byte character
+        let find = |from: usize, b: u8| bytes[from..].iter().position(|&c| c == b).map(|p| p + from);
         let mut commands = Vec::new();
         let mut labels = HashMap::new();
         let mut i = 0;
+        // 0xFF bytes before `i`
+        let (mut ff, mut ff_at) = (0, 0);
         while i < bytes.len() {
             if bytes[i] != b'_' {
                 i += 1;
                 continue;
             }
             let start = i;
-            let Some(open) = text[i..].find('(').map(|p| p + i) else { break };
-            let name = &text[i + 1..open];
+            ff += bytes[ff_at..start].iter().filter(|&&b| b == 0xff).count();
+            ff_at = start;
+            let Some(open) = find(i, b'(') else { break };
+            let name = String::from_utf8_lossy(&bytes[i + 1..open]);
+            let name = name.as_ref();
             if name.is_empty() || name.len() > 16 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 i += 1;
                 continue;
@@ -125,9 +141,8 @@ impl Scene {
             // find the closing paren that is followed by ';'
             let mut j = open + 1;
             let close = loop {
-                match text[j..].find(')') {
-                    Some(p) => {
-                        let c = j + p;
+                match find(j, b')') {
+                    Some(c) => {
                         if bytes.get(c + 1).is_none_or(|&b| b == b';') {
                             break c;
                         }
@@ -136,7 +151,8 @@ impl Scene {
                     None => break bytes.len(),
                 }
             };
-            let inner = &text[open + 1..close.min(bytes.len())];
+            let inner = String::from_utf8_lossy(&bytes[open + 1..close.min(bytes.len())]);
+            let inner = inner.as_ref();
             let args: Vec<String> = if inner.is_empty() {
                 Vec::new()
             } else {
@@ -165,6 +181,7 @@ impl Scene {
                 // message text may contain commas (it is never split)
                 args: if matches!(name.get(..2), Some("ZM")) { vec![inner.to_string()] } else { args },
                 offset: start,
+                legacy_offset: start + 2 * ff,
             });
             i = close + 1;
         }
@@ -187,6 +204,18 @@ mod tests {
         assert_eq!(eval_int("0xFF8913"), Some(0xFF8913));
         assert_eq!(eval_int("2000.0"), Some(2000));
         assert_eq!(eval_int(""), None);
+        // 0xFF padding ends the expression (sub_3160)
+        assert_eq!(eval_int("0\u{FFFD}\u{FFFD}"), Some(0));
+        assert_eq!(eval_int("\u{FFFD}\u{FFFD}1612"), Some(0));
+        assert_eq!(eval_int("12\u{FFFD}5"), Some(12));
+    }
+
+    #[test]
+    fn raw_offsets() {
+        // offsets count the 0xFF bytes once each, as the save records do
+        let s = Scene::parse(b"_STZ4(0,1,1,1,1,0\xff\xff\xff\xff);_ZMb3901($041383);");
+        assert_eq!(s.commands[1].offset, 23);
+        assert_eq!(s.commands[0].int(5), Some(0));
     }
 
     #[test]

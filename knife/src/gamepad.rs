@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::ui::Pad;
 
-const PADS: [Pad; 19] = [
+const PADS: [Pad; 20] = [
     Pad::Up,
     Pad::Down,
     Pad::Left,
@@ -32,6 +32,7 @@ const PADS: [Pad; 19] = [
     Pad::Minus,
     Pad::Plus,
     Pad::R3,
+    Pad::L3,
 ];
 
 /// d-pad and stick directions (game mask 0xFF00F0), the buttons that repeat
@@ -174,6 +175,7 @@ mod backend {
             Button::DPadLeft => Pad::Left,
             Button::DPadRight => Pad::Right,
             Button::RightThumb => Pad::R3,
+            Button::LeftThumb => Pad::L3,
             _ => return None,
         })
     }
@@ -274,6 +276,9 @@ mod backend {
                     set(Pad::ZR, &g.rightTrigger());
                     if let Some(b) = g.rightThumbstickButton() {
                         set(Pad::R3, &b);
+                    }
+                    if let Some(b) = g.leftThumbstickButton() {
+                        set(Pad::L3, &b);
                     }
                     let d = g.dpad();
                     set(Pad::Up, &d.up());

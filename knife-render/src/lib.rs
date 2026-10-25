@@ -100,6 +100,17 @@ pub enum PsOp {
     NoAlpha,
     /// normal: mix(d * backdrop alpha, s, a), opaque (where a = 0 the backdrop, alpha included, stays)
     Normal,
+    /// darken (Witch on the Holy Night's STBR 4): mix(d, min(d, s), colour alpha) where a > 0
+    DarkenColorAlpha,
+    /// lighten (STBR 6; texture alpha ignored): mix(d, max(d, s), colour alpha) while the colour alpha > 0
+    LightenColorAlpha,
+    /// screen (STBR 9; texture alpha ignored): mix(d, 1 - (1 - d)(1 - s ca), ca), ca the colour alpha
+    ScreenColorAlpha,
+    /// the default shader through blend state 3 (DstColor / 1-SrcAlpha, STBR 7): min(d s + (1 - a) d, 1)
+    /// where a > 0
+    MultiplyDst,
+    /// the default shader with blending off (blend state 7, STBR 26 / 29): s where a > 0
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -108,8 +119,9 @@ pub enum Shade {
     Sprite,
     Fill,
     Text,
-    /// glyph coverage with its black rim composited in one pass (fill over the rim taps), so a faded glyph
-    /// blends once like nn::font's bordered glyph; `Quad::haze` = [uv clamp rect, (u, v per canvas px, rim alpha, -)]
+    /// glyph coverage with its rim composited in one pass (fill over the rim taps), so a faded glyph blends
+    /// once like nn::font's bordered glyph; `Quad::haze` = [uv clamp rect, (u, v per canvas px, rim alpha, rim
+    /// colour 0xRRGGBB: 0 black)]
     RimText,
     Mono,
     Nega,
@@ -197,17 +209,25 @@ pub struct RuleMask {
     pub progress: f32,
     pub flip: u8,
     pub invert: bool,
+    /// The edge width c3[0x34] in rule units at 1920 wide: Tsukihime's 128, Witch on the Holy Night's
+    /// dword_612C88 (FADS / STTR)
+    pub soft: f32,
 }
 
 impl RuleMask {
     pub fn new(tex: TexRef, progress: f32) -> Self {
-        Self { tex, progress, flip: 0, invert: false }
+        Self { tex, progress, flip: 0, invert: false, soft: 128.0 }
     }
 
     /// The flag word the shaders read: flip bits, invert at bit 2.
     fn flags(&self) -> f32 {
-        ((self.flip & 3) as u32 | (self.invert as u32) << 2) as f32
+        rule_flags(self.flip, self.invert, self.soft)
     }
+}
+
+/// Flip bits, invert at bit 2, the edge width (1..255) from bit 3.
+fn rule_flags(flip: u8, invert: bool, soft: f32) -> f32 {
+    ((flip & 3) as u32 | (invert as u32) << 2 | (soft.clamp(1.0, 255.0) as u32) << 3) as f32
 }
 
 pub struct GpuTexture {
@@ -958,6 +978,7 @@ impl Renderer {
     }
 
     /// Full-target transition from `old` to `new`: a crossfade, or through a rule image as `RuleMask` reads it.
+    #[allow(clippy::too_many_arguments)]
     pub fn transition(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -966,9 +987,10 @@ impl Renderer {
         new: &GpuTexture,
         rule: Option<&GpuTexture>,
         progress: f32,
+        soft: f32,
     ) {
         self.pipeline(PipeKey::Transition, TARGET_FORMAT);
-        let params: [f32; 4] = [progress, 0.0, rule.is_some() as u32 as f32, 0.0];
+        let params: [f32; 4] = [progress, rule_flags(0, false, soft), rule.is_some() as u32 as f32, 0.0];
         let rule_view = rule.map(|r| &r.view).unwrap_or(&self.white.view);
         let bg = self.trans_bind_group(&old.view, &new.view, rule_view, params);
         let verts = fullscreen_verts([1.0; 4]);

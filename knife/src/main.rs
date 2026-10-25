@@ -22,6 +22,7 @@ mod text;
 mod text_stream;
 mod ui;
 mod voice_ids;
+mod witch;
 
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
@@ -155,7 +156,8 @@ struct Cli {
     /// Debug: scripted input, comma-separated MS:KEY: a controller button (up, down, left, right, a, b, x, y, l, r,
     /// zl, zr, minus, plus, r3, lup, ldown, lleft, lright (left stick), rup, rdown (right stick): tapped, or held
     /// from NAME+ to NAME-), menu, click,
-    /// move/X/Y in canvas pixels, press / release of the left button, wheel/N notches of the mouse wheel (+ up)
+    /// move/X/Y in canvas pixels, press / release of the left button, wheel/N notches of the mouse wheel (+ up),
+    /// trackpad/PX a trackpad scroll of PX canvas pixels (+ up)
     #[cfg_attr(feature = "debug", arg(long, value_delimiter = ','))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
     keys: Vec<String>,
@@ -408,6 +410,8 @@ impl App {
             ui.pad(g, r, b, pressed, repeat);
         }
         g.paused = ui.game_paused();
+        let (held, advance) = ui.held_input();
+        g.set_held(held, advance);
         g.flow_replay = ui.flow_replay();
         if self.cli.hold_skip {
             g.set_skip(ui.in_game());
@@ -500,7 +504,13 @@ impl App {
                 "release" => ui.mouse_up(g, r),
                 _ if k.starts_with("wheel/") => {
                     if let Ok(n) = k[6..].parse::<f32>() {
-                        ui.wheel(n, n);
+                        ui.wheel(n, n, false);
+                    }
+                }
+                // a trackpad's travel in canvas pixels (+ up), as MouseScrollDelta::PixelDelta at 1:1
+                _ if k.starts_with("trackpad/") => {
+                    if let Ok(px) = k[9..].parse::<f32>() {
+                        ui.wheel(px / 40.0, px / ui::SAVE_WHEEL_ROW, true);
                     }
                 }
                 _ if k.starts_with("move/") => {
@@ -599,21 +609,21 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // in notches; a trackpad's pixels count 40 to the notch. Save list rows: a notch, or the
                 // trackpad's displacement (momentum included) in `SAVE_WHEEL_ROW`s on screen
-                let (dy, rows) = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y, y),
+                let (dy, rows, trackpad) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y, y, false),
                     MouseScrollDelta::PixelDelta(p) => {
                         let s = self.window.as_ref().map_or(1.0, |w| {
                             let s = w.inner_size();
                             (s.width as f32 / CANVAS_W as f32).min(s.height as f32 / CANVAS_H as f32)
                         });
-                        (p.y as f32 / 40.0, p.y as f32 / (ui::SAVE_WHEEL_ROW * s))
+                        (p.y as f32 / 40.0, p.y as f32 / (ui::SAVE_WHEEL_ROW * s), true)
                     }
                 };
                 // the wheel / trackpad tilts the left stick (no Switch control)
                 if let Some(ui) = &mut self.ui
                     && dy != 0.0
                 {
-                    ui.wheel(dy, rows);
+                    ui.wheel(dy, rows, trackpad);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -646,6 +656,7 @@ impl ApplicationHandler for App {
                     KeyCode::KeyA => Some(Pad::LLeft),
                     KeyCode::KeyD => Some(Pad::LRight),
                     KeyCode::KeyO => Some(Pad::R3),
+                    KeyCode::KeyP => Some(Pad::L3),
                     KeyCode::KeyU => Some(Pad::Minus),
                     KeyCode::KeyI => Some(Pad::Plus),
                     _ => None,
@@ -701,6 +712,7 @@ fn main() -> Result<()> {
     // knife.ini fills the options the command line leaves out
     let cli = Cli::parse_from(ini::merged_args());
     let build = assets::detect_build(&cli.assets_dir());
+    assets::select_build(build);
     save::set_file(cli.save_file.clone().unwrap_or_else(|| save::default_file(build)));
     savedata::set_system_language(cli.language.unwrap_or_else(|| assets::system_language(build)));
     if let Some(language) = cli.language {
@@ -767,6 +779,7 @@ fn pad_name(k: &str) -> Option<Pad> {
         "lleft" => Pad::LLeft,
         "lright" => Pad::LRight,
         "r3" => Pad::R3,
+        "l3" => Pad::L3,
         "minus" => Pad::Minus,
         "plus" => Pad::Plus,
         _ => return None,

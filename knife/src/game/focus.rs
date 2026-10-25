@@ -8,7 +8,7 @@
 //! Positions are kept in the exe's 640x448 draw space; lines and notes are sized in native pixels of the
 //! 1920x1080 frame (the draws scale by 640 / 1920 and 448 / 1080 before mapping back to the frame).
 
-use knife_render::{CANVAS_H, CANVAS_W, Quad, TexRef};
+use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, TexRef};
 
 use crate::fx::Rng;
 
@@ -87,6 +87,8 @@ const NOTES: [Note; 3] = [
 const NOTE_V: (f32, f32) = (-0.4, 4.0);
 const NOTE_JITTER: f32 = 0.005;
 const NOTE_FLOOR: f32 = 450.0;
+/// Witch on the Holy Night's effect 4 lines (dword_262994[12])
+const WITCH_LINES: usize = 20;
 
 /// One particle (56 bytes at word_14715DC).
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +158,26 @@ impl Focus {
     /// The effect already on keeps running.
     pub fn start(&mut self, effect: i32, frames: i32) {
         let rate = if frames > 0 { 1.0 / frames as f32 } else { 1.0 };
+        // Witch on the Holy Night (jp_86470): effects past 4 do nothing; 4 is its own ring of lines (FCLN);
+        // starting the effect that is already on keeps it (2 / 3 set their drop chance again)
+        if crate::assets::witch() && effect >= 1 {
+            if effect > 4 {
+                return;
+            }
+            if self.mode == 2 && self.effect == effect {
+                if (2..=3).contains(&effect) {
+                    self.chance = if effect == 3 { 0.1 } else { 0.05 };
+                }
+                return;
+            }
+            if effect == 4 {
+                (self.mode, self.effect, self.level, self.rate) = (1, effect, 0.0, rate);
+                for s in &mut self.slots[..WITCH_LINES] {
+                    s.kind = -1;
+                }
+                return;
+            }
+        }
         match effect {
             0 if frames <= 0 => {
                 self.level = 0.0;
@@ -221,6 +243,7 @@ impl Focus {
             _ => {}
         }
         match self.effect {
+            4 if crate::assets::witch() => self.step_witch_lines(n),
             4..=33 => self.step_lines(n),
             1..=3 => self.step_notes(n),
             _ => {}
@@ -272,6 +295,27 @@ impl Focus {
         }
         for s in &mut self.slots[count..] {
             *s = FREE;
+        }
+    }
+
+    /// Witch on the Holy Night's effect 4 (jp_86850): each of 20 lines is rolled again every 4 frames (words 1 /
+    /// 2): a random angle, 40..50 units from (320, 224) (jp_A8F90), pointing away, alpha 0.10..0.50.
+    fn step_witch_lines(&mut self, n: i16) {
+        for i in 0..WITCH_LINES {
+            let s = &mut self.slots[i];
+            if s.kind >= 0 {
+                s.tick = s.tick.wrapping_add(n);
+                if s.tick < s.total {
+                    continue;
+                }
+            } else if n < 1 {
+                continue;
+            }
+            let alpha = (self.rng.rand() % 41 + 10) as f32 / 100.0;
+            let angle = (self.rng.rand() as u16 ^ 0x8000) as i16;
+            let r = (self.rng.rand() % 11 + 40) as f32;
+            let th = rad(angle);
+            self.slots[i] = Slot { kind: 0, tick: 0, total: 4, step: 4, angle, x: th.cos() * r + 320.0, y: th.sin() * r + 224.0, alpha, ..FREE };
         }
     }
 
@@ -355,6 +399,24 @@ impl Focus {
         let (kx, ky) = (CANVAS_W as f32 / 640.0, CANVAS_H as f32 / 448.0);
         let mut out = Vec::new();
         match self.effect {
+            // sub_667F0: the whole FocusLine (960 x 2 texels at the native scale) rotated about its start, blend
+            // 30 (SrcAlpha / One)
+            4 if crate::assets::witch() => {
+                let t = &tex[3];
+                let [u, v] = t.uv_max();
+                let (sx, sy) = (640.0 / 1920.0, 448.0 / 1080.0);
+                for s in self.slots[..WITCH_LINES].iter().filter(|s| s.alpha > 0.0 && s.kind >= 0) {
+                    let th_ = rad(s.angle);
+                    let (c, n) = (th_.cos(), th_.sin());
+                    let (len, wid) = (960.0 * sx, 2.0 * sy);
+                    let p = |dl: f32, dw: f32| [(s.x + c * dl - n * dw) * kx, (s.y + n * dl + c * dw) * ky];
+                    let mut q = Quad::rect(t.clone(), [0.0; 4], [1.0, 1.0, 1.0, s.alpha * self.level]);
+                    q.pos = [p(0.0, 0.0), p(len, 0.0), p(len, wid), p(0.0, wid)];
+                    q.uv = [[0.0, 0.0], [u, 0.0], [u, v], [0.0, v]];
+                    q.blend = Blend::Add;
+                    out.push(q);
+                }
+            }
             4..=33 => {
                 let t = &tex[3];
                 let (tw, th) = (t.texture.size().width as f32, t.texture.size().height as f32);

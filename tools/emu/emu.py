@@ -3,14 +3,15 @@
 
 Astris must have focus to take input (the commands activate it). Needs `tools/emu/dsu_server.py` running (Astris: Input = DSU Controller, 127.0.0.1:26760, slot 0) and the game
 window open. Captures are the game area of the window, scaled to 1920x1080.
-EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en, save copy switch_emu_save_en) instead
-of the Japanese one (the default, EMU_GAME=ja).
+EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en, save copy switch_emu_save_en) and
+EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh, switch_emu_save_woh) instead of the Japanese Tsukihime
+(the default, EMU_GAME=ja).
 
     emu.py press BTN [ms] | hold BTN | release BTN | stick L|R X Y | reset
     emu.py shot OUT.png
     emu.py run NAME KEYS [--every MS] [--until MS]
         KEYS: comma-separated MS:KEY like knife's --keys (a b x y l r zl zr plus minus up down left right,
-        lup/ldown/lleft/lright = left stick tilt for 100 ms, NAME+ / NAME- hold / release, tap/X/Y[/MS] a touch
+        lup/ldown/lleft/lright = left stick tilt for 100 ms (held from NAME+ to NAME-), NAME+ / NAME- hold / release, tap/X/Y[/MS] a touch
         at game coordinates, wait); the Switch
         is captured every --every ms (or as fast as a capture allows, 0.25-0.5 s) into build/emu/NAME/emu_NNNN.png,
         with each capture's real time in emu_times.txt
@@ -50,11 +51,17 @@ WINREC = os.path.join(OUT, "winrec")
 CLICK = os.path.join(OUT, "click")
 SAVE_ROOT = os.path.expanduser("~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/"
                               "bis/user/save")
-# EMU_GAME=ja (default) or en picks the build: (title id, window title prefix, Library row in window-relative pt,
-# the local save copy, knife's data). The Library lists the games by title: TSUKIHIME first, then 月姫.
+# EMU_GAME=ja (default), en or woh picks the game: (title id, window title test, Library row in window-relative
+# pt, the local save copy, knife's data). The Library lists the games by title, now all Japanese: 月姫 1.0.2 (the
+# Japanese build), 月姫 1.0.1 (the overseas build), then 魔法使いの夜.
 GAMES = {
-    "ja": (0x01001DC01486A000, "月姫", (200, 200), "switch_emu_save", "switch_romfs"),
-    "en": (0x010057A01E4D4000, "TSUKIHIME", (200, 110), "switch_emu_save_en", "switch_romfs_en"),
+    # both Tsukihime builds title their window 月姫 -A piece of blue glass moon- – Version: X
+    "ja": (0x01001DC01486A000, lambda t: t.startswith("月姫") and "1.0.1" not in t, (200, 114), "switch_emu_save",
+           "switch_romfs"),
+    "en": (0x010057A01E4D4000, lambda t: t.startswith("TSUKIHIME") or t.startswith("月姫") and "1.0.1" in t, (200, 210),
+           "switch_emu_save_en", "switch_romfs_en"),
+    "woh": (0x0100751018DBA000, lambda t: t.startswith(("WITCH ON THE HOLY NIGHT", "魔法使いの夜")), (200, 306),
+            "switch_emu_save_woh", "switch_romfs_woh"),
 }
 GAME = os.environ.get("EMU_GAME", "ja")
 if GAME not in GAMES:
@@ -106,7 +113,7 @@ def window():
     out = subprocess.run([WINLIST, "Astris"], capture_output=True, text=True, check=True).stdout
     for line in out.splitlines():
         wid, _x, _y, _w, _h, title = line.split("\t", 5)
-        if title.startswith(GAME_TITLE):
+        if GAME_TITLE(title):
             return wid, int(_w), int(_h), int(_x), int(_y)
     raise SystemExit("no Astris game window")
 
@@ -222,14 +229,14 @@ def astris_window(title):
     out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True).stdout
     for line in out.splitlines():
         v = line.split("\t")
-        if len(v) == 3 and v[0].startswith(title):
+        if len(v) == 3 and (title(v[0]) if callable(title) else v[0].startswith(title)):
             return int(v[1]), int(v[2])
     return None
 
 
 def game_running():
-    """Either build's game window (the Library window turns into the game's while it runs)."""
-    return any(astris_window(t) for _, t, *_ in GAMES.values())
+    """Any game's window (the Library window turns into the game's while it runs)."""
+    return astris_window(lambda t: not t.startswith("Library")) is not None
 
 
 def restart(save):
@@ -256,7 +263,14 @@ def restart(save):
     time.sleep(1)
     click((lib[0] + CLICK_GAME[0], lib[1] + CLICK_GAME[1]), 2)
     time.sleep(33)
-    window()
+    try:
+        window()
+    except SystemExit:
+        # another game started (the Library order changed): stop it before it plays on
+        if game_running():
+            subprocess.run(["osascript", "-e", 'tell application "System Events" to tell process "Astris" to click '
+                            'menu item "Stop" of menu "Emulation" of menu bar 1'], check=False)
+        raise SystemExit(f"the Library row {CLICK_GAME} did not start {GAME}; stopped (check GAMES)")
     print("restarted")
 
 
@@ -274,10 +288,20 @@ STICK = {"lup": ("L", 0, 1), "ldown": ("L", 0, -1), "lleft": ("L", -1, 0), "lrig
          "rup": ("R", 0, 1), "rdown": ("R", 0, -1)}
 
 
+# knife's names for the stick clicks
+ALIAS = {"l3": "lstick", "r3": "rstick"}
+
+
 def send_key(key):
     if key == "wait":
         return
-    if key.endswith("+"):
+    if key.rstrip("+-") in ALIAS:
+        key = ALIAS[key.rstrip("+-")] + key[len(key.rstrip("+-")):]
+    if key[:-1] in STICK and key[-1] in "+-":
+        # a stick held tilted (NAME+) until NAME-
+        s, x, y = STICK[key[:-1]]
+        ctrl(f"stick {s} {x} {y}" if key.endswith("+") else f"stick {s} 0 0")
+    elif key.endswith("+"):
         ctrl(f"hold {key[:-1]}")
     elif key.endswith("-"):
         ctrl(f"release {key[:-1]}")

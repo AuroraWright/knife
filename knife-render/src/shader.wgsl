@@ -17,8 +17,9 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) hx: vec4<f32>,
-    @location(3) hy: vec4<f32>,
+    // per-quad parameters (`Quad::haze`), the same at every vertex: flat, so packed values stay exact
+    @location(2) @interpolate(flat) hx: vec4<f32>,
+    @location(3) @interpolate(flat) hy: vec4<f32>,
     @location(4) s0: vec4<f32>,
     @location(5) s1: vec4<f32>,
     @location(6) s2: vec4<f32>,
@@ -170,7 +171,10 @@ fn fs_rim_text(i: VsOut) -> @location(0) vec4<f32> {
         keep *= 1.0 - i.hy.z * rim_cov(i, i.uv - taps[k] * i.hy.xy);
     }
     let a = c + (1.0 - keep) * (1.0 - c);
-    return vec4<f32>(i.color.rgb * c * i.color.a, a * i.color.a);
+    // the rim's colour, 0xRRGGBB in hy.w
+    let e = u32(i.hy.w);
+    let edge = vec3<f32>(f32((e >> 16u) & 255u), f32((e >> 8u) & 255u), f32(e & 255u)) / 255.0;
+    return vec4<f32>((i.color.rgb * c + edge * (1.0 - keep) * (1.0 - c)) * i.color.a, a * i.color.a);
 }
 
 // Monochrome (grayscale) sprite.
@@ -213,10 +217,11 @@ fn rule_at(uv: vec2<f32>, flags: f32) -> f32 {
     return select(r, 1.0 - r, (f & 4u) != 0u);
 }
 
-// nexl_nxshader_transition (c3[0x30] progress, c3[0x34] = 128 * width / 1920 in 0..255 rule units): the edge
-// sits at (255 + 2v) p - v and fades over v with a smoothstep; visible where the rule is below it.
-fn rule_mask(r: f32, p: f32) -> f32 {
-    let v = 128.0 / 255.0;
+// nexl_nxshader_transition (c3[0x30] progress, c3[0x34] = soft * width / 1920 in 0..255 rule units, soft from
+// the flag word's bit 3 up: Tsukihime's 128, Witch on the Holy Night's FADS / STTR value): the edge sits at
+// (255 + 2v) p - v and fades over v with a smoothstep; visible where the rule is below it.
+fn rule_mask(r: f32, p: f32, flags: f32) -> f32 {
+    let v = f32(u32(flags + 0.5) >> 3u) / 255.0;
     let t = clamp((r - ((1.0 + 2.0 * v) * p - v) + 0.5 * v) / v, 0.0, 1.0);
     return 1.0 - t * t * (3.0 - 2.0 * t);
 }
@@ -227,7 +232,7 @@ fn fs_transition(i: VsOut) -> @location(0) vec4<f32> {
     let b = textureSample(tex1, samp, i.uv);
     var t = tu.params.x;
     if (tu.params.z > 0.5) {
-        t = rule_mask(rule_at(i.uv, tu.params.y), tu.params.x);
+        t = rule_mask(rule_at(i.uv, tu.params.y), tu.params.x, tu.params.y);
     }
     return vec4<f32>(mix(a.rgb, b.rgb, t), 1.0);
 }
@@ -236,7 +241,7 @@ fn fs_transition(i: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_rule(i: VsOut) -> @location(0) vec4<f32> {
     let t = sample_img(i);
-    let m = rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params.y), tu.params.x);
+    let m = rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params.y), tu.params.x, tu.params.y);
     let a = t.a * i.color.a * m;
     return vec4<f32>(t.rgb * i.color.rgb * a, a);
 }
@@ -326,14 +331,14 @@ fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
     if (tu.params.y > 0.5) { s = i.color.rgb; }
     var ca = i.color.a;
     if (tu.params2.x >= 0.0) {
-        ca *= rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params2.y), tu.params2.x);
+        ca *= rule_mask(rule_at(i.pos.xy / tu.params.zw, tu.params2.y), tu.params2.x, tu.params2.y);
     }
     let a = t.a * ca;
     let one = vec3<f32>(1.0);
     let zero = vec3<f32>(0.0);
     let op = u32(tu.params.x + 0.5);
     // the alpha-weighted shaders leave the backdrop, alpha included, alone where a = 0 (their `$p0 exit`)
-    if (a <= 0.0 && (op <= 15u || op == 19u)) {
+    if (a <= 0.0 && (op <= 15u || op == 19u || op == 20u || op == 23u || op == 24u)) {
         return d4;
     }
     var o = d;
@@ -377,6 +382,14 @@ fn fs_ps(i: VsOut) -> @location(0) vec4<f32> {
         case 18u: { o = s; }
         // normal: the backdrop premultiplied by its own alpha
         case 19u: { o = ps_mix(d * d4.a, s, a); }
+        case 20u: { o = ps_mix(d, min(d, s), ca); }
+        case 21u: {
+            if (ca <= 0.0) { return d4; }
+            o = ps_mix(d, max(d, s), ca);
+        }
+        case 22u: { o = ps_mix(d, one - (one - d) * (one - s * ca), ca); }
+        case 23u: { o = min(d * s + (1.0 - a) * d, one); }
+        case 24u: { o = s; }
         default: {}
     }
     return vec4<f32>(o, 1.0);

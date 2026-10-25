@@ -35,6 +35,8 @@ pub struct Volumes {
     pub voice: f32,
     pub bgm_mute: bool,
     pub se_mute: bool,
+    /// the movie player's volume (off_AE0350 + 7): Tsukihime's BGM copy, Witch on the Holy Night's own slider
+    pub movie: Option<f32>,
 }
 
 impl Volumes {
@@ -56,6 +58,7 @@ impl Default for Volumes {
             voice: 1.0,
             bgm_mute: false,
             se_mute: false,
+            movie: None,
         }
     }
 }
@@ -117,11 +120,14 @@ impl VoicePlayer {
 /// An SE channel's player (sound player 11 + ch, off_AE0BE8 + 60 ch).
 struct SeChan {
     voice: Voice,
-    /// the speaker row the channel was bound to when it played (SEPL key 70): that row's voice volume
-    /// replaces the SE category
+    /// the speaker row the channel was bound to when it played at once (SEPL key 70, type 2): that row's voice
+    /// volume replaces the SE category
     speaker: Option<usize>,
     /// state 2: fading out (sub_9D020), stopped when its volume comes down to 0
     fading: bool,
+    /// the player's pan ramp (+28 current, +32 target, +36 rate a frame, x 1000): sub_9D110 starts it,
+    /// sub_9B7F0 steps it
+    pan: (f32, f32, f32),
 }
 
 /// A player's volume rate, points (0..100) a frame, in volume (0..1) a second; sub_9B7F0 steps a rate of 0 or
@@ -139,6 +145,14 @@ pub struct Sound {
     /// each channel's volume word (byte_146E640 + 140): SEPL / SEVL set it to their volume, SEFD to 0,
     /// sub_5F200 to -1, a reset (sub_57240 / sub_82330) to 100; SESP leaves it. Fades take their rates from it.
     pub se_word: [i16; 20],
+    /// the BGM volume word (word_146E650; Witch on the Holy Night's jd_146E650 is 255 x percent / 100): every MPLY
+    /// of a track and MVOL set it, MPLY(-1) / MFAD / MSTP leave it, a load restores it; 0 from boot. The record
+    /// keeps it (+36 / WoH +13276), with or without a track
+    pub bgm_word: i16,
+    /// each channel's loop flag word (byte_146E640 + 180): SEPL (sub_6A340, queued sub_65780) sets it from its
+    /// loop argument; SEFD and an empty SEPL clear the loop id (+100) but leave it; a reset (sub_57240) and the
+    /// script end (sub_5F200) clear it. The record keeps it (+14489 / WoH +13303)
+    pub se_loop: [bool; 20],
     /// each channel's pan word (byte_146E640 + 220, -1000..1000): SEPL's key 18, what a load restarts a loop with
     pub se_pan: [i16; 20],
     /// each speaker row's voice volume, 0 while voices are off or the row is muted (`set_speaker_gains`)
@@ -162,6 +176,8 @@ pub struct Sound {
     /// sound player 4: the config's voice test (sub_2B930), apart from the scene voices on players 2 / 3
     test_voice: Option<Voice>,
     movie: Option<Voice>,
+    /// the movie's audio track, for a seek
+    movie_pcm: Option<Arc<Pcm>>,
     /// sound players 4..7 for system sounds; sub_ACEF0 and sub_ACFA0 each cycle them with their own counter
     /// (dword_18C04E8 / dword_18C04EC), stopping what the player was playing
     sys: [Option<Voice>; 4],
@@ -182,6 +198,8 @@ impl Sound {
             bgm: None,
             se: HashMap::new(),
             se_word: [100; 20],
+            bgm_word: 0,
+            se_loop: [false; 20],
             se_pan: [0; 20],
             speaker_gain: Vec::new(),
             chan_speaker: [None; 20],
@@ -193,6 +211,7 @@ impl Sound {
             flushes: 0,
             test_voice: None,
             movie: None,
+            movie_pcm: None,
             sys: Default::default(),
             sys_next: [0; 2],
             bgm_cache: HashMap::new(),
@@ -430,7 +449,9 @@ impl Sound {
     /// or not (sub_EDD28 stops the handle). `volume` 0..1, `fade_in` seconds from 0, `pan` -1..1.
     #[allow(clippy::too_many_arguments)]
     pub fn play_se(&mut self, ch: i32, name: &str, pcm: Arc<Pcm>, volume: f32, fade_in: f64, looping: bool, pan: f32) {
-        let speaker = usize::try_from(ch).ok().and_then(|c| self.chan_speaker.get(c).copied().flatten());
+        // only an immediate play (sub_9CAA0) makes a bound channel type 2; a fade-in (sub_9CBF0) leaves it type 1,
+        // at the SE category through its curve (only its target is 0 for a muted row)
+        let speaker = usize::try_from(ch).ok().and_then(|c| self.chan_speaker.get(c).copied().flatten()).filter(|_| fade_in <= 0.0);
         if let Some(c) = self.se.remove(&ch) {
             c.voice.stop(0.0);
         }
@@ -442,7 +463,7 @@ impl Sound {
         }
         let (k, curve) = self.se_mix(speaker);
         let voice = self.audio.play_gain(pcm, (volume.max(0.0), k, pan), fade_in, looping, curve);
-        self.se.insert(ch, SeChan { voice, speaker, fading: false });
+        self.se.insert(ch, SeChan { voice, speaker, fading: false, pan: (0.0, 0.0, 0.0) });
     }
 
     /// Stop SE channel `ch` (all for a negative one) at once (sub_9CF90) and forget its loop.
@@ -511,9 +532,53 @@ impl Sound {
         }
     }
 
+    /// sub_9CE60: a playing (not fading) player's pan becomes `pan` (-1000..1000) at once, its ramp cleared.
+    pub fn set_se_pan(&mut self, ch: i32, pan: i32) {
+        if self.se_state(ch) != 1 {
+            return;
+        }
+        if let Some(c) = self.se.get_mut(&ch) {
+            c.pan = (0.0, 0.0, 0.0);
+            c.voice.set_pan(pan as f32 * 0.001);
+        }
+    }
+
+    /// sub_9D110: an active player's pan moves from `from` to `to` (-1000..1000) by `per_frame`.
+    pub fn ramp_se_pan(&mut self, ch: i32, from: i32, to: i32, per_frame: f32) {
+        if self.se_state(ch) == 0 {
+            return;
+        }
+        if let Some(c) = self.se.get_mut(&ch) {
+            c.pan = (from as f32, to as f32, per_frame);
+        }
+    }
+
+    /// sub_9B7F0's pan step for `frames` frames: the current pan moves by the rate until it passes the target,
+    /// which ends the ramp.
+    pub fn step_se_pans(&mut self, frames: f32) {
+        for c in self.se.values_mut() {
+            let (cur, to, rate) = &mut c.pan;
+            if *rate == 0.0 {
+                continue;
+            }
+            *cur += *rate * frames;
+            if (*rate >= 0.0 && *cur >= *to) || (*rate < 0.0 && *cur <= *to) {
+                *cur = *to;
+                *rate = 0.0;
+            }
+            c.voice.set_pan(*cur * 0.001);
+        }
+    }
+
     /// The looping SE on channel `ch` (word100 with word180 set).
     pub fn looping_on(&self, ch: i32) -> Option<&str> {
         self.loops.get(&ch).map(String::as_str)
+    }
+
+    /// A loop played straight on the channel's player, outside the script's loop id word (+100): nothing saves
+    /// or restarts it.
+    pub fn unlist_loop(&mut self, ch: i32) {
+        self.loops.remove(&ch);
     }
 
     /// The looping effects (channel, name, volume word / 100), what a save restarts.
@@ -598,11 +663,27 @@ impl Sound {
 
     pub fn play_movie_audio(&mut self, pcm: Arc<Pcm>) {
         self.stop_movie_audio();
-        // the movie player takes the BGM copy (off_AE0350 + 7) as is
-        self.movie = Some(self.audio.play(pcm, self.vol.bgm_level(), 0.0, false));
+        // the movie player takes off_AE0350 + 7 as is: the BGM copy, Witch on the Holy Night's movie slider
+        let vol = self.vol.movie.unwrap_or_else(|| self.vol.bgm_level());
+        self.movie = Some(self.audio.play(pcm.clone(), vol, 0.0, false));
+        self.movie_pcm = Some(pcm);
+    }
+
+    /// The movie's audio from `secs` on (a movie seek).
+    pub fn seek_movie_audio(&mut self, secs: f32) {
+        let Some(pcm) = self.movie_pcm.clone() else { return };
+        if let Some(v) = self.movie.take() {
+            v.stop(0.0);
+        }
+        let vol = self.vol.movie.unwrap_or_else(|| self.vol.bgm_level());
+        let start = (f64::from(secs) * f64::from(pcm.sample_rate)) as usize;
+        if start < pcm.frames.len() {
+            self.movie = Some(self.audio.play_at(pcm, vol, 0.0, false, start, Curve::Linear));
+        }
     }
 
     pub fn stop_movie_audio(&mut self) {
+        self.movie_pcm = None;
         if let Some(v) = self.movie.take() {
             v.stop(0.1);
         }

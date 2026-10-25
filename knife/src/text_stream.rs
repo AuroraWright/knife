@@ -55,6 +55,7 @@ pub fn plain_text(text: &str) -> String {
             Run::Text(s) | Run::Bar { text: s, .. } => output.extend(s.chars().map(crate::text::tag_symbol)),
             Run::Ruby { base, .. } => output.push_str(&base),
             Run::Newline => output.push('\n'),
+            Run::Italic | Run::Wobble(_) | Run::Plain | Run::Fill(_) | Run::Edge(_) | Run::Indent => {}
         }
     }
     output.trim_matches(|c| c == '\n' || c == '\r').to_owned()
@@ -161,7 +162,8 @@ mod tests {
         assert_eq!(plain_text("先ほど<前触|まえぶ>れもなく@k"), "先ほど前触れもなく");
         assert_eq!(plain_text("@r一行目^二行目[ber00][ber00]@n"), "一行目\n二行目\u{3000}\u{3000}");
         assert_eq!(plain_text("friend.[heart] [x]"), "friend.♥ [x]");
-        assert_eq!(plain_text("@c900赤い@c字"), "赤い字");
+        // `@c` takes one character, `@r` is no line break
+        assert_eq!(plain_text("@c1赤い@r字@c9"), "赤い字");
     }
 
     fn read(client: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>) -> String {

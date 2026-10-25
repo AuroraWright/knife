@@ -9,7 +9,20 @@ use serde::{Deserialize, Serialize};
 
 /// Slots 0..140 are the exe's 140 save records: 0..100 the save list (sub_50790), 100..139 the auto save ring
 /// (sub_52AA0, newest at 100, reached through CONTINUE only), 139 the quick save (sub_52860).
-pub use crate::savedata::{AUTO_FIRST, LIST_SLOTS, QUICK_SLOT, SLOTS};
+/// The build's record slots (`savedata::Layout`): all of them, the save list, the quick save, the (first) auto
+/// save.
+pub fn slots() -> usize {
+    crate::savedata::lay().slots
+}
+pub fn list_slots() -> usize {
+    crate::savedata::lay().list_slots
+}
+pub fn quick_slot() -> usize {
+    crate::savedata::lay().quick_slot
+}
+pub fn auto_first() -> usize {
+    crate::savedata::lay().auto_first
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LayerSave {
@@ -74,6 +87,12 @@ pub struct LayerSave {
     /// SOXY draw offset (stage words 1222 / 1262)
     #[serde(default)]
     pub soxy: (i16, i16),
+    /// Witch on the Holy Night's SNX4 values (`Layer::snx4`)
+    #[serde(default)]
+    pub snx4: [f32; 2],
+    /// Witch on the Holy Night's STGS words: start and current alpha, frames, curve (`Layer::wfade`)
+    #[serde(default)]
+    pub wfade: Option<[i16; 4]>,
 }
 
 impl LayerSave {
@@ -96,7 +115,7 @@ pub struct SeQueued {
     pub channel: i32,
     /// frames left on the exe's counter (+1112), before this frame's count-down
     pub frames: i16,
-    /// +1120: 1 SEPL, 2 SEFD, 3 SEVL
+    /// +1120: 1 SEPL, 2 SEFD, 3 SEVL, 4 SEAC
     pub kind: u8,
     /// +1114: SEPL's sound (sub_900; none when not in the table)
     pub name: Option<String>,
@@ -110,6 +129,12 @@ pub struct SeQueued {
     pub pan: i16,
     /// +1128: key 70 (0 none)
     pub speaker: i32,
+    /// +1122: SEAC's end volume (-1 none)
+    #[serde(default)]
+    pub vol_end: i8,
+    /// +1126: SEAC's end pan, 0..128 (-1 none)
+    #[serde(default)]
+    pub pan_end: i16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,6 +149,9 @@ pub struct SaveData {
     pub page_texts: Vec<String>,
     pub choice: Option<(String, Vec<(i32, String)>)>,
     pub bgm: Option<(i32, f32)>,
+    /// the BGM volume word (see `Sound::bgm_word`); None in old saves
+    #[serde(default)]
+    pub bgm_word: Option<i16>,
     pub loops: Vec<SeSave>,
     /// unix seconds
     pub timestamp: u64,
@@ -159,6 +187,9 @@ pub struct SaveData {
     /// each SE channel's volume word (byte_146E640 + 140, saved as a byte at +14468); empty in old saves
     #[serde(default)]
     pub se_words: Vec<i16>,
+    /// each SE channel's loop flag (byte_146E640 + 180; +14489); empty in old saves
+    #[serde(default)]
+    pub se_loops: Vec<bool>,
     /// each SE channel's pan word (byte_146E640 + 220, x 1000; +14510)
     #[serde(default)]
     pub se_pans: Vec<i16>,
@@ -176,6 +207,10 @@ pub struct Kept {
     pub blend: u8,
     #[serde(default)]
     pub stcc: bool,
+    /// the SACL bit (stage byte +0x54 bit 0x40): STCC keeps it, STCH and a reset clear it, and SACL sets it on
+    /// an empty slot too
+    #[serde(default)]
+    pub absolute: bool,
 }
 
 static SAVE_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -186,13 +221,14 @@ pub fn set_file(path: PathBuf) {
 }
 
 /// The default save file of a build: `knife/savedata000` (the overseas data: `knife/overseas/savedata000`, a
-/// separate title on the Switch) in the OS application data directory (the working directory when the OS has
-/// none), as shin does.
+/// separate title on the Switch; Witch on the Holy Night: `knife/witch/savedata000`) in the OS application data
+/// directory (the working directory when the OS has none), as shin does.
 pub fn default_file(build: knife_core::exe::Build) -> PathBuf {
     let dir = dirs::data_dir().unwrap_or_default().join("knife");
     match build {
         knife_core::exe::Build::Japanese => dir.join("savedata000"),
         knife_core::exe::Build::Overseas => dir.join("overseas").join("savedata000"),
+        knife_core::exe::Build::Witch => dir.join("witch").join("savedata000"),
     }
 }
 

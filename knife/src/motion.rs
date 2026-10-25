@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use knife_core::exe::{MOTION_COUNT, MOTION_KEY_COUNT as KEY_COUNT, MOTION_MASK_COUNT as MASK_COUNT, Nso};
+use knife_core::exe::{Build, Nso};
 
-use crate::motion_loops::MOTION_LOOPS;
+use crate::motion_loops::{MOTION_LOOPS, WITCH_EASED_WHOLE, WITCH_MOTION_LOOPS};
 
-/// sub_99950: this motion's clock is eased as a whole by its first key's ease, its segments run linear.
+/// sub_99950: this motion's clock is eased as a whole by its first key's ease, its segments run linear (Witch on
+/// the Holy Night: sub_72B10's ids, `WITCH_EASED_WHOLE`).
 const EASED_WHOLE: i32 = 9999;
 
 pub const NO_KEY: i32 = -32767;
@@ -48,6 +49,7 @@ pub struct MotionTable {
     lens: Vec<u32>,
     masks: Vec<u64>,
     loops: HashMap<u16, u32>,
+    eased_whole: Vec<i32>,
 }
 
 /// sub_97B80's gate bits per field (tested after `MotionTable::mask_at` clears the absent ones).
@@ -83,7 +85,7 @@ fn rd_u32(nso: &Nso, va: u64) -> Option<u32> {
 impl MotionTable {
     pub fn load(nso: &Nso) -> Result<Self> {
         let l = nso.layout()?;
-        let raw = nso.bytes(l.motion_keys, KEY_COUNT * 64).context("motion keys out of range")?;
+        let raw = nso.bytes(l.motion_keys, l.motion_key_count * 64).context("motion keys out of range")?;
         let keys = raw
             .as_chunks::<64>().0.iter()
             .map(|k| {
@@ -100,13 +102,13 @@ impl MotionTable {
                 f
             })
             .collect();
-        let ends = (0..MOTION_COUNT)
+        let ends = (0..l.motion_count)
             .map(|i| rd_u32(nso, l.motion_ends + i as u64 * 4).unwrap_or(0))
             .collect();
-        let lens = (0..MOTION_COUNT)
+        let lens = (0..l.motion_count)
             .map(|i| rd_u32(nso, l.motion_lens + i as u64 * 4).unwrap_or(0))
             .collect();
-        let masks = (0..MASK_COUNT)
+        let masks = (0..l.motion_mask_count)
             .map(|i| {
                 nso.bytes(l.motion_masks + i as u64 * 8, 8)
                     .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
@@ -117,7 +119,17 @@ impl MotionTable {
             ends,
             lens,
             masks,
-            loops: MOTION_LOOPS.iter().copied().collect(),
+            loops: match l.build {
+                Build::Witch => WITCH_MOTION_LOOPS,
+                _ => MOTION_LOOPS,
+            }
+            .iter()
+            .copied()
+            .collect(),
+            eased_whole: match l.build {
+                Build::Witch => WITCH_EASED_WHOLE.iter().map(|&i| i32::from(i)).collect(),
+                _ => vec![EASED_WHOLE],
+            },
         })
     }
 
@@ -129,6 +141,11 @@ impl MotionTable {
         let start = if id >= 2 { self.ends[id as usize - 2] } else { 0 } as usize;
         let end = self.ends[id as usize - 1] as usize;
         (end > start && end <= self.keys.len()).then_some((start, end))
+    }
+
+    /// sub_999A0: the motion has a loop point (it wraps instead of ending).
+    pub fn looping(&self, id: i32) -> bool {
+        u16::try_from(id).ok().and_then(|i| self.loops.get(&i)).is_some_and(|&v| v != 0)
     }
 
     pub fn length(&self, id: i32) -> u32 {
@@ -173,7 +190,7 @@ impl MotionTable {
 
     /// sub_99950 / sub_961B0: motion 9999's clock is eased over its whole length by its first key's ease.
     fn eased_time(&self, id: i32, t: f32) -> f32 {
-        let Some((s, e)) = self.range(id).filter(|_| id == EASED_WHOLE) else { return t };
+        let Some((s, e)) = self.range(id).filter(|_| self.eased_whole.contains(&id)) else { return t };
         let total = self.keys[e - 1][field::TIME] as f32;
         let kind = self.keys[s][field::EASE];
         let kind = if kind == NO_KEY || kind == HOLD { 0 } else { kind };
@@ -325,7 +342,7 @@ impl MotionTable {
         let u = if v9 >= v24 {
             1.0
         } else {
-            let kind = if id == EASED_WHOLE {
+            let kind = if self.eased_whole.contains(&id) {
                 0
             } else if a4 == a2 {
                 k(a4, field::EASE)

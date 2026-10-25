@@ -30,6 +30,11 @@ knife needs the game data from your own copy of the game:
    cp fontstandard/nintendo_udsg-r_std_003.bfttf <romfs folder>/
    ```
 
+   The Chinese languages of the overseas releases also use the Chinese system fonts: copy the `.bfttf` files
+   of FontChineseSimplified (0100000000000814: `nintendo_udsg-r_org_zh-cn_003.bfttf`,
+   `nintendo_udsg-r_ext_zh-cn_003.bfttf`) and FontChineseTraditional (0100000000000813:
+   `nintendo_udjxh-db_zh-tw_003.bfttf`) into the same folder.
+
 By default knife looks for this folder as `assets` next to the executable (inside a macOS app bundle, also
 `Contents/Resources/assets`).
 
@@ -105,6 +110,7 @@ the controller labels them, Plus / Minus as Start / Back).
 | T / Y | ZL / ZR |
 | K / L | right stick up / down |
 | O | R3 |
+| P | L3 |
 | U / I | Minus / Plus |
 | F | toggle fullscreen |
 | Left Ctrl (hold) | skip text while held |

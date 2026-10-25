@@ -153,9 +153,21 @@ pub struct Layer {
     pub stage_rot: Option<f32>,
     /// quake slots 0 (SQK2) and 1 (SHK2 / SSW2)
     pub quake: [Quake; 2],
+    /// Witch on the Holy Night's one quake slot (STQK / STSW)
+    pub wquake: WitchQuake,
     /// SNX2 brightness (1 + v / 255) and SNX3 contrast (1 + v / 100) as the stage holds them (floats
     /// 1301 / 1302 + 4 layer); like the STEC mode they reach the texture only when it is built (`bake`)
     pub snx: [f32; 2],
+    /// Witch on the Holy Night's SNX4 values (stage floats 4844 + 16 layer + 8 / + 12, render +0x20C / +0x210):
+    /// saved and copied by SCH2 with a source layer, reset by STCH / STCC; nothing draws with them
+    pub snx4: [f32; 2],
+    /// Witch on the Holy Night's STGS stage words (2244 / 2404 + 2 layer): the fade's start alpha (0..255) and
+    /// frames, with its curve byte (564 + layer). STCH sets (alpha, 0) and curve 0, STGS (from, frames) (or
+    /// (to, 0) while skipping); the word between them (2324) is the drawn alpha, which jp_3C970 writes every
+    /// frame. While the frames word is set a commit rebuilds the fade from the three (sub_3E130 ->
+    /// sub_13ED0); the sound resume (jp_5D7E0) moves the start to the alpha.
+    pub wfade: [i16; 2],
+    pub wfade_ease: u8,
     /// STRA haze state (render words +284..+288)
     pub haze: Haze,
     /// clip window (STCH args 12..16); children are placed relative to its top-left
@@ -693,7 +705,239 @@ impl Quake {
     }
 }
 
+/// Witch on the Holy Night's quake: one slot per layer instead of Tsukihime's two (STQK sub_438A0, STSW
+/// sub_43770, STQS sub_44320; stepped by jp_3C970, drawn by sub_16210). Render +340 / +342 amplitudes, +344
+/// period P, +346 frames left D (-1 forever), +348 delay, +350 counter, +352 / +356 offset, +360 type; the stage
+/// keeps ax, ay, P, D, the delay and the starting D (words 4084 / 4164 / 4244 / 4324 / 4404 / 4484) and the
+/// type (byte 4564), which a load makes the render slot again (sub_3E130). Times are frames.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WitchQuake {
+    /// 0 / 4 / 5 random jolts every P frames (4 ends at a click wait once no voice plays, 5 does not fade),
+    /// 2 sine (P = cycle frames + 100 cycles over the lifetime, fading with them), 3 a two-level square wave,
+    /// 1 STSW's sway
+    pub kind: i32,
+    /// amplitudes in 1024x576 units; a negative ax follows layer 1's or layer 0's offset. The sway keeps its
+    /// state in ax / ay (phase + 1000 amplitude) and P (the two periods)
+    pub ax: i16,
+    pub ay: i16,
+    pub period: i16,
+    pub left: i16,
+    pub delay: i16,
+    counter: i16,
+    /// in 640x448 units
+    pub offset: (f32, f32),
+    /// the stage words: ax, ay, P, D, delay, starting D
+    pub stage: [i16; 6],
+    pub stage_kind: u8,
+}
+
+impl WitchQuake {
+    /// STQK's slot (sub_438A0, one layer): `period_ms` (34 when absent), `dur_ms` (-1 forever), `delay` in
+    /// frames; P = 3 period / 50 frames (at least 1 for the types 2..5), the types 2 / 3 add 100 x the cycles
+    /// that fit the duration (the cycle then at most 99). Types other than 2..5 are 0.
+    pub fn new(kind: i32, ax: i16, ay: i16, period_ms: i32, dur_ms: i32, delay: i16) -> Self {
+        let f = 3 * period_ms / 50;
+        let kind = if (2..=5).contains(&kind) { kind } else { 0 };
+        let period = match kind {
+            2 | 3 if period_ms <= dur_ms => f.clamp(1, 99) + 100 * dur_ms.checked_div(period_ms).unwrap_or(0),
+            2..=5 => f.max(1),
+            _ => f.max(0),
+        } as i16;
+        let left = if dur_ms < 0 { -1 } else { (3 * dur_ms / 50) as i16 };
+        Self {
+            kind,
+            ax,
+            ay,
+            period,
+            left,
+            delay,
+            stage: [ax, ay, period, left, delay, left],
+            stage_kind: kind as u8,
+            ..Self::default()
+        }
+    }
+
+    /// STSW's sway (sub_43770(layer, 0, 0, 0, -1, 0, 1)): type 1, P 1, forever.
+    pub fn sway() -> Self {
+        Self { kind: 1, period: 1, left: -1, stage: [0, 0, 1, -1, 0, -1], stage_kind: 1, ..Self::default() }
+    }
+
+    /// The slot a load rebuilds from the stage words (jp_5BAF0 / sub_3E130); counter and offset start at 0.
+    pub fn restore(kind: u8, stage: [i16; 6]) -> Self {
+        let [ax, ay, period, left, delay, _] = stage;
+        Self { kind: i32::from(kind), ax, ay, period, left, delay, stage, stage_kind: kind, ..Self::default() }
+    }
+
+    /// STQS: everything but the type (render +360, stage byte 4564) is zeroed.
+    pub fn stop(&mut self) {
+        *self = Self { kind: self.kind, stage_kind: self.stage_kind, ..Self::default() };
+    }
+
+    /// STCH without a source layer zeroes the stage words, D and the delay; the render amplitudes, P and the
+    /// offset stay, so a quaking layer keeps its last offset.
+    pub fn stch_clear(&mut self) {
+        self.left = 0;
+        self.delay = 0;
+        self.stage = [0; 6];
+        self.stage_kind = 0;
+    }
+
+    /// One frame of jp_3C970's quake. `lead`: layer 0's and layer 1's offsets where drawn, for a follower;
+    /// `talk_done`: no voice plays and the message waits for a click (sub_9C400 == 0, AE04B8 0x400).
+    #[allow(clippy::approx_constant)]
+    fn step(&mut self, rng: &mut crate::fx::Rng, lead: [Option<(f32, f32)>; 2], talk_done: bool) {
+        if self.delay >= 1 {
+            self.delay = (self.delay - 1).max(0);
+            self.stage[4] = self.delay;
+            return;
+        }
+        if self.left == 0 {
+            return;
+        }
+        if self.left >= 1 {
+            self.left -= 1;
+            if self.left <= 0 {
+                *self = Self { stage: [0, 0, 0, 0, 0, self.stage[5]], ..Self::default() };
+                return;
+            }
+        }
+        self.stage[3] = self.left;
+        self.counter -= 1;
+        const X: f32 = 640.0 * 0.00097656;
+        const Y: f32 = 448.0 / 576.0;
+        match self.kind {
+            2 | 3 => {
+                let m = self.period % 100;
+                let r = self.period / 100 * m;
+                if self.counter <= 0 {
+                    self.counter = m;
+                }
+                let k = if self.kind == 2 && r >= 1 { f32::from(self.left) / f32::from(r) } else { 1.0 };
+                let mut phase = f32::from(m - self.counter) * 3.1416 / f32::from(m);
+                if self.kind == 3 {
+                    phase = if phase < 1.5708 { 0.0 } else { 0.7854 };
+                }
+                let s = (phase + phase).sin();
+                let amp = |a: i16| f32::from(a.signum()) * k * f32::from(a.unsigned_abs());
+                self.offset = (amp(self.ax) * s * X, amp(self.ay) * s * Y);
+            }
+            1 => self.step_sway(rng),
+            4 if talk_done => *self = Self { stage: [0, 0, 0, 0, 0, self.stage[5]], ..Self::default() },
+            _ => {
+                if self.counter > 0 {
+                    return;
+                }
+                self.counter = self.period;
+                if self.ax < 0 {
+                    let mut o = (f32::from(self.ax), f32::from(self.ay));
+                    for l in lead.into_iter().flatten() {
+                        o = l;
+                    }
+                    self.offset = o;
+                    return;
+                }
+                let mut r = |a: i16| if a != 0 { (rng.f() * 2.0 - 1.0) * f32::from(a) } else { 0.0 };
+                let (mut x, mut y) = (r(self.ax) * X, r(self.ay) * Y);
+                let e = self.stage[5];
+                if e >= 1 && self.kind != 5 {
+                    let (e, d) = (f32::from(e), f32::from(self.left));
+                    let k = if e > 120.0 { (d / (e * 0.5).max(e - 60.0)).min(1.0) } else { d / e };
+                    x *= k;
+                    y *= k;
+                }
+                self.offset = (x, y);
+            }
+        }
+    }
+
+    /// STSW's sway (the type 1 branch): per axis a phase counting down a period of 60..119 frames and an
+    /// amplitude of 5..9 (1024x576 units; y at 0.3), rolled anew when the phase runs out, the sign kept; the
+    /// state lives in ax / ay (phase + 1000 amplitude, signed) and P ((x period - 60) + 100 (y period - 60)).
+    /// The offset follows sin(phase) only on some frames: every 4th phase step below |sin| 0.5, every 3rd up to
+    /// 0.8, and above that every other one until 0.96.
+    #[allow(clippy::approx_constant)]
+    fn step_sway(&mut self, rng: &mut crate::fx::Rng) {
+        // the counter is held at 10000, so it runs out only on the first frame
+        let fresh = self.counter <= 0;
+        self.counter = 10000;
+        let mut u = || rng.rand() as f32 * 4.6566e-10;
+        let (sx, sy, mut ax, mut ay, mut px, mut py) = if fresh {
+            let sx = if u() < 0.5 { 1 } else { -1 };
+            let sy = if u() < 0.5 { 1 } else { -1 };
+            (sx, sy, 0, 0, 0, 0)
+        } else {
+            let (ax, ay) = (i32::from(self.ax) / 1000, i32::from(self.ay) / 1000);
+            let phase = |a: i16| (i32::from(a.unsigned_abs()) % 1000 - 1).max(0);
+            (ax.signum(), ay.signum(), ax, ay, phase(self.ax), phase(self.ay))
+        };
+        let mut per_y = i32::from(self.period) / 100 + 60;
+        let per_x;
+        if px != 0 {
+            per_x = i32::from(self.period) % 100 + 60;
+        } else {
+            px = (u() * 60.0) as i32 + 60;
+            ax = ((u() * 5.0) as i32 + 5) * sx;
+            per_x = px;
+        }
+        if py == 0 {
+            py = (u() * 60.0) as i32 + 60;
+            ay = ((u() * 5.0) as i32 + 5) * sy;
+            per_y = py;
+        }
+        let a = py as f32 * 6.2832 / per_y as f32;
+        let s = a.sin().abs();
+        let update = if s < 0.5 {
+            py & 3 == 0
+        } else if s >= 0.8 {
+            py & 1 == 0 || s >= 0.96
+        } else {
+            py % 3 == 0
+        };
+        if update {
+            self.offset = (
+                (px as f32 * 6.2832 / per_x as f32).sin() * ax as f32 * 640.0 * 0.00097656,
+                ay as f32 * 0.3 * a.sin() * 448.0 / 576.0,
+            );
+        }
+        let pack = |p: i32, a: i32| (if a < 0 { -(p + 1000 * a.abs()) } else { p + 1000 * a.abs() }) as i16;
+        self.ax = pack(px, ax);
+        self.ay = pack(py, ay);
+        self.period = (per_x + 100 * per_y - 6060) as i16;
+    }
+}
+
 impl Layer {
+    /// The drawn alpha as jp_3C970 keeps it in stage word 2324: (int)((target + offset) x 255).
+    pub fn drawn_alpha(&self) -> i16 {
+        (self.alpha.value() * 255.0 + 1.0e-3) as i32 as i16
+    }
+
+    /// sub_3E130 -> sub_13ED0 (Witch on the Holy Night): while the STGS frames word is set the alpha tween is
+    /// rebuilt from the drawn alpha.
+    pub fn restart_fade(&mut self) {
+        let cur = self.drawn_alpha();
+        self.rebuild_fade(cur);
+    }
+
+    /// sub_13ED0: amplitude start - to, progress |to - drawn| / |to - start| (4.12, saturating, NaN 0) and a
+    /// step of -4096 / frames, so a linear fade goes on where it is.
+    pub fn rebuild_fade(&mut self, cur: i16) {
+        let [from, frames] = self.wfade;
+        if frames < 1 {
+            return;
+        }
+        let to = (self.alpha.to * 255.0).round() / 255.0;
+        let (from, cur) = (f32::from(from) / 255.0, f32::from(cur) / 255.0);
+        let ratio = (to - cur).abs() / (to - from).abs();
+        self.alpha = Tween {
+            to,
+            diff: from - to,
+            prog: (ratio * 4096.0) as i32 as i16,
+            step: (-4096.0 / f32::from(frames)) as i32 as i16,
+            ease: i32::from(self.wfade_ease),
+        };
+    }
+
     pub fn new(name: String, source: Source, x: f32, y: f32, prio: i32) -> Self {
         Self {
             name,
@@ -734,7 +978,11 @@ impl Layer {
             stage_shift: None,
             stage_rot: None,
             quake: [Quake::default(); 2],
+            wquake: WitchQuake::default(),
             snx: [1.0; 2],
+            snx4: [0.0; 2],
+            wfade: [255, 0],
+            wfade_ease: 0,
             haze: Haze::default(),
             clip: None,
         }
@@ -786,9 +1034,10 @@ impl Layer {
 
     /// sub_329F0: a layer is busy while one of the `mask` parts runs: 1 position, 4 rotation, 8 alpha,
     /// 0x20 the motion (bit 2 is a tween no command sets, 0x10 the unused STRC clip tween); zoom is never
-    /// waited on.
-    pub fn animating(&self, mask: i32) -> bool {
-        (mask & 0x20 != 0 && self.motion.as_ref().is_some_and(|m| !m.finished() && !m.paused))
+    /// waited on. A motion runs (sub_9598C) while it has no loop point (`looping`, sub_999A0), is short of its
+    /// length and is not paused: a looping motion is never waited on.
+    pub fn animating(&self, mask: i32, looping: &dyn Fn(i32) -> bool) -> bool {
+        (mask & 0x20 != 0 && self.motion.as_ref().is_some_and(|m| !looping(m.id) && !m.finished() && !m.paused))
             || (mask & 1 != 0 && !(self.x.done() && self.y.done()))
             || (mask & 4 != 0 && !self.rotation.done())
             || (mask & 8 != 0 && !self.alpha.done())
@@ -851,8 +1100,19 @@ pub struct Stage {
     pub rules: Vec<Option<RenderRule>>,
     /// Render +12 per slot: the slot held an image at the last commit (sub_3C970)
     pub shown: Vec<bool>,
+    /// Stage word 0x183C, the backdrop colour index (Witch on the Holy Night's jp_48AC0 sets it each story
+    /// frame: 0 black in `savedata::witch_dark_scene`, else 1 white; Tsukihime: always 0), and the colour the
+    /// commit (sub_3E130 -> sub_13A60, off_6327E0) handed to the render, which sub_206C0 fills the screen with
+    pub backdrop: u8,
+    pub backdrop_drawn: u8,
+    /// The rule wipes' edge width (`RuleMask::soft`): Tsukihime's fixed 128, or Witch on the Holy Night's
+    /// dword_612C88 (64 at boot; FADS's fifth and STTR's fourth argument, sub_7EDA0 taking 64 for <= 0 or >= 255),
+    /// which nothing saves or resets
+    pub rule_soft: f32,
     /// the quake slots' random source and unspent time for their 60 Hz steps
     quake_rng: crate::fx::Rng,
+    /// no voice plays and the message waits for a click: Witch on the Holy Night's type 4 quake ends
+    pub talk_done: bool,
     frame_acc: f32,
     group: Group,
 }
@@ -868,7 +1128,11 @@ impl Stage {
             kept: vec![None; LAYERS],
             rules: vec![None; LAYERS],
             shown: vec![false; LAYERS],
+            backdrop: 0,
+            backdrop_drawn: 0,
+            rule_soft: if crate::assets::witch() { 64.0 } else { 128.0 },
             quake_rng: crate::fx::Rng::default(),
+            talk_done: false,
             frame_acc: 0.0,
             group: Group::default(),
         }
@@ -876,26 +1140,41 @@ impl Stage {
 
     /// STNS (sub_35FC0), once per frame: the quad that paints the noise into render target 40
     /// (canvas sized, never cleared). Noise texture 390 (noisehd1) when n%10==2, else 389 (noisehd0),
-    /// scaled 0.6 in a 960x540 space (1.2x at canvas size) at a fresh random offset of 0..-100 x 0..-45
-    /// units, mirrored horizontally on alternate ticks (each frame when n>2, else every third). The
-    /// strip the shifted texture misses keeps earlier frames' noise, as in the exe. Grain layers then
-    /// show RT40 in place of their image. All grain layers share RT40 like the exe; the first one's
+    /// scaled 0.6 in a 960x540 space (1.2x at canvas size) at a fresh random offset of -rand(0, 320) / 4 x
+    /// -rand(0, 180) / 4 units, mirrored horizontally on alternate ticks (each frame when n>2, else every
+    /// third). The strip the shifted texture misses keeps earlier frames' noise, as in the exe. Grain layers
+    /// then show RT40 in place of their image. All grain layers share RT40 like the exe; the first one's
     /// parameters drive it.
+    ///
+    /// Witch on the Holy Night (jp_35FC0, render +364..+372 stepped by jp_3C970): scale 0.9375 (1.875x), a tick
+    /// every 9 frames for n 11 / 12, 6 for 21 / 22 / 31 / 32, else 3, and the offset -rand(0, 896) / 4 x
+    /// -rand(0, 504) / 4 drawn only at a tick (held between ticks).
     pub fn noise_pass(&self) -> Option<Quad> {
         let nt = self.noise.as_ref()?;
         let n = self.layers.iter().flatten().find_map(|l| l.noise.filter(|_| !l.pending))?;
         let t = &nt[usize::from(n % 10 == 2)];
-        let tick = self.frame / if n > 2 { 1 } else { 3 };
+        let witch = crate::assets::witch();
+        let period = match (witch, n) {
+            (true, 11 | 12) => 9,
+            (true, 21 | 22 | 31 | 32) => 6,
+            (true, _) => 3,
+            (false, _) => if n > 2 { 1 } else { 3 },
+        };
+        let tick = self.frame / period;
+        // a fresh offset each frame in Tsukihime, each tick in Witch on the Holy Night
+        let seed = if witch { tick } else { self.frame };
         let rnd = |k: u32| {
-            let mut v = self.frame.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B);
+            let mut v = seed.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B);
             v ^= v >> 15;
             v = v.wrapping_mul(0x2C1B_3C6D);
             v ^= v >> 12;
             (v & 0xFFFF) as f32 / 65535.0
         };
         let k = CANVAS_W as f32 / 1920.0;
-        let (x0, y0) = (-rnd(1) * 200.0 * k, -rnd(2) * 90.0 * k);
-        let (tw, th) = (t.width as f32 * 1.2 * k, t.height as f32 * 1.2 * k);
+        // offsets in the 960x540 space (2 px each), the quad scaled there
+        let (rx, ry, scale) = if witch { (896.0, 504.0, 0.9375) } else { (320.0, 180.0, 0.6) };
+        let (x0, y0) = (-rnd(1) * rx / 4.0 * 2.0 * k, -rnd(2) * ry / 4.0 * 2.0 * k);
+        let (tw, th) = (t.width as f32 * scale * 2.0 * k, t.height as f32 * scale * 2.0 * k);
         let um = t.uv_max();
         let (u0, u1) = if tick % 2 == 1 { (um[0], 0.0) } else { (0.0, um[0]) };
         let mut q = Quad::rect(t.clone(), [x0, y0, tw, th], [1.0; 4]);
@@ -925,6 +1204,7 @@ impl Stage {
     /// the render shift and pivot from the stage word and anchor), and sub_31F30(layer, target, target, 0
     /// frames) lands each layer's zoom tween on the stage's zoom target (kind 0).
     pub fn commit(&mut self) {
+        self.backdrop_drawn = self.backdrop;
         for (shown, l) in self.shown.iter_mut().zip(&self.layers) {
             *shown = l.is_some();
         }
@@ -947,6 +1227,9 @@ impl Stage {
             for t in [&mut l.zoom_x, &mut l.zoom_y] {
                 *t = Tween::new(t.to, t.to, 0, 0);
             }
+            if crate::assets::witch() {
+                l.restart_fade();
+            }
         }
     }
 
@@ -967,6 +1250,18 @@ impl Stage {
 
     /// The quake part of sub_3C970, layers in order so that followers see layers 0 / 1 already stepped.
     fn step_quakes(&mut self) {
+        if crate::assets::witch() {
+            // jp_3C970: a follower takes layer 0's offset, then layer 1's, where drawn (render +12 == 1 and the
+            // frame's drawn flag)
+            for li in 0..self.layers.len() {
+                let lead = |k: usize| self.layers[k].as_ref().filter(|l| !l.pending).map(|l| l.wquake.offset);
+                let lead = [lead(0), lead(1)];
+                if let Some(l) = self.layers[li].as_mut() {
+                    l.wquake.step(&mut self.quake_rng, lead, self.talk_done);
+                }
+            }
+            return;
+        }
         for li in 0..self.layers.len() {
             for s in 0..2 {
                 let lead = |k: usize| self.layers[k].as_ref().filter(|l| !l.pending).map(|l| l.quake[s].offset);
@@ -986,6 +1281,9 @@ impl Stage {
     /// offset, or none when the base clips.
     fn quake_px(&self, i: usize) -> (f32, f32) {
         let Some(l) = self.layers[i].as_ref() else { return (0.0, 0.0) };
+        if crate::assets::witch() {
+            return (0.0, 0.0);
+        }
         let get = |k: usize| self.layers.get(k).and_then(|l| l.as_ref());
         let (mut x, mut y) = (0.0, 0.0);
         for s in 0..2 {
@@ -1020,14 +1318,31 @@ impl Stage {
         (x / 3.0 * CANVAS_W as f32 / 640.0, y / 3.0 * CANVAS_H as f32 / 448.0)
     }
 
-    pub fn animating(&self, i: i32, mask: i32) -> bool {
+    /// Witch on the Holy Night's quake offset of a layer drawn at `pos` (sub_16210), in canvas pixels: only
+    /// with P >= 1 and an image other than BLACK (id >= 1); once on an axis where the turned quad reaches within
+    /// 30 units of the left (30.167 of the top) edge, twice otherwise.
+    fn witch_quake_px(l: &Layer, pos: &[[f32; 2]; 4]) -> (f32, f32) {
+        let q = &l.wquake;
+        let black = matches!(l.source, Source::Color(c) if c == [0.0; 3]);
+        if q.period < 1 || q.offset == (0.0, 0.0) || black {
+            return (0.0, 0.0);
+        }
+        let (sx, sy) = (CANVAS_W as f32 / 640.0, CANVAS_H as f32 / 448.0);
+        let min_x = pos.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+        let min_y = pos.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let kx = if min_x - 30.0 * sx <= 0.0 { 1.0 } else { 2.0 };
+        let ky = if min_y - 30.167 * sy <= 0.0 { 1.0 } else { 2.0 };
+        (q.offset.0 * kx * sx, q.offset.1 * ky * sy)
+    }
+
+    pub fn animating(&self, i: i32, mask: i32, looping: &dyn Fn(i32) -> bool) -> bool {
         if i < 0 {
-            self.layers.iter().flatten().any(|l| l.animating(mask))
+            self.layers.iter().flatten().any(|l| l.animating(mask, looping))
         } else {
             self.layers
                 .get(i as usize)
                 .and_then(|l| l.as_ref())
-                .is_some_and(|l| l.animating(mask))
+                .is_some_and(|l| l.animating(mask, looping))
         }
     }
 
@@ -1471,10 +1786,16 @@ impl Stage {
             let sy = CANVAS_H as f32 / UNIT_H;
             let (mut tex, w, h, ox, oy, uvm) = match &l.source {
                 Source::Image(img) => {
-                    // sub_34440: the quad turns about the pivot and is offset by pivot + shift
+                    // sub_34440: the quad turns about the pivot and is offset by pivot + shift. Witch on the Holy
+                    // Night's (sub_16210) offsets it by pivot - the ImageInfo centre instead: the image's centre
+                    // sits on the position whatever the shift words hold, and it turns about the pivot.
                     let centre = img.anchor();
                     let piv = l.pivot.unwrap_or(centre);
-                    let sh = l.shift.unwrap_or([-centre[0], -centre[1]]);
+                    let sh = if crate::assets::witch() {
+                        [-img.center_x, -img.center_y]
+                    } else {
+                        l.shift.unwrap_or([-centre[0], -centre[1]])
+                    };
                     cx += (piv[0] + sh[0]) * CANVAS_W as f32 / UNIT_W;
                     cy += (piv[1] + sh[1]) * 1.25 * CANVAS_H as f32 / 448.0;
                     (img.tex.clone(), img.width * sx, img.height * sy, piv[0] * sx, piv[1] * sy, img.tex.uv_max())
@@ -1522,6 +1843,7 @@ impl Stage {
             let rule = self.rules[i].as_ref().map(|r| knife_render::RuleMask {
                 // the shader compares c3[0x3c] with 1 / 2 / 3: 1 and 3 mirror x, 2 and 3 mirror y
                 flip: if r.flip <= 3 { r.flip } else { 0 },
+                soft: self.rule_soft,
                 ..knife_render::RuleMask::new(r.tex.clone(), alpha.clamp(0.0, 1.0))
             });
             // STRA: the layer's texture (slot 393 + layer) is drawn through the haze shader
@@ -1533,9 +1855,17 @@ impl Stage {
             }
             .unwrap_or_default();
             let [u0, v0, u1, v1] = uv;
+            let mut pos = [corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)];
+            if crate::assets::witch() {
+                let q = Self::witch_quake_px(l, &pos);
+                for p in &mut pos {
+                    p[0] += q.0;
+                    p[1] += q.1;
+                }
+            }
             Some(Quad {
                 tex,
-                pos: [corner(0.0, 0.0), corner(w, 0.0), corner(w, h), corner(0.0, h)],
+                pos,
                 uv: [[u0, v0], [u1, v0], [u1, v1], [u0, v1]],
                 color: [rgb[0], rgb[1], rgb[2], alpha.clamp(0.0, 1.0)],
                 blend: l.blend,

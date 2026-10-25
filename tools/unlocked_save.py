@@ -19,8 +19,21 @@ save at the start of node 1 whose playthrough has every route node and edge (F20
 both in the record's F subset), so the system menu's flowchart opens fully lit. Flowchart jumps need nothing
 stored per node (the exe restarts the node's scene, sub_178C8).
 
+witch: Witch on the Holy Night's savedata.bin (0x3FB800 bytes, knife/src/savedata.rs `WITCH`, re/NOTES_WOH.md "Save
+file"), patching an existing one: a 7168-byte system block (u16 +2 = 1; +4 config, 320 bytes; +324 G, 330 words;
++984 seen, 524 bytes), then the records, kept as they are. It gains what a finished playthrough leaves there:
+  G010 = 1  past the first launch (0: the title1st splash starts the story; 1_2 sets it)
+  G011..G024 = 1  each voice character met (the config's voice help, sub_B7E0)
+  G026 bits 1, 8, 9  the TeaTime menus' "new book in the archive" popups shown (TTCT)
+  G130..  RDST bits (bit n % 16 of G130 + n / 16, jp_8D180): every RDST(n) of the scripts, 0..206 but 135 / 137.
+          They hold jp_8D1C0's ending bits (the second title; every CG, track and archive scene, jp_455C0 /
+          jp_45FE0 / sub_2CD0), the CGs of jp_455C0's switch and the archive's read icons
+  seen    images 0..3199 (jp_644A0), BGM n <= 0x207 at bit 3200 + n (jp_77740)
+Unlike Tsukihime there is no flowchart, so no record is added.
+
 usage: unlocked_save.py switch OUT.bin [--patch IN.bin]
        unlocked_save.py knife OUT_DIR [--nodes NODES.json]
+       unlocked_save.py witch OUT_DIR
 """
 import json
 import os
@@ -160,11 +173,60 @@ def knife(out_dir, nodes_path=None):
     print(f"wrote {path}")
 
 
+W_SIZE, W_SYS, W_CONFIG, W_G, W_SEEN = 0x3FB800, 7168, 4, 324, 984
+# RDST(n) in the scripts (kdu scenes): 0..206 but 135 and 137
+W_RDST = [n for n in range(207) if n not in (135, 137)]
+W_IMAGES, W_BGM = 3200, 0x208
+
+
+def witch_config_defaults():
+    """WITCH_CONFIG_DEFAULTS in knife/src/savedata.rs (0x2EB0B0)."""
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), "..", "knife", "src", "savedata.rs")).read()
+    i = src.index("pub const WITCH_CONFIG_DEFAULTS")
+    body = src[src.index("= [", i) + 3:src.index("];", i)]
+    return bytes(int(v, 0) for v in re.findall(r"0x[0-9a-f]+|\d+", body))
+
+
+def witch(out_dir):
+    path = os.path.join(out_dir, "savedata.bin")
+    if os.path.exists(path):
+        data = bytearray(open(path, "rb").read())
+        if len(data) != W_SIZE:
+            sys.exit(f"{path}: expected {W_SIZE} bytes, got {len(data)}")
+    else:
+        data = bytearray(W_SIZE)
+    if struct.unpack_from("<H", data, 2)[0] == 0:
+        # an unused system block: a fresh one (sub_4EA30; the language word -1 takes the system language)
+        data[:W_SYS] = bytes(W_SYS)
+        struct.pack_into("<H", data, 2, 1)
+        cfg = witch_config_defaults()
+        data[W_CONFIG:W_CONFIG + len(cfg)] = cfg
+
+    def g_or(n, v):
+        struct.pack_into("<H", data, W_G + 2 * n, struct.unpack_from("<H", data, W_G + 2 * n)[0] | v)
+
+    g_or(10, 1)
+    for n in range(11, 25):
+        g_or(n, 1)
+    g_or(26, 1 << 1 | 1 << 8 | 1 << 9)
+    for n in W_RDST:
+        g_or(130 + n // 16, 1 << (n % 16))
+    set_bits(data, W_SEEN, 0, W_IMAGES)
+    set_bits(data, W_SEEN, W_IMAGES, W_BGM)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    print(f"wrote {path}")
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if len(a) >= 2 and a[0] == "switch":
         switch(a[1], a[3] if len(a) >= 4 and a[2] == "--patch" else None)
     elif len(a) in (2, 4) and a[0] == "knife" and (len(a) == 2 or a[2] == "--nodes"):
         knife(a[1], a[3] if len(a) == 4 else None)
+    elif len(a) == 2 and a[0] == "witch":
+        witch(a[1])
     else:
         sys.exit(__doc__)
