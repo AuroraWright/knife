@@ -369,6 +369,9 @@ pub struct Renderer {
     lut_group: wgpu::BindGroup,
     /// pre_alter without a grade, into an sRGB texture (`upload_altered`)
     alter: wgpu::RenderPipeline,
+    /// The window is fully covered or minimised: `present` submits the frame's work but takes no surface
+    /// texture (a hidden macOS window hands drawables back at once or after a second's stall)
+    pub hidden: bool,
 }
 
 pub enum Upload<'a> {
@@ -567,6 +570,7 @@ impl Renderer {
             soft_lut,
             lut_group,
             alter,
+            hidden: false,
         })
     }
 
@@ -1132,6 +1136,10 @@ impl Renderer {
 
     /// Scale `canvas` into the window (letterboxed) through the output curve, then submit and present.
     pub fn present(&mut self, mut encoder: wgpu::CommandEncoder, canvas: &RenderTarget) {
+        if self.hidden {
+            self.queue.submit([encoder.finish()]);
+            return;
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {

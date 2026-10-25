@@ -223,6 +223,11 @@ struct App {
     scripted: bool,
     /// The game language the window title was last set for (`Assets::title`)
     title_language: Option<usize>,
+    /// The window is fully covered or minimised (`WindowEvent::Occluded`): no redraws come, so `about_to_wait`
+    /// runs the frames on a 60 Hz timer and nothing is presented
+    occluded: bool,
+    /// When the next frame runs while `occluded`
+    hidden_tick: Instant,
 }
 
 /// A 1920x1080 window, shrunk to 90% of the monitor (or its work area) at 16:9 when it does not fit, centred.
@@ -425,9 +430,12 @@ impl App {
         if !g.paused {
             ui.rewind_before_script(g);
         }
-        ui.story_input(g, r, dt);
-        g.update(r, dt.min(100.0));
-        ui.update(g, r, dt);
+        // a stalled frame (the machine waking, a blocked present) counts at most 100 ms, so the fixed 60 fps
+        // steps of the game and the menus don't run a long burst to catch up
+        let step = dt.min(100.0);
+        ui.story_input(g, r, step);
+        g.update(r, step);
+        ui.update(g, r, step);
         // nn::atk's update after the frame callback, then the present (sub_FC064)
         g.sound.flush();
         g.system_menu_shown = ui.system_menu_shown();
@@ -542,9 +550,32 @@ impl App {
             tracing::info!("shot {} scene {} pc {}\n{}", path.display(), g.scene_index, g.current_pc(), g.dump_layers());
         }
     }
+
+    /// One frame, then --exit-after's check.
+    fn tick(&mut self, el: &ActiveEventLoop) {
+        self.frame();
+        if self.cli.exit_after.is_some_and(|ms| self.elapsed >= ms as f32) {
+            if let (Some(g), Some(ui)) = (&self.game, &mut self.ui) {
+                ui.store_global(g);
+            }
+            el.exit();
+        }
+    }
 }
 
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if !self.occluded || self.game.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.hidden_tick {
+            self.tick(el);
+            self.hidden_tick = (self.hidden_tick + std::time::Duration::from_micros(16_667)).max(now);
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(self.hidden_tick));
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_none()
             && let Err(e) = self.init(el)
@@ -568,15 +599,28 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.frame();
-                if self.cli.exit_after.is_some_and(|ms| self.elapsed >= ms as f32) {
-                    if let (Some(g), Some(ui)) = (&self.game, &mut self.ui) {
-                        ui.store_global(g);
-                    }
-                    el.exit();
-                }
-                if let Some(w) = &self.window {
+                self.tick(el);
+                if !self.occluded
+                    && let Some(w) = &self.window
+                {
                     w.request_redraw();
+                }
+            }
+            // a hidden window's presents don't wait for the display (or stall for a second each), and the time
+            // spent so would come back as a burst of catch-up steps: run the hidden frames on a timer instead
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if let Some(r) = &mut self.renderer {
+                    r.hidden = occluded;
+                }
+                if occluded {
+                    self.hidden_tick = Instant::now();
+                    el.set_control_flow(ControlFlow::WaitUntil(self.hidden_tick));
+                } else {
+                    el.set_control_flow(ControlFlow::Poll);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } if self.scripted => {}
@@ -754,6 +798,8 @@ fn main() -> Result<()> {
         kl: [false; 2],
         scripted,
         title_language: None,
+        occluded: false,
+        hidden_tick: Instant::now(),
     };
     el.run_app(&mut app)?;
     Ok(())
