@@ -3,8 +3,8 @@
 
 Astris must have focus to take input (the commands activate it). Needs `tools/emu/dsu_server.py` running (Astris: Input = DSU Controller, 127.0.0.1:26760, slot 0) and the game
 window open. Captures are the game area of the window, scaled to 1920x1080.
-EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en, save copy switch_emu_save_en) and
-EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh, switch_emu_save_woh) instead of the Japanese Tsukihime
+EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en) and
+EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh) instead of the Japanese Tsukihime
 (the default, EMU_GAME=ja).
 
     emu.py press BTN [ms] | hold BTN | release BTN | stick L|R X Y | reset
@@ -16,7 +16,7 @@ EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh, switch_emu_save_woh) ins
         is captured every --every ms (or as fast as a capture allows, 0.25-0.5 s) into build/emu/NAME/emu_NNNN.png,
         with each capture's real time in emu_times.txt
     emu.py knife NAME KEYS [--every MS] [--until MS] [knife args...]
-        the same keys through knife (--keys / --shots) on a copy of switch_emu_save(_en), into knife_NNNN.png
+        the same keys through knife (--keys / --shots) on a copy of the game's live save, into knife_NNNN.png
         (target/release/knife built with `--features debug`);
         with --title it boots like a normal start (--boot --skip-intro), so the title has its entry state
     emu.py rec NAME KEYS [--fps N] [--until MS]
@@ -28,8 +28,8 @@ EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh, switch_emu_save_woh) ins
         touch the game screen at 1920x1080 game coordinates (tools/emu/touch.swift: Astris takes the mouse as the
         touch screen; the first touch after focusing only activates it, so a fresh session needs one extra tap)
     emu.py restart [SAVE]
-        stop the game (Emulation > Stop), install SAVE as the live save (both Ryujinx save dirs and
-        switch_emu_save) while it is stopped, and start it again (double-click in the game list); ~40 s.
+        stop the game (Emulation > Stop), install SAVE as the live save (both Ryujinx save dirs) while it is
+        stopped, and start it again (double-click in the game list); ~40 s.
         The screen must be unlocked (clicks and the controller do not reach a locked session).
 """
 
@@ -53,16 +53,15 @@ CLICK = os.path.join(OUT, "click")
 SAVE_ROOT = os.path.expanduser("~/Library/Containers/V380-Ori.Astris/Data/Library/Application Support/Ryujinx/"
                               "bis/user/save")
 # EMU_GAME=ja (default), en or woh picks the game: (title id, window title test, Library row in window-relative
-# pt, the local save copy, knife's data). The Library lists the games by title, now all Japanese: 月姫 1.0.2 (the
+# pt, knife's data). The Library lists the games by title, now all Japanese: 月姫 1.0.2 (the
 # Japanese build), 月姫 1.0.1 (the overseas build), then 魔法使いの夜.
 GAMES = {
     # both Tsukihime builds title their window 月姫 -A piece of blue glass moon- – Version: X
-    "ja": (0x01001DC01486A000, lambda t: t.startswith("月姫") and "1.0.1" not in t, (200, 114), "switch_emu_save",
-           "switch_romfs"),
+    "ja": (0x01001DC01486A000, lambda t: t.startswith("月姫") and "1.0.1" not in t, (200, 114), "switch_romfs"),
     "en": (0x010057A01E4D4000, lambda t: t.startswith("TSUKIHIME") or t.startswith("月姫") and "1.0.1" in t, (200, 210),
-           "switch_emu_save_en", "switch_romfs_en"),
+           "switch_romfs_en"),
     "woh": (0x0100751018DBA000, lambda t: t.startswith(("WITCH ON THE HOLY NIGHT", "魔法使いの夜")), (200, 306),
-            "switch_emu_save_woh", "switch_romfs_woh"),
+            "switch_romfs_woh"),
 }
 # the Library's rows (window-relative pt); the order changes, see restart
 LIBRARY_ROWS = [(200, 114), (200, 210), (200, 306)]
@@ -70,7 +69,7 @@ GAMES_ROOT = os.path.join(os.path.dirname(SAVE_ROOT), "..", "..", "games")
 GAME = os.environ.get("EMU_GAME", "ja")
 if GAME not in GAMES:
     raise SystemExit(f"EMU_GAME: {GAME}: expected one of {', '.join(GAMES)}")
-TITLE_ID, GAME_TITLE, CLICK_GAME, SAVE_COPY, ROMFS = GAMES[GAME]
+TITLE_ID, GAME_TITLE, CLICK_GAME, ROMFS = GAMES[GAME]
 
 
 def live_save():
@@ -259,10 +258,10 @@ def restart(save):
         raise SystemExit("no Astris Library window (is the game still running?)")
     if save:
         live = live_save()
-        os.makedirs(os.path.join(ROOT, SAVE_COPY), exist_ok=True)
-        for dst in (os.path.join(live, "0", "savedata000"), os.path.join(live, "1", "savedata000"),
-                    os.path.join(ROOT, SAVE_COPY, "savedata000")):
-            shutil.copyfile(save, dst)
+        data = open(save, "rb").read()
+        for dst in (os.path.join(live, "0", "savedata000"), os.path.join(live, "1", "savedata000")):
+            with open(dst, "wb") as f:
+                f.write(data)
     # the Library's order changes (and both Tsukihime builds title their window alike), so the game that started
     # is told by its metadata.json, which a launch stamps; a wrong one is stopped and the next row tried, and the
     # row that worked is remembered
@@ -429,7 +428,7 @@ def knife(name, keys, every, until, extra):
     sv = os.path.join(OUT, "save")
     shutil.rmtree(sv, ignore_errors=True)
     os.makedirs(sv)
-    shutil.copyfile(os.path.join(ROOT, SAVE_COPY, "savedata000"), os.path.join(sv, "savedata.bin"))
+    shutil.copyfile(os.path.join(live_save(), "0", "savedata000"), os.path.join(sv, "savedata.bin"))
     shots = os.path.join(d, "knife_raw")
     shutil.rmtree(shots, ignore_errors=True)
     ev = parse_keys(keys)
