@@ -3812,6 +3812,11 @@ impl Ui {
         if self.closing || self.page_opening() {
             return;
         }
+        // a scroll (wheel, trackpad, stick, drag, or the tween keeping the cursor in view) moves the entries under a
+        // resting pointer: the events it sends without the pointer moving leave the hover be until it has settled
+        if !moved && self.scroll_moving() {
+            return;
+        }
         // the system menu: the pointer moves the tab cursor like the other menus' (the Switch's tap moves it and
         // opens the tab at once, so only a click opens here); off the tabs the cursor stays, as a touch outside
         // them does nothing (sub_4CEA0)
@@ -4600,6 +4605,17 @@ impl Ui {
             || (self.screen == Screen::Config && (self.conf_next.is_some() || self.conf_ca < 1.0))
             || self.lang_seq.is_some()
             || self.lang_cool > 0
+    }
+
+    /// The config, the CG grid, the music list or the flowchart scrolling: the wheel / trackpad still tilting the
+    /// stick, or the scroll's tween running.
+    fn scroll_moving(&self) -> bool {
+        match self.screen {
+            Screen::Config => self.wheel != 0.0 || self.conf_t < CONF_SCROLL_MS,
+            Screen::Gallery | Screen::Music => self.wheel != 0.0 || self.gal_scroll.t < self.gal_scroll.len,
+            Screen::Flowchart { .. } => self.wheel != 0.0 || self.flow_t < self.flow_len,
+            _ => false,
+        }
     }
 
     /// The save list or the config still fading in: sub_50FC0 state 1 and sub_2B770 (config state 2) read no
