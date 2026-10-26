@@ -3804,12 +3804,19 @@ impl Ui {
             self.touch_move();
         }
         if self.screen == Screen::Game {
-            game.mouse_move(x, y, self.touch.panel == touch::Panel::Closed);
+            // a choice / TeaTime takes the pointer when it would take the pad (`pad_story`): not during a scene
+            // countdown or a story movie, with the mode panel up, or while a popup takes the buttons
+            let input = self.touch.panel == touch::Panel::Closed
+                && self.touch.scene_cd.is_none()
+                && !game.in_movie()
+                && self.popup.is_none();
+            game.mouse_move(x, y, input);
             return;
         }
-        // a page fading out or in takes no input (sub_2C500, sub_50FC0 state 27, sub_4D8C0 state 4; sub_2B770,
-        // sub_50FC0 state 1): its cursor stays
-        if self.closing || self.page_opening() {
+        // the pointer is held whenever the pad is (`key_nav`): a page fading out or in (sub_2C500, sub_50FC0 states
+        // 1 / 27, sub_2B770, sub_4D8C0 state 4), a save or delete running, a popup or dialog up, a transition; the
+        // cursor stays
+        if self.busy() || self.popup.is_some() || self.title_after_banner {
             return;
         }
         // a scroll (wheel, trackpad, stick, drag, or the tween keeping the cursor in view) moves the entries under a
@@ -3850,10 +3857,7 @@ impl Ui {
             // sub_8E200 state 17: off the entries the cursor stays; moving onto another one plays sound 0
             // (sub_AE0E0 / sub_AE0B0 only run there, so the cursor stays put until the fade-in has ended)
             hover = hover.or(self.hover);
-            if self.busy() {
-                hover = self.hover;
-                self.sounded = true;
-            } else if hover != self.hover {
+            if hover != self.hover {
                 // the pointer stands in for the pad's highlight here, so it brings the logo in at once as a
                 // d-pad move does (qword_1536194 = 1)
                 self.logo_a = 1.0;

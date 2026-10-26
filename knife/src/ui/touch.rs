@@ -1106,8 +1106,9 @@ impl Ui {
                 // state 3, as the other menus' cursors: the pointed button takes the focus (sound 0 when it
                 // changes) and is the one the pad goes on from (qword_B35A1C); a pointer moved off the buttons
                 // leaves none lit, the pad's focus (HIDWORD(qword_B35A14)) only stays until the pointer moves
-                // (Witch on the Holy Night: sound 2; a story dialog over the panel takes the pointer)
-                if hovered && self.screen != Screen::Witch {
+                // (Witch on the Holy Night: sound 2; a story dialog over the panel takes the pointer, and a popup
+                // takes the buttons, as from the pad)
+                if hovered && self.screen != Screen::Witch && self.popup.is_none() {
                     let before = self.touch.panel_hover.or(self.touch.panel_key);
                     self.touch.panel_hover = self.panel_button();
                     self.touch.panel_key = None;
