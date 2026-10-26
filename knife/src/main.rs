@@ -353,7 +353,9 @@ impl App {
                 }
             }
             ui.screen = ui::Screen::Game;
-        } else if !debug || self.cli.boot {
+        } else if !debug || self.cli.boot || (self.cli.title && assets::witch()) {
+            // (--title on WoH too: its title has nothing to show until jp_8D2E0 loads TITLE_PARTS and lays the
+            // menu out)
             ui.boot(&mut game, &renderer, self.cli.skip_intro);
         }
         game.auto = self.cli.auto;
