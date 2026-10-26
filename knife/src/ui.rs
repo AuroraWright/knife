@@ -36,9 +36,9 @@ fn gs() -> f32 {
 pub const SAVE_PITCH: f32 = 93.748 * H / 448.0;
 /// Trackpad travel (canvas px on screen) that scrolls the save list a row.
 pub const SAVE_WHEEL_ROW: f32 = 1.5 * SAVE_PITCH;
-/// Trackpad travel (canvas px on screen) that steps Witch on the Holy Night's backlog an entry: 1.5 entry pitches
-/// (116 units), as the save list's.
-const WITCH_LOG_ROW: f32 = 1.5 * 116.0 * H / 448.0;
+/// Trackpad travel (canvas px on screen) that steps Witch on the Holy Night's backlog an entry: one entry pitch
+/// (116 units).
+const WITCH_LOG_ROW: f32 = 116.0 * H / 448.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Confirm {
