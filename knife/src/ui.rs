@@ -2033,7 +2033,7 @@ impl Ui {
             }
         };
         if self.screen == Screen::Title && matches!(s, Screen::Config | Screen::SaveLoad { .. }) {
-            self.menu_bg.fade(0.02);
+            self.menu_bg.fade(0.024);
         }
         self.push(s);
     }
@@ -2484,11 +2484,12 @@ impl Ui {
         }
     }
 
-    /// Per-screen content fade speeds (per frame): (in, out). Save/load and config: sub_50FC0 / sub_2B680
-    /// (0.024, 0.048); system menu: sub_4CBA0 / sub_4D8C0 state 4 (1/18, 1/30); gallery: sub_47A90 (0.04).
+    /// Per-screen content fade speeds (per frame): (in, out). Save/load: sub_50FC0 states 1 / 27 (0.024, 0.048);
+    /// config: sub_2B770 / sub_2C500 (0.024 both ways); system menu: sub_4CBA0 / sub_4D8C0 state 4 (1/18, 1/30); gallery: sub_47A90 (0.04).
     fn fade_speeds(s: Screen) -> (f32, f32) {
         match s {
-            Screen::SaveLoad { .. } | Screen::Config => (0.024, 0.048),
+            Screen::SaveLoad { .. } => (0.024, 0.048),
+            Screen::Config => (0.024, 0.024),
             Screen::Menu => (1.0 / 18.0, 1.0 / 30.0),
             Screen::Gallery | Screen::Music | Screen::Movies | Screen::Endings => (0.04, 0.04),
             // backlog: sub_28F80 states 4 and 8 (and the quick jump, sub_28D50)
@@ -2510,6 +2511,11 @@ impl Ui {
             // the system menu over the game (sub_4D8C0 state 4) fades its backdrop with it (sub_49630(0, -1/30))
             if self.screen == Screen::Menu && matches!(self.stack.last(), None | Some(Screen::Game)) {
                 self.menu_bg.fade(-1.0 / 30.0);
+            }
+            // over the title the load list and the config take their backdrop out with them (sub_50FC0 state 27,
+            // sub_2C500: sub_49630(0, -0.024))
+            if matches!(self.screen, Screen::SaveLoad { .. } | Screen::Config) && self.stack.last() == Some(&Screen::Title) {
+                self.menu_bg.fade(-0.024);
             }
             self.closing = true;
         } else {
@@ -2571,7 +2577,9 @@ impl Ui {
                 None => self.wt_back(),
             },
             Screen::Title => {
-                self.menu_bg.fade(-0.02);
+                // the page's alpha reached 0: sub_49630(0, 0) cuts what is left of the backdrop, and the title
+                // takes input again (states 32 / 33 -> 15)
+                self.menu_bg.fade(0.0);
                 if let Some(i) = self.load_after_close.take() {
                     // title case 32, result 2: BGM out at 1.5 / frame (sub_9C9B0), the UI hidden (byte_1536155), state 30 fades
                     // to black (+0.01 / frame to 1.2), then the game
@@ -3799,6 +3807,11 @@ impl Ui {
             game.mouse_move(x, y, self.touch.panel == touch::Panel::Closed);
             return;
         }
+        // a page fading out or in takes no input (sub_2C500, sub_50FC0 state 27, sub_4D8C0 state 4; sub_2B770,
+        // sub_50FC0 state 1): its cursor stays
+        if self.closing || self.page_opening() {
+            return;
+        }
         // the system menu: the pointer moves the tab cursor like the other menus' (the Switch's tap moves it and
         // opens the tab at once, so only a click opens here); off the tabs the cursor stays, as a touch outside
         // them does nothing (sub_4CEA0)
@@ -3835,6 +3848,10 @@ impl Ui {
             if self.busy() {
                 hover = self.hover;
                 self.sounded = true;
+            } else if hover != self.hover {
+                // the pointer stands in for the pad's highlight here, so it brings the logo in at once as a
+                // d-pad move does (qword_1536194 = 1)
+                self.logo_a = 1.0;
             }
         }
         // touch only moves these cursors onto their own objects; anywhere else (a system menu tab, the back
@@ -3960,6 +3977,10 @@ impl Ui {
             return;
         }
         if let Some((_, a)) = items.iter().find(|(rc, _)| rect_hit(*rc, self.mouse)) {
+            // sub_8E200 state 17: an entry taken (A or a touch) brings the logo in at once (qword_1536194 = 1)
+            if self.screen == Screen::Title {
+                self.logo_a = 1.0;
+            }
             self.act(game, r, *a);
         }
     }
@@ -4004,6 +4025,8 @@ impl Ui {
                 }
                 self.act(game, r, Action::Back);
             }
+            // a page still fading in or out, or a transition, takes no B either (sub_2B770, sub_50FC0 states 1 / 27)
+            _ if self.busy() => {}
             _ => self.act(game, r, Action::Back),
         }
     }
@@ -4159,6 +4182,14 @@ impl Ui {
         let n = self.items(game).len();
         if n == 0 {
             return;
+        }
+        // sub_8E200 state 17: left / right put the cursor on the first / last entry; a direction or A brings
+        // the logo (and the entries with it) in at once (qword_1536194 = 1)
+        if self.screen == Screen::Title {
+            self.logo_a = 1.0;
+            if dx != 0 && dy == 0 {
+                self.hover = Some(if dx < 0 { 0 } else { n - 1 });
+            }
         }
         if dy != 0 {
             let cur = self.hover.map_or(if dy > 0 { -1 } else { 0 }, |h| h as i32);
@@ -4548,11 +4579,12 @@ impl Ui {
         self.wheel = (self.wheel + lines * WHEEL_FRAMES).clamp(-8.0 * WHEEL_FRAMES, 8.0 * WHEEL_FRAMES);
     }
 
-    /// Input is held while a screen fades out, the screen goes black for a transition, the gallery
-    /// crossfades between modes, or the title fades in from black (sub_8E200 takes input only from state 17,
-    /// after state 2's fade).
+    /// Input is held while a screen fades out, the save list or the config fades in, the screen goes black for a
+    /// transition, the gallery crossfades between modes, or the title fades in from black (sub_8E200 takes input
+    /// only from state 17, after state 2's fade).
     fn busy(&self) -> bool {
         self.closing
+            || self.page_opening()
             || self.dlg_holding()
             || (self.screen == Screen::Title && self.black_speed < 0.0)
             || (self.screen == Screen::Gallery && self.cg_in < CG_FX_SECS)
@@ -4568,6 +4600,12 @@ impl Ui {
             || (self.screen == Screen::Config && (self.conf_next.is_some() || self.conf_ca < 1.0))
             || self.lang_seq.is_some()
             || self.lang_cool > 0
+    }
+
+    /// The save list or the config still fading in: sub_50FC0 state 1 and sub_2B770 (config state 2) read no
+    /// input, and the system menu's tabs only run in config state 7 (sub_4D580)
+    fn page_opening(&self) -> bool {
+        matches!(self.screen, Screen::SaveLoad { .. } | Screen::Config) && !self.closing && self.scr_a < 1.0
     }
 
     /// An answered confirm dialog still up: input waits for dword_B34B54 (sub_496F0).
@@ -4685,8 +4723,9 @@ impl Ui {
                 // title case 2 / system menu tab 1 (sub_4CEA0; sound 2 while saving is disabled, sub_47B10); WoH's
                 // title case 2 sound 0
                 self.snd(game, if crate::assets::witch() && self.screen == Screen::Title { 0 } else { 1 });
+                // sub_50E00: the backdrop fades in with the list (sub_49630(0, 0.024))
                 if self.screen == Screen::Title {
-                    self.menu_bg.fade(0.02);
+                    self.menu_bg.fade(0.024);
                 }
                 self.push(Screen::SaveLoad { save: false, scroll: 0 });
                 self.hover = self.latest_entry(false);
@@ -4705,8 +4744,9 @@ impl Ui {
             Action::OpenConfig => {
                 // title case 3 / system menu tab 2: system sound 1 (WoH's title case 3: 0)
                 self.snd(game, if crate::assets::witch() && self.screen == Screen::Title { 0 } else { 1 });
+                // sub_2B680: the backdrop fades in with the config (sub_49630(0, 0.024))
                 if self.screen == Screen::Title {
-                    self.menu_bg.fade(0.02);
+                    self.menu_bg.fade(0.024);
                 }
                 self.conf_prev = [[0.0; 3]; 2];
                 self.conf_test_se = None;
