@@ -1,0 +1,4 @@
+plugins {
+    // needs Gradle 8.9 or newer
+    id 'com.android.application' version '8.7.3' apply false
+}

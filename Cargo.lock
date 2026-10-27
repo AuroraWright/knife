@@ -1484,6 +1484,7 @@ dependencies = [
  "knife-core",
  "knife-render",
  "mp4",
+ "ndk",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
@@ -1502,6 +1503,14 @@ dependencies = [
  "windows",
  "windows-sys 0.52.0",
  "winit",
+]
+
+[[package]]
+name = "knife-android"
+version = "0.9.6"
+dependencies = [
+ "knife",
+ "tracing",
 ]
 
 [[package]]

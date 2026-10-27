@@ -596,6 +596,11 @@ impl Sound {
             .or(self.pending.as_ref().map(|p| (p.id, p.volume)))
     }
 
+    /// Mute everything while the app is in the background (no frames run there), or bring the sound back.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.audio.set_muted(muted);
+    }
+
     /// sub_5F200 / sub_5EF10: the BGM (sub_9C650: 416.67 points a frame) and every SE channel (sub_9CF90)
     /// stop at once.
     pub fn stop_all(&mut self) {

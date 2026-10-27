@@ -224,7 +224,7 @@ pub fn set_file(path: PathBuf) {
 /// separate title on the Switch; Witch on the Holy Night: `knife/witch/savedata000`) in the OS application data
 /// directory (the working directory when the OS has none), as shin does.
 pub fn default_file(build: knife_core::exe::Build) -> PathBuf {
-    let dir = dirs::data_dir().unwrap_or_default().join("knife");
+    let dir = crate::platform::data_dir().unwrap_or_default().join("knife");
     match build {
         knife_core::exe::Build::Japanese => dir.join("savedata000"),
         knife_core::exe::Build::Overseas => dir.join("overseas").join("savedata000"),

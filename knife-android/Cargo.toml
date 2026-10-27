@@ -1,0 +1,15 @@
+[package]
+name = "knife-android"
+version = "0.9.6"
+edition = "2024"
+license = "MPL-2.0"
+description = "knife for Android: the library the app's NativeActivity loads"
+
+# Nothing here on other platforms: the library is empty unless it is built for Android (see ../android).
+[lib]
+name = "knife_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+knife = { path = "../knife" }
+tracing = { workspace = true }

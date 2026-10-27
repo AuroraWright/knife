@@ -1,7 +1,8 @@
 ; Example knife.ini. Copy this file to "knife.ini" to use it.
 ;
 ; knife reads knife.ini from the folder that contains the executable. Inside a
-; macOS app bundle it also looks in Contents/Resources.
+; macOS app bundle it also looks in Contents/Resources. On Android that folder
+; is the app's files folder, Android/data/dev.knife.app/files.
 ;
 ; Each line sets one command line option, using its long name without "--":
 ;   option = value
@@ -31,6 +32,11 @@ language =
 ; folder (~/Library/Application Support on macOS, %APPDATA% on Windows,
 ; ~/.local/share on Linux).
 save-file =
+
+; Rendering resolution: window (the window's resolution, at least 1920x1080)
+; or original (the Switch's 1920x1080 scaled to the window, identical to the
+; Switch). Empty: window.
+resolution =
 
 ; Serve displayed text over WebSocket at HOST:PORT, e.g. 127.0.0.1:6677.
 text-websocket =
