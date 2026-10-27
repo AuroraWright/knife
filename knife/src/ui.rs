@@ -1033,7 +1033,7 @@ fn gal_light_alpha(t: f32) -> f32 {
     let leg = (t / 1.2).max(0.0);
     let x = leg.fract() * 2.0;
     let e = if x < 1.0 { 0.5 * x * x } else { 1.0 - 0.5 * (2.0 - x) * (2.0 - x) };
-    let (from, to) = if leg as u32 % 2 == 0 { (1.0, 0.4) } else { (0.4, 1.0) };
+    let (from, to) = if (leg as u32).is_multiple_of(2) { (1.0, 0.4) } else { (0.4, 1.0) };
     from + (to - from) * e
 }
 
@@ -6644,6 +6644,7 @@ impl Ui {
     /// One CG grid (cGalleryCGMain / cGalleryCGSub, sub_AF78): thumbnails at 392 + 240 col, 109 + 139 row, and on
     /// entry `cur` the cursor frame with its glow at `flash`.
     /// The thumbnails at `cell_a(k)`, the cursor at `cur_a`.
+    #[allow(clippy::too_many_arguments)]
     fn draw_cg_grid(&self, out: &mut Vec<Quad>, sub: Option<usize>, scroll: f32, cur: Option<usize>, flash: Option<f32>, cell_a: &dyn Fn(usize) -> f32, cur_a: f32) {
         for (k, id) in self.cg_grid(sub).into_iter().enumerate() {
             let rc = Self::cg_cell(k, scroll);
