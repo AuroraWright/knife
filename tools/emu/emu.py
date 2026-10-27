@@ -135,10 +135,11 @@ def grab(win, path):
     im.crop(crop_box(win, im.size[0])).resize((1920, 1080), Image.LANCZOS).save(path)
 
 
-def to_srgb(im):
+def to_srgb(im, icc=None):
     """A window capture comes in the display's colour space (its ICC profile, Display P3 here), which
-    desaturates the game's sRGB colours (bow R 27 -> 44); convert it back so pixels compare with knife's."""
-    icc = im.info.get("icc_profile")
+    desaturates the game's sRGB colours (bow R 27 -> 44); convert it back so pixels compare with knife's.
+    `icc` is the profile to assume when the image carries none (winrec's frames)."""
+    icc = im.info.get("icc_profile") or icc
     im = im.convert("RGB")
     if not icc:
         return im
@@ -184,8 +185,13 @@ def rec(name, keys, fps, until):
         send_key(key)
     p.wait()
     ctrl("reset")
+    # winrec's frames are in the display's colour space without a profile: take the one screencapture embeds
+    tmp = os.path.join(d, "icc.png")
+    subprocess.run(["screencapture", "-x", "-o", "-l", win[0], tmp], check=True)
+    icc = Image.open(tmp).info.get("icc_profile")
+    os.remove(tmp)
     for f in sorted(os.listdir(raw)):
-        im = to_srgb(Image.open(os.path.join(raw, f)))
+        im = to_srgb(Image.open(os.path.join(raw, f)), icc)
         im.crop(crop_box(win, im.size[0])).resize((1920, 1080), Image.LANCZOS).save(
             os.path.join(d, "emu_" + f[2:]), quality=92)
     shutil.rmtree(raw)

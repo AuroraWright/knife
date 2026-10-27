@@ -222,6 +222,18 @@ struct Popup {
 
 /// A confirm dialog answered (sub_49F00 states 3 / 4): it stays `hold` frames (15 after A, 1 after B), then
 /// dword_B34B54 clears, the caller acts and the dialog fades out over the screen below at 0.07 per frame
+/// A Tsukihime menu object knife draws itself (sub_ADC50 tables): title entries 232.. (group 10, by entry),
+/// system menu tabs 197..201 (group 1), config controls (groups 3..5, by `conf_layout` index), dialog buttons
+/// 0 / 1 (group 15) and mode panel buttons 207..214 (group 14). All carry flag 0x20.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Obj {
+    Title(usize),
+    Tab(usize),
+    Conf(usize),
+    Dialog(usize),
+    Panel(usize),
+}
+
 /// (sub_4AE90: shrinking after Yes, cursor 0 in qword_B34B58, growing after No).
 #[derive(Clone, Copy)]
 struct DlgOut {
@@ -297,6 +309,16 @@ pub struct Ui {
     /// cursor (sub_50FC0 state 2, not the list rebuilds); sub_4F240 draws the selected frame again over the
     /// cursor entry with blend 30 at that times the page alpha and lowers it by 0.2 per draw
     save_flash: f32,
+    /// sub_AE840 for the `Obj`s: the focused object and its state last frame (1, 3 with flag 2, 4 pressed),
+    /// its focus flash (+64: an object of flag 0x20 taking the focus, state 0 -> 1 or 2 -> 3, starts it at 1
+    /// and it drops by +68 = 0.1 a frame from that frame; any other change of its state ends it), and the
+    /// object sub_AE040 pressed with its frames left (state 4)
+    obj_focus: Option<(Obj, u8)>,
+    obj_flash: f32,
+    obj_press: Option<(Obj, u32)>,
+    /// dword_1915114 / dword_AC0C14: the focus pulse of flag 0x800 objects (the config's) and its step, which
+    /// every sub_AEEC0 call (one per object group drawn) adds, bouncing between 0 and 1
+    obj_pulse: (f32, f32),
     /// the save list's (page, cursor, scroll) last frame, to see the cursor moves that light the flash
     save_seen: Option<(bool, Option<usize>, usize)>,
     /// text slot 38, the info panel's notes: sub_50B10 lays out the cursor entry's text on opening, cursor
@@ -345,6 +367,10 @@ pub struct Ui {
     cg_t: f32,
     /// cGalleryGuide sub_604C / sub_5EA4: phase (0 hidden, 1 fading in, 2 shown, 3 fading out) and its seconds
     cg_guide: (u8, f32),
+    /// The viewer guide's alpha in the screen a picture change captured (sub_CA54's sub_A4610(1))
+    cg_cap_guide: f32,
+    /// Surface 3: the old screen a picture change wipes away
+    cg_rt: Option<TexRef>,
     /// right stick y (-128..128, up) for the CG viewer zoom; the right stick's directions are the d-pad's
     pub rstick: i32,
     /// drawing the screen below a dialog / viewer (no guide or popup)
@@ -363,8 +389,10 @@ pub struct Ui {
     cg_sub: Option<usize>,
     /// the grid being replaced, fading out (sub_A4F4: 0.5 s, ease-out quad): (variations group, scroll, cursor)
     cg_old: Option<(Option<usize>, f32, Option<usize>)>,
-    /// time since the shown grid was made (sub_9970 fades it in over 0.5 s, ease-in quad; input waits for it)
+    /// time since the shown grid was made (sub_9970 fades it in over 0.5 s, ease-in quad, and sub_B318 each cell
+    /// with its own delay; input waits for all of it) and its first row on screen then (sub_B318's stagger)
     cg_in: f32,
+    cg_row0: usize,
     /// cGalleryCG + 64 / + 56 / + 60 (sub_AEC8 on a pick): the group picked in the group grid and that grid's
     /// scroll, and the variations grid's scroll when a picture was opened from it
     cg_pick: (Option<usize>, f32, f32),
@@ -419,6 +447,9 @@ pub struct Ui {
     logo_a: f32,
     logo_rising: bool,
     press_t: f32,
+    /// the title menu's lumi glow alpha and step (qword_1536168): from (0, 1/120) at sub_8D2E0, sub_8D5D0
+    /// bounces it between 0 and 1 while the menu (not PRESS ANY BUTTON) shows
+    lumi: (f32, f32),
     logo_fx: LogoFx,
     menu_bg: MenuBg,
     /// black screen overlay (0..1.2) with its per-frame speed, and what to do once it is fully black
@@ -499,6 +530,15 @@ pub struct Ui {
     /// the save list's stick accumulator (sub_50FC0 dword_F1F478)
     stick_acc: i32,
     gal_guide: GalGuide,
+    /// the gallery's button cursor as last drawn (None while the content has the focus) and the title_clock when
+    /// sub_82FC last restarted its line (unk_3372D8: scale x 0 -> 1 over 12 frames) and sub_57D0 its light
+    gal_cur: Option<usize>,
+    gal_line: f32,
+    gal_light: f32,
+    /// the music panel's press flash (sprite + 136, sub_1E98C: stop / prev / next) and the title_clock it started;
+    /// the title_clock the volume slider took the focus (sub_1EC0C: knob frame 88,8 and its glow + 208 flashing)
+    music_flash: (Option<u8>, f32),
+    music_vol_t: Option<f32>,
     /// stick frames the mouse wheel / trackpad still holds the left stick for (+ up)
     wheel: f32,
     /// wheel frames toward the next flowchart stick press
@@ -529,6 +569,12 @@ pub struct Ui {
     /// system menu tab under the cursor (HIDWORD(qword_B359EC)): kept across menu invocations and title
     /// visits (set to 0 once at boot, sub_4CA50); the line / dot cursor marks it
     sys_tab: usize,
+    /// sub_4C370's cursor under that tab: the line's x scale (qword_B35A04, +0.1 a frame up to 1, drawn from
+    /// its centre), its alpha (HIDWORD qword_B35A04, +-0.1 a frame) and the light's alpha and step
+    /// (dword_B35A0C / dword_5912F0); all go to 0 (step 1/60) when the menu opens and on every cursor move
+    sys_cur: (f32, f32, f32, f32),
+    /// the tab the cursor was last drawn on, to see its moves
+    sys_cur_tab: usize,
     /// the UI focus object (qword_19150EC, sub_AE0E0) is that tab: the tab is drawn highlighted with its
     /// help balloon. sub_4CEA0 sets it when the cursor moves or is tapped and a return from a submenu
     /// restores it (states 9 / 12 / 16); every other screen (the title, a choice, a submenu's page) takes
@@ -577,6 +623,19 @@ pub(crate) fn shared_font_atlas(r: &Renderer, fonts: Vec<Vec<u8>>) -> Option<Fon
         atlas.add_fallback(d).unwrap_or_else(|e| tracing::warn!("system font fallback: {e:#}"));
     }
     Some(atlas)
+}
+
+/// Additive copies (blend 30) of `out[range]` at `a` times their alpha: sub_AEEC0's focus pulse and flash.
+fn add_copy(out: &mut Vec<Quad>, range: std::ops::Range<usize>, a: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    for k in range {
+        let mut d = out[k].clone();
+        d.color[3] *= a;
+        d.blend = Blend::Add;
+        out.push(d);
+    }
 }
 
 fn rect_hit(r: [f32; 4], p: (f32, f32)) -> bool {
@@ -940,8 +999,8 @@ enum CgFx {
     Switch(usize, usize, f32, [f32; 2], bool),
 }
 
-/// CG viewer transitions last 0.5 s
-/// cGalleryGuide of the gallery: the index shown, the fade (`dir` -1 out / +1 in, `t` 0..1) and the next index.
+/// cGalleryGuide of the gallery: the index shown, the fade (`dir` -1 out / +1 in, `t` 0..1; -2 hidden) and the
+/// next index.
 #[derive(Clone, Copy)]
 struct GalGuide {
     idx: usize,
@@ -951,17 +1010,29 @@ struct GalGuide {
 }
 
 impl GalGuide {
-    fn shown(idx: usize) -> Self {
-        GalGuide { idx, dir: 0, t: 0.0, next: idx }
+    /// sub_5920 makes it at alpha 0: the gallery's opening (sub_6934) fades it in
+    fn hidden() -> Self {
+        GalGuide { idx: 10, dir: -2, t: 0.0, next: 10 }
     }
 
     fn alpha(&self) -> f32 {
         match self.dir {
+            -2 => 0.0,
             -1 => (1.0 - self.t) * (1.0 - self.t),
             1 => self.t * self.t,
             _ => 1.0,
         }
     }
+}
+
+/// cGalleryCursor (sub_5728(light, 0.4, 1.0), sub_57D0 / sub_585C): the button light's alpha, `t` seconds after
+/// sub_57D0 restarted it: 1.0 -> 0.4 -> 1.0 ... in 1.2 s legs, quad in-out (sub_26720 type 2 mode 2)
+fn gal_light_alpha(t: f32) -> f32 {
+    let leg = (t / 1.2).max(0.0);
+    let x = leg.fract() * 2.0;
+    let e = if x < 1.0 { 0.5 * x * x } else { 1.0 - 0.5 * (2.0 - x) * (2.0 - x) };
+    let (from, to) = if leg as u32 % 2 == 0 { (1.0, 0.4) } else { (0.4, 1.0) };
+    from + (to - from) * e
 }
 
 /// the mouse wheel / trackpad: the left stick tilt and frames per notch
@@ -1028,6 +1099,10 @@ impl Ui {
             delete_wait: None,
             save_cool: 0,
             save_flash: 0.0,
+            obj_focus: None,
+            obj_flash: 0.0,
+            obj_press: None,
+            obj_pulse: (0.0, 0.005),
             save_seen: None,
             save_notes: None,
             save_pending: None,
@@ -1053,6 +1128,8 @@ impl Ui {
             cg_fx: CgFx::None,
             cg_t: 0.0,
             cg_guide: (0, 0.0),
+            cg_cap_guide: 0.0,
+            cg_rt: None,
             rstick: 0,
             under: false,
             last_track: None,
@@ -1063,6 +1140,7 @@ impl Ui {
             cg_sub: None,
             cg_old: None,
             cg_in: CG_FX_SECS,
+            cg_row0: 0,
             cg_pick: (None, 0.0, 0.0),
             conf_tab: 0,
             conf_scroll: 0.0,
@@ -1092,6 +1170,7 @@ impl Ui {
             logo_a: 0.0,
             logo_rising: true,
             press_t: 0.0,
+            lumi: (0.0, 1.0 / 120.0),
             logo_fx: LogoFx::new(),
             menu_bg: MenuBg::new(),
             black: 0.0,
@@ -1135,7 +1214,12 @@ impl Ui {
             stick_tick: 0.0,
             stick_acc: 0,
             wheel: 0.0,
-            gal_guide: GalGuide::shown(10),
+            gal_guide: GalGuide::hidden(),
+            gal_cur: None,
+            gal_line: 0.0,
+            gal_light: 0.0,
+            music_flash: (None, 0.0),
+            music_vol_t: None,
             wheel_press: 0.0,
             wheel_steps: 0.0,
             conf_sb_a: 0.0,
@@ -1148,6 +1232,8 @@ impl Ui {
             help_item: None,
             key_focus: false,
             sys_tab: 0,
+            sys_cur: (0.0, 0.0, 0.0, 1.0 / 60.0),
+            sys_cur_tab: 0,
             sys_focus: false,
             conf_cur: [Some((0, 0)), Some((0, 0)), None],
             title_cur: None,
@@ -1357,6 +1443,7 @@ impl Ui {
         }
         let max = self.gal_scroll_max();
         self.gal_scroll.to(k as f32 * 139.0, max, false);
+        self.cg_row0 = ((self.gal_scroll.pos + 0.001) / 139.0) as usize;
         self.gal_mem = Some(Action::Cg(cur));
         if !self.gal_side {
             self.hover_action(game, Action::Cg(cur));
@@ -1420,10 +1507,11 @@ impl Ui {
         self.gal_track = false;
         self.music_bg_off = 0.0;
         self.gal_mem = None;
-        // cGalleryCG starts on the group grid (sub_8818)
+        // cGalleryCG starts on the group grid (sub_8818), its cells coming in from the top (sub_9970 -> sub_B318)
         self.cg_sub = None;
         self.cg_old = None;
-        self.cg_in = CG_FX_SECS;
+        self.cg_in = 0.0;
+        self.cg_row0 = 0;
         self.cg_pick = (None, 0.0, 0.0);
         self.music_btn = 0;
         self.music_row = 0;
@@ -1453,10 +1541,15 @@ impl Ui {
         }
     }
 
-    /// Scroll range of the CG grid (sub_AF78: (rows - 6) * 139 - 69.5) or the music list (4720).
+    /// Scroll range of a CG grid (sub_AF78: (rows - 6) * 139 - 69.5).
+    fn cg_range(&self, sub: Option<usize>) -> f32 {
+        (self.cg_grid(sub).len().div_ceil(CG_COLS) as f32 - 6.0) * 139.0 - 69.5
+    }
+
+    /// Scroll range of the CG grid or the music list (4720).
     fn gal_scroll_max(&self) -> f32 {
         match self.screen {
-            Screen::Gallery => (self.cg_list().len().div_ceil(CG_COLS) as f32 - 6.0) * 139.0 - 69.5,
+            Screen::Gallery => self.cg_range(self.cg_sub),
             Screen::Music => MUSIC_SCROLL_MAX,
             _ => 0.0,
         }
@@ -2056,6 +2149,9 @@ impl Ui {
         self.gal_a = 1.0;
         if s == Screen::Menu {
             self.menu_a = 1.0;
+            // sub_4CBA0 on opening: the cursor line and light start over
+            self.sys_cur = (0.0, 0.0, 0.0, 1.0 / 60.0);
+            self.sys_cur_tab = self.sys_tab;
         }
         self.gal_next = None;
         if let Screen::Confirm(c) = s {
@@ -2303,6 +2399,7 @@ impl Ui {
         self.intro = None;
         self.press = self.boot_flag;
         self.press_t = 0.0;
+        self.lumi = (0.0, 1.0 / 120.0);
         self.logo_a = 0.0;
         self.logo_rising = true;
         self.title_movie = false;
@@ -2485,13 +2582,15 @@ impl Ui {
     }
 
     /// Per-screen content fade speeds (per frame): (in, out). Save/load: sub_50FC0 states 1 / 27 (0.024, 0.048);
-    /// config: sub_2B770 / sub_2C500 (0.024 both ways); system menu: sub_4CBA0 / sub_4D8C0 state 4 (1/18, 1/30); gallery: sub_47A90 (0.04).
+    /// config: sub_2B770 / sub_2C500 (0.024 both ways); system menu: sub_4CBA0 / sub_4D8C0 state 4 (1/18, 1/30);
+    /// gallery: cGallery's frame and the mode's content, 0.5 s quad in / out (sub_6934 / sub_7AC4 and each content's
+    /// own, e.g. sub_8BA0 / sub_90E0), drawn at the square of this linear alpha (`gal_hub_a`).
     fn fade_speeds(s: Screen) -> (f32, f32) {
         match s {
             Screen::SaveLoad { .. } => (0.024, 0.048),
             Screen::Config => (0.024, 0.024),
             Screen::Menu => (1.0 / 18.0, 1.0 / 30.0),
-            Screen::Gallery | Screen::Music | Screen::Movies | Screen::Endings => (0.04, 0.04),
+            Screen::Gallery | Screen::Music | Screen::Movies | Screen::Endings => (1.0 / 30.0, 1.0 / 30.0),
             // backlog: sub_28F80 states 4 and 8 (and the quick jump, sub_28D50)
             Screen::Backlog { .. } => (0.05, 0.05),
             // cFlowchart states 0 / 5 (sub_110D4, sub_11BEC) and its panel (sub_1697C): 0.5 s, quad in / out
@@ -2557,8 +2656,16 @@ impl Ui {
         if matches!(from, Screen::Flowchart { gallery: true }) && Self::is_gallery_mode(self.screen) && self.screen != Screen::Music {
             game.play_title_bgm();
         }
-        // after the chart the gallery's content goes on fading in (it started with the chart's fade-out,
-        // sub_7624 -> sub_82FC); the system menu fades in from 0 (state 16)
+        // after the chart the gallery's content is made again and fades in (sub_7624 -> sub_7F38; a CG grid's
+        // cells staggered from its first row on screen); the system menu fades in from 0 (state 16)
+        if matches!(from, Screen::Flowchart { gallery: true }) && self.screen == Screen::Gallery {
+            self.cg_in = 0.0;
+            self.cg_row0 = ((self.gal_scroll.pos + 0.001) / 139.0) as usize;
+        }
+        // cGallery state 1 again, with no fade left (sub_6BBC): the button light restarts (sub_57D0)
+        if matches!(from, Screen::Flowchart { gallery: true }) && Self::is_gallery_mode(self.screen) {
+            self.gal_light = self.title_clock;
+        }
         match self.screen {
             Screen::Title if Self::is_gallery_mode(from) => {
                 // cGallery state 1: [0] = the mode it closes with (sub_82E4), the first mode of the next open
@@ -2948,14 +3055,31 @@ impl Ui {
             game.play_sys_sound(0);
             self.cg_fx = CgFx::Switch(group, pos, self.cg_zoom, self.cg_pan, d > 0);
             self.cg_t = 0.0;
+            self.cg_cap_guide = self.cg_guide_a();
             self.screen = Screen::CgView { group: g2, pos: p2 };
             let size = |e: Option<crate::gallery::Entry>| e.map(|e| (e.width, e.height));
             if size(self.cg_entry(group, pos)) != size(self.cg_entry(g2, p2)) {
                 self.cg_zoom = 0.0;
                 self.cg_pan = [0.0; 2];
             }
-            self.cg_guide_show();
         }
+    }
+
+    /// Frames a viewer transition waits before its tween runs: a picture change spends sub_CA54's substates 0..7
+    /// capturing the screen, making sprite 176 and loading the next picture (the old view holds meanwhile), and
+    /// the tween's first step comes in the update after (sub_CD58, which also shows the guide); closing makes
+    /// sprite 176 first (sub_CE60 substate 0).
+    fn cg_hold(&self) -> f32 {
+        match self.cg_fx {
+            CgFx::Switch(..) => 8.0 / 60.0,
+            CgFx::Close => 1.0 / 60.0,
+            _ => 0.0,
+        }
+    }
+
+    /// The viewer transition's tween position 0..1.
+    fn cg_u(&self) -> f32 {
+        ((self.cg_t - self.cg_hold()) / CG_FX_SECS).clamp(0.0, 1.0)
     }
 
     /// cGalleryGuide sub_604C(-1, 0.5, 2.0): fade in over 0.5 s (quad in) unless already shown, then stay 2 s
@@ -2984,25 +3108,37 @@ impl Ui {
         if !matches!(self.screen, Screen::CgView { .. }) {
             return;
         }
+        if self.cg_fx != CgFx::None {
+            let hold = self.cg_hold();
+            let before = self.cg_t;
+            self.cg_t += secs;
+            if before < hold && self.cg_t >= hold {
+                match self.cg_fx {
+                    // sub_CD58 substate 0: sub_604C(guide, -1, 0.5, 2.0)
+                    CgFx::Switch(..) => self.cg_guide_show(),
+                    // sub_CE60 substate 1: sub_5EA4(guide, 0.5)
+                    CgFx::Close if matches!(self.cg_guide.0, 1 | 2) => self.cg_guide = (3, 0.0),
+                    _ => {}
+                }
+            }
+            if self.cg_t >= hold + CG_FX_SECS {
+                if self.cg_fx == CgFx::Close
+                    && let Screen::CgView { group, pos } = self.screen
+                {
+                    self.cg_fx = CgFx::None;
+                    self.pop();
+                    self.cg_viewed(game, group, pos);
+                    return;
+                }
+                self.cg_fx = CgFx::None;
+            }
+        }
         self.cg_guide.1 += secs;
         match self.cg_guide {
             (1, t) if t >= CG_FX_SECS => self.cg_guide = (2, 0.0),
             (2, t) if t >= 2.0 => self.cg_guide = (3, 0.0),
             (3, t) if t >= CG_FX_SECS => self.cg_guide = (0, 0.0),
             _ => {}
-        }
-        if self.cg_fx == CgFx::None {
-            return;
-        }
-        self.cg_t += secs;
-        if self.cg_t >= CG_FX_SECS {
-            if self.cg_fx == CgFx::Close
-                && let Screen::CgView { group, pos } = self.screen
-            {
-                self.pop();
-                self.cg_viewed(game, group, pos);
-            }
-            self.cg_fx = CgFx::None;
         }
     }
 
@@ -3011,19 +3147,24 @@ impl Ui {
     /// (variations grid with the cursor on the picture, or the group grid on the group); another group with
     /// several unlocked pictures opens its variations grid on the picture, any other the group grid on it.
     fn cg_viewed(&mut self, game: &Game, group: usize, pos: usize) {
-        let (picked, main_scroll, sub_scroll) = self.cg_pick;
-        let sub = if picked == Some(group) {
-            self.cg_sub.is_some()
-        } else {
-            self.cg_unlocked.get(group).is_some_and(|v| v.len() > 1)
-        };
-        if sub {
+        let (_, main_scroll, sub_scroll) = self.cg_pick;
+        if self.cg_viewed_sub(group).is_some() {
             self.cg_show(game, Some(group), pos, sub_scroll, false);
         } else {
             self.cg_show(game, None, group, main_scroll, false);
         }
         self.cg_pick.0 = Some(group);
         self.cg_in = CG_FX_SECS;
+    }
+
+    /// The grid closing the viewer on `group` returns to (`cg_viewed`): its variations grid or the group grid.
+    fn cg_viewed_sub(&self, group: usize) -> Option<usize> {
+        let sub = if self.cg_pick.0 == Some(group) {
+            self.cg_sub.is_some()
+        } else {
+            self.cg_unlocked.get(group).is_some_and(|v| v.len() > 1)
+        };
+        sub.then_some(group)
     }
 
     /// B, a guide tap or a strong vertical flick in the viewer (sub_C56C -> state 5, sub_CE60): sound 2, the
@@ -3035,9 +3176,6 @@ impl Ui {
         game.play_sys_sound(2);
         self.cg_fx = CgFx::Close;
         self.cg_t = 0.0;
-        if matches!(self.cg_guide.0, 1 | 2) {
-            self.cg_guide = (3, 0.0);
-        }
     }
 
     /// CG viewer geometry (sub_BE84 / sub_D270) of a `w` x `h` picture at `zoom` (0 = the minimum) moved `pan`
@@ -3721,19 +3859,16 @@ impl Ui {
                     self.sprite(q, "btn_test", [x, y, 104.0, 56.0], Some([32.0 + col * 120.0, 32.0, 104.0, 56.0]));
                 }
             }
-            // sub_2B010 flags every config object 0x880: the focused one gets an additive copy pulsing 0..1 at
-            // 0.02 / frame (sub_AEEC0, dword_1915114). The focus is the cursor, or the open tab's button
-            // before anything else was picked.
+            // sub_2B010 flags every config object 0x880: the focused one gets an additive copy at the focus
+            // pulse (`obj_pulse`: 0.02 / frame over the title on the first two tabs). The focus is the cursor,
+            // or the open tab's button before anything else was picked.
             let focused = hovered(i) || (self.hover.is_none() && !self.side && c == Ctl::Tab(self.conf_tab));
+            let q1 = q.len();
             if focused {
-                let pulse = 1.0 - ((self.title_clock * 1.2) % 2.0 - 1.0).abs();
-                for k in q0..q.len() {
-                    let mut d = q[k].clone();
-                    d.color[3] *= pulse;
-                    d.blend = Blend::Add;
-                    q.push(d);
-                }
+                add_copy(q, q0..q1, self.obj_pulse.0);
             }
+            // flag 0x20 (unk_46B370: 0x420): the focus flash over it
+            add_copy(q, q0..q1, self.obj_flash(Obj::Conf(i)));
         }
         let [vx, vy, vw, vh] = CONF_VIEW;
         let clip = [[vx, vy], [vx + vw, vy], [vx + vw, vy + vh], [vx, vy + vh]];
@@ -4588,6 +4723,14 @@ impl Ui {
         self.wheel = (self.wheel + lines * WHEEL_FRAMES).clamp(-8.0 * WHEEL_FRAMES, 8.0 * WHEEL_FRAMES);
     }
 
+    /// cGallery state 1 (sub_6BBC) takes no input while it fades in; a mode's content takes none until its own
+    /// fade-in has ended (the CG grid: sub_9BDC, also each cell's), while the buttons may already move.
+    fn gal_opening(&self) -> bool {
+        Self::is_gallery_mode(self.screen)
+            && !self.closing
+            && (self.scr_a < 1.0 || (!self.gal_side && (self.gal_a < 1.0 || (self.screen == Screen::Gallery && self.cg_in < self.cg_in_len()))))
+    }
+
     /// Input is held while a screen fades out, the save list or the config fades in, the screen goes black for a
     /// transition, the gallery crossfades between modes, or the title fades in from black (sub_8E200 takes input
     /// only from state 17, after state 2's fade).
@@ -4596,7 +4739,7 @@ impl Ui {
             || self.page_opening()
             || self.dlg_holding()
             || (self.screen == Screen::Title && self.black_speed < 0.0)
-            || (self.screen == Screen::Gallery && self.cg_in < CG_FX_SECS)
+            || self.gal_opening()
             || self.cg_fx != CgFx::None
             || self.black_then.is_some()
             || self.gal_next.is_some()
@@ -4679,6 +4822,24 @@ impl Ui {
     }
 
     fn act(&mut self, game: &mut Game, r: &Renderer, a: Action) {
+        // sub_AE040(.., 10): the object A or a tap takes shows its pressed frame for 10 frames: a title entry
+        // (sub_8E200, not the Extra slot 5), a system menu tab (sub_4CEA0) or a dialog button (sub_49F00, not on B)
+        if !crate::assets::witch() {
+            let o = match self.screen {
+                Screen::Title if a != Action::OpenExtra => self.title_entries().iter().position(|e| e.0 == a).map(Obj::Title),
+                Screen::Menu => {
+                    let tabs = [Action::OpenSave, Action::OpenLoad, Action::OpenConfig, Action::OpenFlow, Action::ToTitle];
+                    tabs.iter().position(|&x| x == a).map(Obj::Tab)
+                }
+                Screen::Confirm(_) if matches!(a, Action::Yes | Action::No) => {
+                    self.items(game).iter().position(|&(_, x)| x == a).map(Obj::Dialog)
+                }
+                _ => None,
+            };
+            if let Some(o) = o {
+                self.obj_press(o);
+            }
+        }
         match a {
             Action::NewGame => {
                 // title case 1 -> state 20: system sound 6, BGM out over 1.5 s; with node 485 read the screen
@@ -4917,6 +5078,9 @@ impl Ui {
                 }
             }
             Action::MusicCtl(k) => {
+                // sub_1E98C: stop, prev and next flash their lit frame (sprite + 136 at vertex alpha 1, property 8
+                // to 0 over 1/6 s, quad in); play, pause and repeat hide it (they keep a lit frame of their own)
+                self.music_flash = (matches!(k, 2 | 4 | 5).then_some(k), self.title_clock);
                 let n = crate::gallery_table::MUSIC.len();
                 // the search stops short of the track it started from (no replay of a lone unlocked track)
                 let step = |from: usize, d: i32| {
@@ -5860,6 +6024,8 @@ impl Ui {
                 self.save_cool = self.save_cool.saturating_sub(1);
             }
             self.save_flash = (self.save_flash - 0.2).max(0.0);
+            self.sys_cur_frame();
+            self.obj_frame(game);
             if let Screen::SaveLoad { save, scroll } = self.screen {
                 let cur = (save, self.hover, scroll);
                 if !self.side && self.save_seen.is_some_and(|(s, h, sc)| s == save && (h, sc) != (cur.1, cur.2)) {
@@ -5890,9 +6056,10 @@ impl Ui {
             self.gal_track = false;
         }
         self.gal_guide_tick(game, secs);
+        self.gal_cursor_tick(game);
         self.cg_update(game, secs);
-        if self.cg_in < CG_FX_SECS {
-            self.cg_in = (self.cg_in + secs).min(CG_FX_SECS);
+        if self.cg_in < CG_FX_SECS + 1.0 {
+            self.cg_in += secs;
             if self.cg_in >= CG_FX_SECS {
                 self.cg_old = None;
             }
@@ -6065,6 +6232,14 @@ impl Ui {
             self.logo_rising = !self.menu_bg.visible();
             self.logo_a = (self.logo_a + if self.logo_rising { f / 120.0 } else { -f / 60.0 }).clamp(0.0, 1.0);
             self.press_t += f;
+            if !self.press {
+                let (v, step) = &mut self.lumi;
+                *v += *step * f;
+                if *v > 1.0 || *v < 0.0 {
+                    *v = v.clamp(0.0, 1.0);
+                    *step = -*step;
+                }
+            }
         }
         if self.black_speed != 0.0 {
             self.black = (self.black + self.black_speed * f).clamp(0.0, 1.2);
@@ -6090,7 +6265,12 @@ impl Ui {
                 }
             }
         } else {
+            let was = self.scr_a;
             self.scr_a = (self.scr_a + fin * f).min(1.0);
+            // the gallery's fade-in ending (sub_6BBC) restarts the button light (sub_57D0)
+            if was < 1.0 && self.scr_a >= 1.0 && Self::is_gallery_mode(self.screen) {
+                self.gal_light = self.title_clock;
+            }
         }
         if let Some(next) = self.gal_next {
             self.gal_a -= secs * 2.0;
@@ -6105,8 +6285,9 @@ impl Ui {
                 self.screen = next;
                 self.gal_mode_shown(game);
             }
-        } else if matches!(self.screen, Screen::Flowchart { gallery: true }) && !self.closing {
-            // the content fading out under the chart; it comes back as the chart fades out (sub_7624, sub_82FC)
+        } else if matches!(self.screen, Screen::Flowchart { gallery: true }) {
+            // the content fading out under the chart; it is made again once the chart has faded out (sub_7624:
+            // the chart's vt + 56 -> sub_7F38) and fades in from there
             self.gal_a = (self.gal_a - secs * 2.0).max(0.0);
         } else {
             self.gal_a = (self.gal_a + secs * 2.0).min(1.0);
@@ -6308,7 +6489,7 @@ impl Ui {
     /// The system menu (sub_4C370) drawn under the save/load and config screens when they were opened
     /// from it. `open`: the button of the open submenu (selected column); `cursor`: the tab under the cursor
     /// (hover column, with the cursor light and line).
-    fn draw_menu_base(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, open: Option<usize>, cursor: Option<usize>, focus: Option<usize>) {
+    fn draw_menu_base(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, open: Option<usize>, focus: Option<usize>) {
         self.sprite(out, "system_titlebg", [0.0, 0.0, W, 392.0], None);
         self.sprite(out, "system_scenebg", [752.0, 0.0, 1168.0, 80.0], None);
         self.sprite(out, "underline", [0.0, 72.0, W, 16.0], None);
@@ -6350,20 +6531,28 @@ impl Ui {
                 self.sprite_c(out, "menu_btn_ja", rc, Some(src), 143.0 / 255.0, Blend::Alpha);
                 continue;
             }
-            let col = if open == Some(i) {
+            // objects 197..201 (unk_591438): flag 2 (the open page) shows Save / Load / Config selected but
+            // FlowChart / Title normal; pressed (sub_AE040 as a tab opens) all selected; flag 0x20's flash
+            let o = Obj::Tab(i);
+            let col = if self.obj_pressed(o) || (open == Some(i) && i < 3) {
                 2.0
             } else if focus == Some(i) {
                 1.0
             } else {
                 0.0
             };
+            let n = out.len();
             self.sprite(out, "menu_btn_ja", rc, Some([24.0 + col * 240.0, 24.0 + i as f32 * 104.0, 224.0, 88.0]));
+            add_copy(out, n..out.len(), self.obj_flash(o));
         }
-        if let Some(i) = cursor {
-            let blink = 0.5 + 0.5 * (self.title_clock * 3.0).sin().abs();
-            self.sprite_c(out, "systemcursor_light", [0.0, 32.0 + i as f32 * 75.0, 528.0, 240.0], None, blink, Blend::Add);
-            self.sprite_c(out, "systemcursor_line", [86.0, 136.0 + i as f32 * 75.0, 224.0, 56.0], None, 1.0, Blend::Add);
+        // sub_4C370 (blend 30, additive): the line (flags 17, centred on x 66) at its x scale, then the light
+        let (sx, la, light, _) = self.sys_cur;
+        let i = self.sys_tab as f32;
+        if sx > 0.0 {
+            let w = 224.0 * sx;
+            self.sprite_c(out, "systemcursor_line", [198.0 - w / 2.0, 136.0 + i * 75.0, w, 56.0], Some([0.0, 0.0, 224.0, 56.0]), la, Blend::Add);
         }
+        self.sprite_c(out, "systemcursor_light", [0.0, 32.0 + i * 75.0, 528.0, 240.0], None, light, Blend::Add);
     }
 
     /// Draws `digits` (0-9 plus one separator glyph at index 10) from a 24x32-cell number atlas
@@ -6400,13 +6589,25 @@ impl Ui {
     /// the mode's title banner.
     /// Over black (the title faded out before cGallery opened) and the submenu backdrop. Returns where the
     /// mode's own sprites start (they crossfade when the mode changes).
+    /// cGallery's frame and buttons (a1 + 64): 0.5 s quad in as it opens (sub_6934), quad out as it closes (sub_7AC4)
+    fn gal_hub_a(&self) -> f32 {
+        self.scr_a * self.scr_a
+    }
+
+    /// The mode's content: its own 0.5 s quad in / out as the gallery opens or closes, and as a mode switch fades
+    /// the old one out and the new one in (sub_8400 / sub_7328 -> content vt + 48, its fade-in on creation)
+    fn gal_content_a(&self) -> f32 {
+        let a = self.scr_a * self.gal_a;
+        a * a
+    }
+
     fn draw_hub_bg(&self, out: &mut Vec<Quad>, white: &TexRef, banner: Option<&str>) -> usize {
         out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 1.0]));
         self.draw_menu_layer(out);
         let n = out.len();
         self.spr(out, "config_innerbg", 365.0, 0.0, None);
         self.spr(out, "underline", 0.0, 72.0, None);
-        self.fade_quads(out, n, self.scr_a);
+        self.fade_quads(out, n, self.gal_hub_a());
         let n0 = out.len();
         if let Some(b) = banner {
             self.spr(out, b, 64.0, 0.0, None);
@@ -6416,7 +6617,8 @@ impl Ui {
 
     /// One CG grid (cGalleryCGMain / cGalleryCGSub, sub_AF78): thumbnails at 392 + 240 col, 109 + 139 row, and on
     /// entry `cur` the cursor frame with its glow at `flash`.
-    fn draw_cg_grid(&self, out: &mut Vec<Quad>, sub: Option<usize>, scroll: f32, cur: Option<usize>, flash: Option<f32>) {
+    /// The thumbnails at `cell_a(k)`, the cursor at `cur_a`.
+    fn draw_cg_grid(&self, out: &mut Vec<Quad>, sub: Option<usize>, scroll: f32, cur: Option<usize>, flash: Option<f32>, cell_a: &dyn Fn(usize) -> f32, cur_a: f32) {
         for (k, id) in self.cg_grid(sub).into_iter().enumerate() {
             let rc = Self::cg_cell(k, scroll);
             if rc[1] + rc[3] < GAL_CLIP[0] || rc[1] > GAL_CLIP[1] {
@@ -6427,18 +6629,36 @@ impl Ui {
                 use crate::gallery::{THUMB_COLS, THUMB_H, THUMB_W};
                 let t = e.thumb as u32;
                 let src = [(t % THUMB_COLS) as f32 * THUMB_W, (t / THUMB_COLS) as f32 * THUMB_H, THUMB_W, THUMB_H - 1.0];
-                self.sprite(out, "cg_thumb_all", rc, Some(src));
+                self.sprite_c(out, "cg_thumb_all", rc, Some(src), cell_a(k), Blend::Alpha);
             }
             if cur == Some(id) {
                 // cg_cursor frame (prio 250) and over it its glow (prio 210; lower draws on top) at
                 // (x - 8, y - 6), both blend mode 2 (sub_1FA44: blend state 0, default shader, plain alpha)
                 let at = [rc[0] - 8.0, rc[1] - 6.0, 248.0, 144.0];
-                self.sprite(out, "cg_cursor", at, Some([8.0, 8.0, 248.0, 144.0]));
+                self.sprite_c(out, "cg_cursor", at, Some([8.0, 8.0, 248.0, 144.0]), cur_a, Blend::Alpha);
                 if let Some(f) = flash.filter(|&f| f > 0.0) {
-                    self.sprite_c(out, "cg_cursor", at, Some([264.0, 8.0, 248.0, 144.0]), f, Blend::Alpha);
+                    self.sprite_c(out, "cg_cursor", at, Some([264.0, 8.0, 248.0, 144.0]), f * cur_a, Blend::Alpha);
                 }
             }
         }
+    }
+
+    /// sub_B318: every cell of a new grid fades in 0.5 s (quad in, sprite property 9); the 42 from the first row
+    /// on screen start (row + column) / 50 s late (unk_3373A0), so the grid comes in from its top-left corner.
+    fn cg_cell_delay(&self, k: usize) -> f32 {
+        let j = k.wrapping_sub(self.cg_row0 * CG_COLS);
+        if j < 42 { (j / CG_COLS + j % CG_COLS) as f32 / 50.0 } else { 0.0 }
+    }
+
+    fn cg_cell_a(&self, k: usize) -> f32 {
+        let u = ((self.cg_in - self.cg_cell_delay(k)) / CG_FX_SECS).clamp(0.0, 1.0);
+        u * u
+    }
+
+    /// sub_9BDC: the grid takes input once its fade and every cell's have ended.
+    fn cg_in_len(&self) -> f32 {
+        let n = self.cg_list().len();
+        CG_FX_SECS + (0..n).map(|k| self.cg_cell_delay(k)).fold(0.0, f32::max)
     }
 
     /// Multiply the alpha of the quads from `n` on (not while drawing the screen under a dialog).
@@ -6530,15 +6750,20 @@ impl Ui {
             let blink = 1.0 - ((self.press_t / 60.0) % 2.0 - 1.0).abs();
             self.sprite_c(out, "press_start", [724.0, 823.17, 472.0, 88.0], None, blink, Blend::Alpha);
         } else {
-            let pulse = 1.0 - ((self.title_clock * 0.5) % 2.0 - 1.0).abs();
+            let pulse = self.lumi.0;
             // texture 321 at unk_231560[language] (960x544 units; English y 196.948)
             let ly = if game.assets.language() == 1 { 196.94815 } else { 278.04443 } * H / 544.0;
             self.sprite_c(out, "titlemenu_lumi", [720.0, ly, 488.0, 256.0], None, hi * pulse, Blend::Add);
             let entries = self.title_entries();
             for (i, &(_, tex, normal)) in entries.iter().enumerate() {
                 let rc = Self::title_slot(i, entries.len());
-                let src = Self::title_src(normal, usize::from(self.hover == Some(i)));
+                // objects 232.. (unk_65CBD8): states normal / hover / pressed (sub_AE040 on A), flag 0x20's flash
+                let o = Obj::Title(i);
+                let st = if self.obj_pressed(o) { 2 } else { usize::from(self.hover == Some(i)) };
+                let src = Self::title_src(normal, st);
+                let n = out.len();
                 self.sprite_c(out, tex, [rc[0], rc[1], src[2], src[3]], Some(src), hi, Blend::Alpha);
+                add_copy(out, n..out.len(), self.obj_flash(o));
             }
         }
         self.sprite(out, "titlemenu_(c)type-moon", [872.0, 1008.0, 184.0, 64.0], None);
@@ -6554,13 +6779,11 @@ impl Ui {
     /// on the active mode.
     /// `n0`: where the mode's sprites start; they fade with the screen and the mode crossfade.
     fn draw_hub_menu(&self, out: &mut Vec<Quad>, items: &[([f32; 4], Action)], hover: Option<usize>, mode: Option<usize>, n0: usize) {
-        self.fade_quads(out, n0, self.scr_a * self.gal_a);
+        self.fade_quads(out, n0, self.gal_content_a());
         let n1 = out.len();
         self.spr(out, "gallerymenu_window", 56.0, 0.0, None);
         let hub = Self::hub_items();
-        let cur = hover.and_then(|h| items.get(h)).and_then(|(_, a)| hub.iter().position(|(_, b)| a == b));
-        // the focus (and with it the cursor line and light) rests on the active mode unless another is hovered
-        let cur = cur.or(mode);
+        let cur = Self::hub_cursor(items, hover, mode);
         for i in 0..hub.len() {
             let sx = if mode == Some(i) {
                 536.0
@@ -6573,12 +6796,22 @@ impl Ui {
         }
         // the line and light (cGalleryMenu + 104 / + 112) hide whenever the mode's content takes the focus (state 4:
         // sub_6E28, sub_7328, sub_6BBC) and come back with the buttons' focus (sub_82FC)
+        // (cGalleryCursor `gal_light_alpha`; the line grows from its left edge, sub_1FA4C anchor 0)
         if let Some(i) = cur.filter(|_| self.gal_side) {
-            let blink = 0.5 + 0.5 * (self.title_clock * 3.0).sin().abs();
-            self.sprite_c(out, "systemcursor_light", [0.0, 96.0 + i as f32 * 80.0, 528.0, 240.0], None, blink, Blend::Add);
-            self.sprite_c(out, "gallerycursor_line", [80.0, 192.0 + i as f32 * 80.0, 304.0, 56.0], None, 1.0, Blend::Add);
+            let light = gal_light_alpha(self.title_clock - self.gal_light);
+            self.sprite_c(out, "systemcursor_light", [0.0, 96.0 + i as f32 * 80.0, 528.0, 240.0], None, light, Blend::Add);
+            let sx = ((self.title_clock - self.gal_line) * 60.0 / 12.0).clamp(0.0, 1.0);
+            if sx > 0.0 {
+                self.sprite_c(out, "gallerycursor_line", [80.0, 192.0 + i as f32 * 80.0, 304.0 * sx, 56.0], Some([0.0, 0.0, 304.0, 56.0]), 1.0, Blend::Add);
+            }
         }
-        self.fade_quads(out, n1, self.scr_a);
+        self.fade_quads(out, n1, self.gal_hub_a());
+    }
+
+    /// The mode button the gallery's cursor is on: the hovered one, else the open mode.
+    fn hub_cursor(items: &[([f32; 4], Action)], hover: Option<usize>, mode: Option<usize>) -> Option<usize> {
+        let hub = Self::hub_items();
+        hover.and_then(|h| items.get(h)).and_then(|(_, a)| hub.iter().position(|(_, b)| a == b)).or(mode)
     }
 
     /// sub_4A8F0: navy bar (0.0039, 0.2353, 0.3961 at 50%) over y 424.36..449 of 448, then the icons and
@@ -6609,17 +6842,48 @@ impl Ui {
     fn gal_guide_tick(&mut self, game: &mut Game, secs: f32) {
         // the gallery's chart is its content too (state 5, sub_7624): the guide crossfades to the chart's index
         // and back to 10 once the chart has closed
+        // the CG viewer: opening it (sub_4DFC -> sub_82D0) fades the guide out, its close starting (sub_4B94 ->
+        // sub_7E24 -> sub_9384 -> sub_82BC) fades the grid's guide back in under it; a gallery movie likewise
+        // (sub_4F28 out, sub_4C8C back to guide 10 once the player has closed)
+        let viewer = matches!(self.screen, Screen::CgView { .. }) && self.stack.last() == Some(&Screen::Gallery);
+        let away = (viewer && self.cg_fx != CgFx::Close)
+            || (Self::is_gallery_mode(self.screen) && self.gal_movie.is_some_and(|m| m.phase < 2));
         let gal = Self::gal_mode(self.screen).is_some() || matches!(self.screen, Screen::Flowchart { gallery: true });
-        let want = if gal { self.guide_for(game, self.screen) } else { None };
+        let want = if let Screen::CgView { group, .. } = self.screen
+            && viewer
+        {
+            // the guide of the grid the close returns to (sub_9384 on the new grid)
+            Some(if self.cg_range(self.cg_viewed_sub(group)) > 0.0 { 0 } else { 10 })
+        } else if gal {
+            self.guide_for(game, self.screen)
+        } else {
+            None
+        };
         let Some(w) = want else {
-            // the guide comes with the gallery (sub_6124), shown
-            if !matches!(self.screen, Screen::CgView { .. }) {
-                self.gal_guide = GalGuide::shown(10);
+            // the guide goes with the gallery (sub_6124 makes it at alpha 0); under a dialog it holds
+            if !self.stack.iter().any(|&s| Self::is_gallery_mode(s)) {
+                self.gal_guide = GalGuide::hidden();
             }
             return;
         };
         let g = &mut self.gal_guide;
-        if g.dir < 0 {
+        if (self.closing && Self::is_gallery_mode(self.screen)) || away {
+            // sub_7AC4 / sub_82D0: sub_5EA4(guide, 0.5) fades it out (from 1) with the gallery
+            if g.dir >= 0 {
+                *g = GalGuide { idx: g.idx, dir: -1, t: 0.0, next: g.idx };
+            }
+            if g.dir == -1 {
+                g.t += secs / 0.5;
+                if g.t >= 1.0 {
+                    *g = GalGuide::hidden();
+                }
+            }
+            return;
+        }
+        if g.dir == -2 {
+            // the gallery opening (sub_6934): sub_5C4C(guide, index, 0.5) fades it in from nothing
+            *g = GalGuide { idx: w, dir: 1, t: 0.0, next: w };
+        } else if g.dir < 0 {
             g.next = w;
         } else if w != g.idx {
             g.dir = -1;
@@ -6637,6 +6901,175 @@ impl Ui {
                     g.dir = 0;
                 }
             }
+        }
+    }
+
+    /// The focused `Obj` and its object state (sub_AE840): 4 while sub_AE040's press lasts, else 3 with
+    /// flag 2 (selected / open / unavailable), else 1. Witch on the Holy Night runs its own (`witch::objs`).
+    fn obj_focused(&self, game: &Game) -> Option<(Obj, u8)> {
+        if crate::assets::witch() {
+            return None;
+        }
+        let (o, on) = match self.screen {
+            Screen::Title if !self.press => (Obj::Title(self.hover?), false),
+            Screen::Menu => (Obj::Tab(self.hover?), false),
+            // the tabs keep the focus under their page (sub_4D580 -> sub_4CEA0); the open one has flag 2
+            Screen::SaveLoad { .. } | Screen::Config if self.side && self.stack.last() == Some(&Screen::Menu) => {
+                (Obj::Tab(self.sys_tab), Some(self.sys_tab) == self.sub_tab())
+            }
+            Screen::Config => {
+                let layout = self.conf_layout();
+                let i = self.hover.or_else(|| {
+                    (!self.side).then(|| layout.iter().position(|&(c, _)| c == Ctl::Tab(self.conf_tab))).flatten()
+                })?;
+                (Obj::Conf(i), layout.get(i).is_some_and(|&(c, _)| self.conf_on(game, c)))
+            }
+            // the buttons take the focus once the window is open (sub_49F00 state 2)
+            Screen::Confirm(_) if self.dlg_t >= 1.0 => (Obj::Dialog(self.hover?), false),
+            Screen::Game if self.touch.panel_t > 0.0 && !self.dlg_holding() => {
+                let i = self.touch.panel_hover.or(self.touch.panel_key)?;
+                (Obj::Panel(i), self.touch.pflags[i])
+            }
+            _ => return None,
+        };
+        Some((o, if self.obj_pressed(o) { 4 } else if on { 3 } else { 1 }))
+    }
+
+    /// sub_AE040's press (state 4) on `o`.
+    fn obj_pressed(&self, o: Obj) -> bool {
+        match o {
+            Obj::Panel(i) => self.touch.flash[i] > 0.0,
+            _ => self.obj_press.is_some_and(|(p, n)| p == o && n > 0),
+        }
+    }
+
+    /// sub_AE040(o, 10): the object shows its pressed frame for 10 frames (only while it takes input without
+    /// flag 2).
+    fn obj_press(&mut self, o: Obj) {
+        self.obj_press = Some((o, 10));
+    }
+
+    /// The focus flash of `o` (0 unless it is the focused object).
+    fn obj_flash(&self, o: Obj) -> f32 {
+        match self.obj_focus {
+            Some((f, _)) if f == o => self.obj_flash,
+            _ => 0.0,
+        }
+    }
+
+    /// The sub_AEEC0 calls of a frame: sub_AFA40's group 0 always, then the groups drawn: the title menu
+    /// (sub_8D5D0, group 10), the system menu (sub_4C370, 1), the config (sub_2AA80: 3, and 4 / 5 on its
+    /// system / sound tabs), a dialog or popup (15) and the mode panel (sub_4DE10, 14). Switch: the config's
+    /// pulse has a 100-frame period over the title on its first two tabs and 134 frames on the third.
+    fn obj_groups(&self) -> u32 {
+        let on = |s: Screen| self.screen == s || self.stack.contains(&s);
+        1 + u32::from(on(Screen::Title) && !self.press)
+            + u32::from(on(Screen::Menu))
+            + if on(Screen::Config) { 1 + u32::from(self.conf_tab < 2) } else { 0 }
+            + u32::from(matches!(self.screen, Screen::Confirm(_)) || self.popup.is_some())
+            + u32::from(self.screen == Screen::Game && self.touch.panel_t > 0.0)
+    }
+
+    /// One frame of sub_AE840 for the `Obj`s: the press counts down, and the focus flash starts, fades or
+    /// ends with the focused object's state; the focus pulse steps once per object group drawn.
+    fn obj_frame(&mut self, game: &Game) {
+        if !crate::assets::witch() {
+            for _ in 0..self.obj_groups() {
+                let (v, step) = &mut self.obj_pulse;
+                *v += *step;
+                if *v > 1.0 || *v < 0.0 {
+                    *v = v.clamp(0.0, 1.0);
+                    *step = -*step;
+                }
+            }
+        }
+        let cur = self.obj_focused(game);
+        self.obj_flash = match (self.obj_focus, cur) {
+            (_, None) => 0.0,
+            (Some((o, s)), Some((n, t))) if o == n => {
+                if s == t { (self.obj_flash - 0.1).max(0.0) } else { 0.0 }
+            }
+            (_, Some((_, t))) => if t == 4 { 0.0 } else { 0.9 },
+        };
+        self.obj_focus = cur;
+        if let Some((_, n)) = &mut self.obj_press {
+            *n = n.saturating_sub(1);
+        }
+    }
+
+    /// One frame of sub_4C370's tab cursor while the system menu is open. The line and the light fade out
+    /// (0.1 a frame, the light's step back to 1/60) in the states 5 / 6 / 7 / 10 / 14 / 15 (a save, load or
+    /// config page opening, the flowchart) and 8 / 11 while the page has the focus (byte_B359E8 clear);
+    /// otherwise (the menu, its dialogs, the tabs focused under a page) the line fades in and the light
+    /// climbs at its step: past 1 it falls at 1/120, and back under 0.5 it climbs at 1/120. The line grows
+    /// at 0.1 a frame in every state.
+    fn sys_cur_frame(&mut self) {
+        let Some(pos) = self.stack.iter().position(|&s| s == Screen::Menu).or((self.screen == Screen::Menu).then_some(self.stack.len()))
+        else {
+            return;
+        };
+        if self.sys_tab != self.sys_cur_tab {
+            // sub_4CEA0: a cursor move starts both over
+            self.sys_cur = (0.0, 0.0, 0.0, 1.0 / 60.0);
+            self.sys_cur_tab = self.sys_tab;
+        }
+        let page = self.stack.get(pos + 1).copied().unwrap_or(self.screen);
+        let out = match page {
+            Screen::SaveLoad { .. } | Screen::Config => !(self.side && self.screen == page),
+            Screen::Flowchart { .. } => true,
+            _ => false,
+        };
+        let (sx, la, light, step) = &mut self.sys_cur;
+        *la = (*la + if out { -0.1 } else { 0.1 }).clamp(0.0, 1.0);
+        *sx = (*sx + 0.1).min(1.0);
+        if out {
+            *light -= 0.1;
+            *step = 1.0 / 60.0;
+        } else {
+            *light += *step;
+            if *light > 1.0 {
+                *light = 1.0;
+                *step = -1.0 / 120.0;
+            } else if *light < 0.5 && *step < 0.0 {
+                *light = 0.5;
+                *step = 1.0 / 120.0;
+            }
+        }
+        if *light < 0.0 {
+            *light = 0.0;
+            *step = 1.0 / 60.0;
+        }
+    }
+
+    /// sub_82FC restarts the button cursor's line and light whenever the cursor lands on a button: a move, the
+    /// gallery opening (sub_6934), the buttons taking the focus back (sub_74F0), the chart starting to close
+    /// (sub_7624).
+    fn gal_cursor_tick(&mut self, game: &Game) {
+        if self.screen == Screen::Music {
+            let vol = self.hover.and_then(|h| self.items(game).get(h).map(|(_, a)| *a)) == Some(Action::MusicVol);
+            if !vol {
+                self.music_vol_t = None;
+            } else if self.music_vol_t.is_none() {
+                self.music_vol_t = Some(self.title_clock);
+            }
+        }
+        if let Some(m) = Self::gal_mode(self.screen) {
+            let cur = if self.gal_side { Self::hub_cursor(&self.items(game), self.hover, Some(m)) } else { None };
+            if cur.is_some() && cur != self.gal_cur {
+                self.gal_line = self.title_clock;
+                self.gal_light = self.title_clock;
+            }
+            self.gal_cur = cur;
+        } else if matches!(self.screen, Screen::Flowchart { gallery: true }) {
+            if !self.closing {
+                self.gal_cur = None;
+            } else if self.gal_cur.is_none() {
+                self.gal_line = self.title_clock;
+                self.gal_light = self.title_clock;
+                self.gal_cur = Some(self.gal_tab);
+            }
+        } else if !self.stack.iter().any(|&s| Self::is_gallery_mode(s)) {
+            self.gal_cur = None;
         }
     }
 
@@ -6764,21 +7197,20 @@ impl Ui {
                 // sub_4C370 (640x448 units scaled to the canvas): title band, scene band, underline,
                 // phase title (F023 indexes the rect table at dword_5912E8+624), window on the left,
                 // buttons, cursor line + light, and the scene title SYSMES[F022+395] at the right
-                // the line / dot cursor shows on the remembered tab as soon as the menu opens; the tab is
-                // highlighted only while it has the focus
-                let cur = Some(self.sys_tab);
+                // the line / light cursor marks the remembered tab from the menu's opening (sys_cur); the tab
+                // is highlighted only while it has the focus
                 let focus = self.hover;
                 self.draw_menu_layer(out);
                 let n0 = out.len();
-                self.draw_menu_base(game, r, out, None, cur, focus);
+                self.draw_menu_base(game, r, out, None, focus);
                 self.fade_quads(out, n0, self.scr_a * self.menu_a);
             }
             Screen::SaveLoad { save, scroll } => {
                 if self.stack.contains(&Screen::Menu) {
                     self.draw_menu_layer(out);
-                    // the line / dot cursor only shows while the tabs have the focus
-                    let cur = self.side.then_some(self.sys_tab);
-                    self.draw_menu_base(game, r, out, Some(usize::from(!save)), cur, cur);
+                    // the tab is highlighted while the tabs have the focus, as the cursor fades in (sys_cur_frame)
+                    let focus = self.side.then_some(self.sys_tab);
+                    self.draw_menu_base(game, r, out, Some(usize::from(!save)), focus);
                 } else {
                     // opened from the title: the title (with the backdrop) stays underneath
                     self.draw_under(game, r, out);
@@ -6912,9 +7344,9 @@ impl Ui {
             Screen::Config => {
                 if self.stack.contains(&Screen::Menu) {
                     self.draw_menu_layer(out);
-                    // the line / dot cursor only shows while the tabs have the focus
-                    let cur = self.side.then_some(self.sys_tab);
-                    self.draw_menu_base(game, r, out, Some(2), cur, cur);
+                    // the tab is highlighted while the tabs have the focus, as the cursor fades in (sys_cur_frame)
+                    let focus = self.side.then_some(self.sys_tab);
+                    self.draw_menu_base(game, r, out, Some(2), focus);
                 } else {
                     self.draw_under(game, r, out);
                 }
@@ -7101,23 +7533,33 @@ impl Ui {
                     self.cg_flash = (cg, self.title_clock);
                 }
                 let flash = 1.0 - 2.0 * (self.title_clock - self.cg_flash.1) * 60.0 / 30.0;
-                // a grid change (sub_8D08): the old grid fades out (ease-out quad) as the new one fades in (ease-in
-                // quad), both over 0.5 s
-                let u = self.cg_in / CG_FX_SECS;
+                // the content's own fades (cGalleryCG + 72's title, the scroll widget) as the gallery or the mode
+                // opens and closes; a grid change (sub_8D08): the old grid fades out (ease-out quad) as the new one
+                // fades in (ease-in quad), both over 0.5 s. A new grid's cells come in staggered (`cg_cell_a`; at
+                // most as far as the content's fade, which they follow out).
+                let ca = self.gal_content_a();
+                self.fade_quads(out, nb, ca);
+                let u = (self.cg_in / CG_FX_SECS).min(1.0);
                 if let Some((sub, sc, oc)) = self.cg_old {
-                    let n1 = out.len();
-                    self.draw_cg_grid(out, sub, sc, oc, None);
-                    self.fade_quads(out, n1, (1.0 - u) * (1.0 - u));
+                    let o = (1.0 - u) * (1.0 - u) * ca;
+                    self.draw_cg_grid(out, sub, sc, oc, None, &|_| o, o);
                 }
-                let n1 = out.len();
-                self.draw_cg_grid(out, self.cg_sub, scroll, cg, Some(flash));
-                self.fade_quads(out, n1, u * u);
+                self.draw_cg_grid(out, self.cg_sub, scroll, cg, Some(flash), &|k| self.cg_cell_a(k).min(ca), (u * u).min(ca));
                 let clip = [[0.0, GAL_CLIP[0]], [W, GAL_CLIP[0]], [W, GAL_CLIP[1]], [0.0, GAL_CLIP[1]]];
                 for q in &mut out[n0..] {
                     q.clip = Some(clip);
                 }
+                // each grid's scroll widget (+ 3800) at that grid's alpha (sub_A720 -> sub_27C98(a1 + 60))
+                if let Some((sub, sc, _)) = self.cg_old {
+                    let n1 = out.len();
+                    self.draw_scroll_widget(out, sc, self.cg_range(sub));
+                    self.fade_quads(out, n1, (1.0 - u) * (1.0 - u) * ca);
+                }
+                let n1 = out.len();
                 self.draw_scroll_widget(out, scroll, self.gal_scroll_max());
-                self.draw_hub_menu(out, &items, hover, Some(0), nb);
+                self.fade_quads(out, n1, (u * u).min(ca));
+                let n2 = out.len();
+                self.draw_hub_menu(out, &items, hover, Some(0), n2);
             }
             Screen::Music => {
                 let scroll = self.gal_scroll.pos.trunc();
@@ -7220,6 +7662,15 @@ impl Ui {
                     let sy = if active { 184.0 } else if hov { 96.0 } else { 8.0 };
                     self.spr(out, "music_controlbtn", x, y, Some([8.0 + 96.0 * k as f32, sy, 88.0, 80.0]));
                 }
+                // the press flash (unk_469818, priority 560, blend mode 2): the lit frame (dword_34D340) at the
+                // button (unk_34D370), 1 - t^2 over 1/6 s
+                if let (Some(k), t0) = self.music_flash {
+                    let u = (self.title_clock - t0) * 6.0;
+                    if u < 1.0 {
+                        let (x, y) = MUSIC_CTL[k as usize];
+                        self.sprite_c(out, "music_controlbtn", [x, y, 88.0, 80.0], Some([8.0 + 96.0 * k as f32, 96.0, 88.0, 80.0]), 1.0 - u * u, Blend::Alpha);
+                    }
+                }
                 // sub_1C184 / sub_1C2B0: "%2d:%02d" elapsed time and "%3d" volume
                 let len = shown.map_or(0.0, |t| (crate::gallery_table::MUSIC_LOOP[t].1 / 48) as f32 / 1000.0);
                 let el = if self.playing_track.is_some() { self.music_clock } else { 0.0 };
@@ -7231,13 +7682,19 @@ impl Ui {
                 font.draw_str_slot_rimmed(r, out, &time, NUM, 4.0, [1548.0, 503.0 + SYS_ASCENT * NUM[1]], [1.0; 4], 1);
                 let vol = format!("{:3}", (self.music_vol * 100.0) as i32);
                 font.draw_str_slot_rimmed(r, out, &vol, NUM, 4.0, [1562.0, 878.0 + SYS_ASCENT * NUM[1]], [1.0; 4], 1);
-                let blink = 0.5 + 0.5 * (self.title_clock * 3.0).sin().abs();
+                // the volume knob (+ 200) takes frame (88, 8) with the focus (sub_1EC0C, unk_34D336), and its glow
+                // (+ 208, unk_469980: frame 168,8) flashes once, 1 - t^2 over 1/6 s
+                let vol_focus = self.music_vol_t.filter(|_| cur == Some(Action::MusicVol));
                 for (y, frac) in [(424.0, if len > 0.0 { (el / len).min(1.0) } else { 0.0 }), (792.0, self.music_vol)] {
                     self.spr(out, "music_slider", 1392.0, y, None);
                     let kx = 1376.0 + frac * 364.0;
-                    self.spr(out, "music_soundbtn", kx, y - 24.0, Some([8.0, 8.0, 72.0, 72.0]));
-                    if y > 500.0 && cur == Some(Action::MusicVol) {
-                        self.sprite_c(out, "music_soundbtn", [kx, y - 24.0, 72.0, 72.0], Some([168.0, 8.0, 72.0, 72.0]), blink, Blend::Add);
+                    let sx = if y > 500.0 && vol_focus.is_some() { 88.0 } else { 8.0 };
+                    self.spr(out, "music_soundbtn", kx, y - 24.0, Some([sx, 8.0, 72.0, 72.0]));
+                    if let Some(t0) = vol_focus.filter(|_| y > 500.0) {
+                        let u = (self.title_clock - t0) * 6.0;
+                        if u < 1.0 {
+                            self.sprite_c(out, "music_soundbtn", [kx, y - 24.0, 72.0, 72.0], Some([168.0, 8.0, 72.0, 72.0]), 1.0 - u * u, Blend::Add);
+                        }
                     }
                 }
                 self.draw_hub_menu(out, &items, hover, Some(1), nb);
@@ -7310,7 +7767,7 @@ impl Ui {
                 // (sub_E2490 0x3F59999A; Switch grey 217) under
                 // the picture (priority 380), so the screen around a picture is light grey. Opening and closing
                 // crossfade with the gallery as captured (`CgFx`).
-                let u = (self.cg_t / CG_FX_SECS).min(1.0);
+                let u = self.cg_u();
                 let a = match self.cg_fx {
                     CgFx::Open => u * u,
                     CgFx::Close => (1.0 - u) * (1.0 - u),
@@ -7346,21 +7803,29 @@ impl Ui {
                     let rc = self.cg_rect(w, h);
                     out.push(Quad::rect(tex, rc, [1.0; 4]).with_uv_rect(u0, v0, u1, v1));
                 }
-                // a picture change: sprite 176 (the capture, here the old view) over the new picture at colour
-                // alpha 1 - u through the rule, a sub_9FE00 draw (progress = that alpha, the rule read inverted)
+                // a picture change: sprite 176 (the capture of the whole old screen: the grey layer, the picture
+                // and the guide) over the new picture through the rule at progress 1 - u (sub_254BC's alpha *
+                // (1 - p) only drives the wipe, a sub_9FE00 draw with the rule read inverted; the view itself
+                // stays opaque where the edge has not passed)
                 if let CgFx::Switch(og, old, zoom, pan, next) = self.cg_fx
                     && let Some((tex, w, h, [u0, v0, u1, v1])) = pic(self, game, og, old)
                 {
                     let (rc, _, _) = Self::cg_geom(w, h, zoom, pan);
-                    let c = 1.0 - u;
-                    let mut q = Quad::rect(tex, rc, [1.0, 1.0, 1.0, c]).with_uv_rect(u0, v0, u1, v1);
+                    // the capture: the grey layer, the old picture (some have transparent parts) and the guide
+                    let mut cap = vec![Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.85, 0.85, 0.85, 1.0])];
+                    cap.push(Quad::rect(tex, rc, [1.0; 4]).with_uv_rect(u0, v0, u1, v1));
+                    self.draw_guide(&mut cap, &white, 9, (1.0 - self.cg_cap_guide) * 25.0);
+                    self.fade_quads(&mut cap, 2, self.cg_cap_guide);
+                    let rt = self.cg_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "cg capture").tex).clone();
+                    game.ui_passes.push((knife_render::RenderTarget { tex: rt.clone() }, Some([0.0, 0.0, 0.0, 1.0]), cap));
+                    let mut q = Quad::rect(rt, [0.0, 0.0, W, H], [1.0; 4]);
                     q.rule = game
                         .assets
                         .rule(r, if next { "RULE_27" } else { "RULE_26" })
                         .map(|i| knife_render::RuleMask {
                             invert: true,
                             soft: game.stage.rule_soft,
-                            ..knife_render::RuleMask::new(i.tex.clone(), c)
+                            ..knife_render::RuleMask::new(i.tex.clone(), 1.0 - u)
                         });
                     out.push(q);
                 }
@@ -7396,13 +7861,23 @@ impl Ui {
                         self.draw_dialog_thumb(game, r, out);
                     }
                     for (i, (_, a)) in items.iter().enumerate() {
-                        // dialog_btn_ja frames: Yes (224,0) / glow (0,135), No (224,67) / glow (0,202), drawn at
-                        // native size from the object position
+                        // dialog_btn_ja frames (objects 0 / 1, unk_590F08): Yes (224,0) / glow (0,135), No (224,67) /
+                        // glow (0,202), pressed (sub_AE040 on A) at (224, y + 135), drawn at native size from the
+                        // object position; flag 0x20's flash over it
                         let y = if *a == Action::Yes { 0.0 } else { 67.0 };
-                        let src = if hovered(i) { [0.0, y + 135.0, 216.0, 56.0] } else { [224.0, y, 216.0, 56.0] };
+                        let o = Obj::Dialog(i);
+                        let src = if self.obj_pressed(o) {
+                            [224.0, y + 135.0, 216.0, 56.0]
+                        } else if hovered(i) {
+                            [0.0, y + 135.0, 216.0, 56.0]
+                        } else {
+                            [224.0, y, 216.0, 56.0]
+                        };
                         let by = if c.thumbnail() { 261.46 * H / 448.0 } else { 600.0 };
                         let rc = [if *a == Action::Yes { 990.0 } else { 756.0 }, by, 216.0, 56.0];
+                        let n = out.len();
                         self.sprite(out, "dialog_btn_ja", rc, Some(src));
+                        add_copy(out, n..out.len(), self.obj_flash(o));
                     }
                 }
                 // the button guide of the screen below stays on top of the dialog and its backdrop (Switch: the
@@ -7432,7 +7907,8 @@ impl Ui {
                 // still the gallery's guide, over the chart and apart from its fade
                 (self.gal_guide.idx, self.gal_guide.alpha(), true)
             } else if Self::gal_mode(screen).is_some() && screen == self.screen {
-                (self.gal_guide.idx, self.scr_a * self.gal_guide.alpha(), true)
+                // its own fades (in as the gallery opens, out as it closes), apart from the frame's
+                (self.gal_guide.idx, self.gal_guide.alpha(), true)
             } else {
                 (g, self.scr_a, false)
             };

@@ -12,7 +12,7 @@
 
 use knife_render::{Blend, CANVAS_H, CANVAS_W, Quad, Renderer, TexRef, Upload};
 
-use super::{Confirm, Screen, Ui};
+use super::{Confirm, Obj, Screen, Ui, add_copy};
 use crate::{game::Game, save};
 
 const W: f32 = CANVAS_W as f32;
@@ -187,16 +187,16 @@ pub struct Touch {
     /// mode panel (dword_B35A10), its slide (dword_B35A28), its hovered button, the button held
     /// and how long (dword_AFFCCC), and the per-button press flash (sub_AE040(.., 10))
     pub panel: Panel,
-    panel_t: f32,
+    pub(super) panel_t: f32,
     pub panel_hover: Option<usize>,
     /// the pointer moved since the last frame, pressed or not (the panel's buttons follow a hovering mouse
     /// as the other menus' items do)
     hovered: bool,
     held_frames: f32,
-    flash: [f32; 8],
+    pub(super) flash: [f32; 8],
     /// The buttons' object flag 2 (objects 207..214, sub_ADE80): previous scene / next scene / Q.SAVE /
     /// Q.LOAD unavailable, auto lit. The objects start without it (unk_5918C8: flags 0x320).
-    pflags: [bool; 8],
+    pub(super) pflags: [bool; 8],
     /// Witch on the Holy Night: the buttons' object states (jp_AE840's crossfade)
     wbtn: [super::witch::WBtn; 8],
     /// The panel's selected button (HIDWORD(qword_B35A1C)), and the last one picked by either pointer or pad,
@@ -716,38 +716,54 @@ impl Ui {
             self.witch_panel_press(game, r, b);
             return;
         }
-        self.touch.flash[b] = 10.0;
+        // sub_AE040(.., 10) only on the cases that act (LABEL_84), and not while the object has flag 2 (auto
+        // being turned off)
+        let flagged = self.touch.pflags[b];
         // sub_4E170: a button that acts plays system sound 1 (before its dialog), an unavailable one sound 2
-        match b {
+        let acted = match b {
             // previous / next scene and quick load ask first (dialogs 11, 10, 9)
             // cases 0 / 4 test the objects' flag 2 (sub_ADE60(207 / 211, 2)), 5 / 6 sub_47B10 itself
             0 if !self.touch.pflags[0] => {
                 self.snd(game, 1);
                 game.drop_capture();
                 self.confirm(game, Confirm::PrevScene);
+                true
             }
             2 => {
                 self.snd(game, 1);
                 self.toggle_auto(game);
+                true
             }
             4 if !self.touch.pflags[4] => {
                 self.snd(game, 1);
                 game.drop_capture();
                 self.confirm(game, Confirm::NextScene);
+                true
             }
             // case 5 also wants dword_AFFCC4 run out (sub_40E90)
             5 if game.can_save() && self.panel_ok(game, 5) && self.save_cool == 0 => {
                 self.snd(game, 1);
                 self.quick_save(game, r);
+                true
             }
             // case 6: sound 2 without a quick save (sub_52BF0(139) < 1)
             6 if self.panel_ok(game, 6) && self.slots.get(save::quick_slot()).is_some_and(Option::is_some) => {
                 self.snd(game, 1);
                 self.confirm(game, Confirm::QuickLoad);
+                true
             }
-            0 | 4 | 5 | 6 => self.snd(game, 2),
-            7 => game.replay_voice(),
-            _ => {}
+            0 | 4 | 5 | 6 => {
+                self.snd(game, 2);
+                false
+            }
+            7 => {
+                game.replay_voice();
+                true
+            }
+            _ => false,
+        };
+        if acted && !flagged {
+            self.touch.flash[b] = 10.0;
         }
     }
 
@@ -913,10 +929,8 @@ impl Ui {
                 Some(3) => panel_skip = true,
                 _ => self.touch.held_frames = 0.0,
             }
-            // Witch on the Holy Night: cases 1 / 3 press their object every held frame (jp_AE040(.., 10))
-            if let Some(b @ (1 | 3)) = held_button
-                && crate::assets::witch()
-            {
+            // cases 1 / 3 press their object every held frame (sub_AE040(.., 10); WoH jp_AE040)
+            if let Some(b @ (1 | 3)) = held_button {
                 self.touch.flash[b] = 10.0;
             }
         } else {
@@ -1205,20 +1219,28 @@ impl Ui {
             // no panel button shows as pointed until sub_4E170 is back in state 3
             let dialog = self.under || self.dlg_holding();
             let hover = self.touch.panel_hover.or(self.touch.panel_key).filter(|_| !dialog);
-            let pressing = (self.touch.press.is_some() && self.touch.panel_hover.is_some()) || (self.enter_held && self.touch.panel_key.is_some());
             for i in 0..8 {
-                // states (sub_ADE80 flag 2): an unavailable button dark, auto lit
-                let row = if i != 2 && self.touch.pflags[i] {
-                    0.0
-                } else if self.touch.flash[i] > 0.0 || (i == 2 && self.touch.pflags[2]) || (pressing && hover == Some(i)) {
-                    3.0
+                // object states (unk_5918C8; sub_ADE80 flag 2: an unavailable button, auto on): 4 pressed, 1 / 3
+                // focused (3 with flag 2), 2 flag 2, else 0. Flag 2 shows the disabled row, auto's the pressed
+                // one; focused with it, the disabled row with the hover row over it at alpha 0x80 (auto: hover)
+                let on = self.touch.pflags[i];
+                let rows: &[(f32, f32)] = if self.touch.flash[i] > 0.0 {
+                    &[(3.0, 1.0)]
                 } else if hover == Some(i) {
-                    2.0
+                    if on && i != 2 { &[(0.0, 1.0), (2.0, 128.0 / 255.0)] } else { &[(2.0, 1.0)] }
+                } else if on {
+                    if i == 2 { &[(3.0, 1.0)] } else { &[(0.0, 1.0)] }
                 } else {
-                    1.0
+                    &[(1.0, 1.0)]
                 };
                 let x = (PANEL_X0 + PANEL_DX * i as f32) * UX;
-                self.sprite(out, "mode_panel_btn_ja", [x, top, BTN_W, BTN_H], Some([8.0 + i as f32 * 232.0, 8.0 + row * 72.0, BTN_W, BTN_H]));
+                let n = out.len();
+                for &(row, a) in rows {
+                    let src = [8.0 + i as f32 * 232.0, 8.0 + row * 72.0, BTN_W, BTN_H];
+                    self.sprite_c(out, "mode_panel_btn_ja", [x, top, BTN_W, BTN_H], Some(src), a, Blend::Alpha);
+                }
+                // flag 0x20 (0x320): the focus flash over it
+                add_copy(out, n..out.len(), self.obj_flash(Obj::Panel(i)));
             }
         }
     }
