@@ -608,7 +608,7 @@ impl Renderer {
         })
     }
 
-    /// Render the canvas at the window's resolution (the largest 16:9 fit, never under 1080p) rather than at
+    /// Render the canvas at the window's resolution (the largest 16:9 fit, above or below 1080p) rather than at
     /// 1920x1080 as the Switch does. The canvas targets made from now on take the scale (`create_canvas_target`;
     /// `canvas_fits` tells the ones made before a change).
     pub fn set_follow_window(&mut self, on: bool) {
@@ -620,7 +620,7 @@ impl Renderer {
         self.scale = if self.follow_window {
             let fit = (self.config.width as f32 / CANVAS_W as f32).min(self.config.height as f32 / CANVAS_H as f32);
             let max = self.device.limits().max_texture_dimension_2d as f32 / CANVAS_W as f32;
-            fit.min(max).max(1.0)
+            fit.min(max)
         } else {
             1.0
         };

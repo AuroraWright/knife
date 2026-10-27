@@ -166,8 +166,8 @@ pub struct FontAtlas {
     glyphs: HashMap<(char, u32), Option<Glyph>>,
     /// the atlas's side
     side: u32,
-    /// the glyphs' raster scale over the base size: the render scale, so a canvas drawn above 1080p keeps the
-    /// glyphs as sharp as the Switch's
+    /// the glyphs' raster scale over the base size: the render scale, so a canvas drawn above or below 1080p keeps
+    /// the glyphs as sharp as the Switch's
     raster: f32,
     shelf_x: u32,
     shelf_y: u32,
@@ -411,7 +411,8 @@ impl FontAtlas {
     }
 
     /// The glyph as nn::font's cache holds it: rasterized at the base size (font manager +124, 40 px) with its
-    /// box on whole pixels, which the draw scales to the slot size; above 1080p at the render scale times that.
+    /// box on whole pixels, which the draw scales to the slot size; above or below 1080p at the render scale times
+    /// that.
     fn glyph(&mut self, r: &Renderer, c: char) -> Option<Glyph> {
         if r.scale() != self.raster {
             self.raster = r.scale();
