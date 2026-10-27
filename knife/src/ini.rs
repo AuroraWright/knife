@@ -112,7 +112,7 @@ pub fn merged_args() -> Vec<OsString> {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     let program = if args.is_empty() { "knife".into() } else { args.remove(0) };
     let mut merged = vec![program];
-    let ini = std::env::current_exe().ok().into_iter().flat_map(|exe| candidates(&exe)).find(|path| path.is_file());
+    let ini = crate::platform::executable().into_iter().flat_map(|exe| candidates(&exe)).find(|path| path.is_file());
     if let Some(path) = ini {
         let loaded = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))

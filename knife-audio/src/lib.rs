@@ -453,6 +453,14 @@ impl Audio {
         }
     }
 
+    /// Silence everything (the mixer's volume) while the app is in the background, or bring the sound back.
+    pub fn set_muted(&mut self, muted: bool) {
+        if let Some(manager) = &mut self.manager {
+            let volume = if muted { kira::Decibels::SILENCE } else { kira::Decibels::IDENTITY };
+            manager.main_track().set_volume(volume, kira::Tween::default());
+        }
+    }
+
     /// Once a frame, after the game's and the UI's update: hand the frame's changes and new sounds to the
     /// mixer together (nn::atk's update, sub_106734, flushes a frame's commands to the renderer).
     pub fn flush(&mut self) {
@@ -557,7 +565,8 @@ impl Audio {
 /// The output stream in 5 ms buffers: nn::audio's renderer runs 5 ms audio frames (240 samples at 48 kHz) and
 /// applies the commands of each game frame (nn::atk's update, `RequestUpdateAudioRenderer`) at its next one, so
 /// sounds start and stop on a 5 ms grid. kira takes new commands once a device buffer, which is 512 frames
-/// (10.7 ms) by default on macOS.
+/// (10.7 ms) by default on macOS. (Not on Android, where a phone's own buffer size is left alone: 5 ms buffers
+/// underrun there.)
 fn backend_settings() -> kira::backend::cpal::CpalBackendSettings {
     use kira::backend::cpal::cpal::{
         BufferSize, SupportedBufferSize,
@@ -568,6 +577,7 @@ fn backend_settings() -> kira::backend::cpal::CpalBackendSettings {
         let mut config = c.config();
         if let SupportedBufferSize::Range { min, max } = *c.buffer_size()
             && (min..=max).contains(&frames)
+            && !cfg!(target_os = "android")
         {
             config.buffer_size = BufferSize::Fixed(frames);
         }

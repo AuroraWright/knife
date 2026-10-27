@@ -1,6 +1,7 @@
 //! H.264 decoding with the platform decoder (after shin-video's `h264_decoder`): VideoToolbox on macOS, Media
-//! Foundation on Windows, GStreamer elsewhere. Each runs on its own thread, gets the MP4 samples in decode order
-//! and hands NV12 frames back in presentation order, converted to RGBA for the movie texture.
+//! Foundation on Windows, MediaCodec on Android, GStreamer elsewhere. Each runs on its own thread, gets the MP4
+//! samples in decode order and hands NV12 frames back in presentation order, converted to RGBA for the movie
+//! texture.
 
 use std::{path::Path, sync::mpsc};
 
@@ -12,8 +13,11 @@ use super::{
     mp4::{Mp4, presentation_times, sync_samples},
 };
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
 #[path = "gstreamer.rs"]
+mod platform;
+#[cfg(target_os = "android")]
+#[path = "mediacodec.rs"]
 mod platform;
 #[cfg(windows)]
 #[path = "media_foundation.rs"]
@@ -57,7 +61,7 @@ pub struct Packet<'a> {
     /// Annex B with start codes, parameter sets before IDR frames
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub annex_b: &'a [u8],
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
     pub decode_time: u64,
     pub presentation_time: i64,
     pub duration: u32,

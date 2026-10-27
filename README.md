@@ -57,8 +57,51 @@ cargo build --release -p knife
 ```
 
 Movies are decoded by the platform: VideoToolbox on macOS, Media Foundation on Windows (N editions need the
-Media Feature Pack) and GStreamer elsewhere (with an H.264 plugin such as gst-libav, plus the GStreamer
-development packages to build). An `ffmpeg` executable on the `PATH` is used as a fallback.
+Media Feature Pack), MediaCodec on Android and GStreamer elsewhere (with an H.264 plugin such as gst-libav, plus
+the GStreamer development packages to build). An `ffmpeg` executable on the `PATH` is used as a fallback.
+
+### Android
+
+knife runs on Android 8 or newer (arm64), with the touch screen as the Switch's. It is built from the `android`
+folder, a Gradle project that runs `cargo ndk` for the `knife-android` crate, which holds the app's entry point;
+everything else is the same program. [android.md](android.md) has the details: setup, installing, putting the game
+data on the phone, and what to do when something goes wrong.
+
+To build it you need:
+
+- the Android SDK with NDK 27 (`27.2.12479018`; Android Studio installs both),
+- JDK 17,
+- Gradle 8.9 or newer (Android Studio brings its own),
+- Rust with the Android target and `cargo-ndk`:
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+```
+
+Tell Gradle where the SDK is (Android Studio does this when it opens the folder; otherwise put
+`sdk.dir=/path/to/Android/Sdk` in `android/local.properties`), then build and install:
+
+```sh
+cd android
+gradle assembleRelease
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+The APK is `android/app/build/outputs/apk/release/app-release.apk`, signed with the debug key so that it installs
+as it is. (Or open the `android` folder in Android Studio and run it.) The engine is always built in release mode,
+also for `assembleDebug`: a debug build of it is too slow to play.
+
+The app's folder is `Android/data/dev.knife.app/files` on the phone's storage (it exists after the first start;
+from a computer, or with `adb push`, it is reachable on every Android version). It takes the place of the
+executable's folder: put the game data (see above) in `assets` there, and a `knife.ini` and `mod_assets` as
+described below. Saves are in `knife/savedata000` in the same folder (and go with the app when it is uninstalled:
+copy them, or point `save-file` in `knife.ini` somewhere else). `adb logcat -s knife` shows the log.
+
+The game renders at the Switch's 1920x1080 (`resolution = original`) and runs at 60 frames a second, whatever the
+screen's refresh rate. The Back button is B, and the buttons of a controller are the Switch's, as on the
+desktop (the d-pad and the buttons, not the sticks). Android's own edge swipes (Back, the system bars) come
+before the game's flicks from the edges of the screen.
 
 ### Options
 
@@ -68,6 +111,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | `-m`, `--mod-assets-dir DIR` | the mod folder, whose files replace the game data's (see above; used only if it exists) |
 | `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (Tsukihime's overseas release and Witch on the Holy Night; by default the config's setting) |
 | `-s`, `--save-file PATH` | the save file (see below for the default) |
+| `-r`, `--resolution window\|original` | render at the window's resolution (the default: the largest 16:9 area that fits, at least 1920x1080) or at the Switch's 1920x1080, scaled to the window, for output identical to the Switch (the default on Android) |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
 | `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |

@@ -380,7 +380,10 @@ impl Quad {
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    /// None while the window has none (`suspend`: Android takes the surface away in the background)
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     pub bc_supported: bool,
     sampler: wgpu::Sampler,
@@ -442,14 +445,7 @@ impl Renderer {
         }))
         .context("creating device")?;
 
-        let caps = surface.get_capabilities(&adapter);
-        // plain 8-bit and never sRGB, as the Switch draws: compositors treat float (and some 10-bit) surfaces as
-        // linear or HDR, which washes the colours out
-        let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
-            .into_iter()
-            .find(|f| caps.formats.contains(f))
-            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
-            .unwrap_or(caps.formats[0]);
+        let format = surface_format(&surface.get_capabilities(&adapter));
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -587,7 +583,9 @@ impl Renderer {
         Ok(Self {
             device,
             queue,
-            surface,
+            instance,
+            adapter,
+            surface: Some(surface),
             config,
             bc_supported,
             sampler,
@@ -608,7 +606,7 @@ impl Renderer {
         })
     }
 
-    /// Render the canvas at the window's resolution (the largest 16:9 fit, above or below 1080p) rather than at
+    /// Render the canvas at the window's resolution (the largest 16:9 fit, never under 1080p) rather than at
     /// 1920x1080 as the Switch does. The canvas targets made from now on take the scale (`create_canvas_target`;
     /// `canvas_fits` tells the ones made before a change).
     pub fn set_follow_window(&mut self, on: bool) {
@@ -620,7 +618,7 @@ impl Renderer {
         self.scale = if self.follow_window {
             let fit = (self.config.width as f32 / CANVAS_W as f32).min(self.config.height as f32 / CANVAS_H as f32);
             let max = self.device.limits().max_texture_dimension_2d as f32 / CANVAS_W as f32;
-            fit.min(max)
+            fit.min(max).max(1.0)
         } else {
             1.0
         };
@@ -664,8 +662,30 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
         self.fit_scale();
+    }
+
+    /// Let go of the window's surface (Android: the app is going to the background, where its native window is
+    /// destroyed); `present` draws nothing until `resume`.
+    pub fn suspend(&mut self) {
+        self.surface = None;
+    }
+
+    /// A new surface for the window after `suspend`, `width` x `height` pixels.
+    pub fn resume(&mut self, window: Arc<impl wgpu::DisplayAndWindowHandle + 'static>, width: u32, height: u32) -> Result<()> {
+        // (two surfaces for one native window do not coexist)
+        self.surface = None;
+        let surface = self.instance.create_surface(window).context("creating surface")?;
+        self.config.format = surface_format(&surface.get_capabilities(&self.adapter));
+        self.config.width = width.max(1);
+        self.config.height = height.max(1);
+        surface.configure(&self.device, &self.config);
+        self.surface = Some(surface);
+        self.fit_scale();
+        Ok(())
     }
 
     fn bind_group_for(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -1222,14 +1242,14 @@ impl Renderer {
 
     /// Scale `canvas` into the window (letterboxed) through the output curve, then submit and present.
     pub fn present(&mut self, mut encoder: wgpu::CommandEncoder, canvas: &RenderTarget) {
-        if self.hidden {
+        let Some(surface) = self.surface.as_ref().filter(|_| !self.hidden) else {
             self.queue.submit([encoder.finish()]);
             return;
-        }
-        let frame = match self.surface.get_current_texture() {
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 self.queue.submit([encoder.finish()]);
                 return;
             }
@@ -1327,6 +1347,16 @@ impl Renderer {
         }
         out
     }
+}
+
+/// The surface's format: plain 8-bit and never sRGB, as the Switch draws (compositors treat float, and some 10-bit,
+/// surfaces as linear or HDR, which washes the colours out).
+fn surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
+    [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
+        .into_iter()
+        .find(|f| caps.formats.contains(f))
+        .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
+        .unwrap_or(caps.formats[0])
 }
 
 fn fullscreen_verts(color: [f32; 4]) -> [Vertex; 6] {

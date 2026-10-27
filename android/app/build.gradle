@@ -1,0 +1,68 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'dev.knife.app'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'dev.knife.app'
+        // Vulkan (or the GLES 3.0 wgpu falls back to) and MediaCodec's NDK interface
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.9.6'
+        // the phones this is for; add 'armeabi-v7a' / 'x86_64' here and to cargoBuild's --target to build for more
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // signed with the debug key, so that the release build installs without a keystore of one's own
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// The program: knife-android, built with cargo-ndk (cargo install cargo-ndk; rustup target add aarch64-linux-android)
+// from the repository's root, whatever the build type: a debug build of the engine is too slow to play.
+tasks.register('cargoBuild', Exec) {
+    description = 'Builds the knife-android library for the phone'
+    workingDir rootProject.projectDir.parentFile
+    doFirst {
+        def ndk = android.ndkDirectory
+        if (ndk != null) {
+            environment 'ANDROID_NDK_HOME', ndk.absolutePath
+        }
+    }
+    commandLine 'cargo', 'ndk',
+            '--target', 'arm64-v8a',
+            '--platform', '26',
+            '--output-dir', "${projectDir}/src/main/jniLibs",
+            'build', '--release', '--package', 'knife-android'
+}
+
+// The C++ runtime that the audio library (Oboe) is linked against, if it is: the NDK has it, the phone does not.
+tasks.register('copyLibcxx', Copy) {
+    description = 'Copies libc++_shared.so from the NDK next to the program'
+    mustRunAfter 'cargoBuild'
+    from {
+        fileTree(dir: android.ndkDirectory,
+                include: 'toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so').files
+    }
+    into "${projectDir}/src/main/jniLibs/arm64-v8a"
+}
+
+tasks.named('preBuild') {
+    dependsOn 'cargoBuild', 'copyLibcxx'
+}

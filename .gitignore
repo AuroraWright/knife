@@ -11,3 +11,7 @@ __pycache__/
 /tools/envydis
 /switch_exefs_woh
 /switch_romfs_woh
+/android/.gradle
+/android/local.properties
+/android/app/build
+/android/app/src/main/jniLibs
