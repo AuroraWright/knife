@@ -68,6 +68,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | `-m`, `--mod-assets-dir DIR` | the mod folder, whose files replace the game data's (see above; used only if it exists) |
 | `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (Tsukihime's overseas release and Witch on the Holy Night; by default the config's setting) |
 | `-s`, `--save-file PATH` | the save file (see below for the default) |
+| `-r`, `--resolution window\|original` | render at the window's resolution (the default: the largest 16:9 area that fits, at least 1920x1080) or at the Switch's 1920x1080, scaled to the window, for output identical to the Switch |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
 | `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |

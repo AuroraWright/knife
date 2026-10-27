@@ -1,8 +1,9 @@
 //! wgpu renderer: textures, a quad batcher with blend-mode pipelines, render targets,
 //! rule transitions and a letterboxed present.
 //!
-//! The game composes everything into a fixed 1920x1080 canvas (`CANVAS_W` x `CANVAS_H`),
-//! which is then scaled to the window.
+//! The game lays everything out on a 1920x1080 canvas (`CANVAS_W` x `CANVAS_H` units), rendered at the
+//! render scale (1, as the Switch draws, or with `Renderer::set_follow_window` the window's size) and then
+//! scaled to the window.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -190,9 +191,14 @@ pub struct SoftClip {
 }
 
 impl SoftClip {
-    fn vertex(&self) -> [[f32; 4]; 3] {
+    /// The shader's values for a target of `k` pixels per unit.
+    fn vertex(&self, k: f32) -> [[f32; 4]; 3] {
         let (s, c) = self.rot.sin_cos();
-        [self.inner, [self.pivot[0], self.pivot[1], s, c], [self.radius, self.row as f32, self.texels as f32, 1.0 - self.fill]]
+        [
+            self.inner.map(|v| v * k),
+            [self.pivot[0] * k, self.pivot[1] * k, s, c],
+            [self.radius * k, self.row as f32, self.texels as f32, 1.0 - self.fill],
+        ]
     }
 }
 
@@ -250,8 +256,30 @@ impl GpuTexture {
 pub type TexRef = Arc<GpuTexture>;
 
 /// An offscreen render target that can also be sampled.
+#[derive(Clone)]
 pub struct RenderTarget {
     pub tex: TexRef,
+    /// The size quads drawn into it are laid out in (`Renderer::draw`): its pixels, or for a canvas target
+    /// (`Renderer::create_canvas_target`) its units, which the render scale maps to more or fewer pixels
+    pub units: [f32; 2],
+}
+
+impl RenderTarget {
+    /// A target of `tex` laid out in its own pixels.
+    pub fn new(tex: TexRef) -> Self {
+        let units = [tex.width as f32, tex.height as f32];
+        Self { tex, units }
+    }
+
+    /// A target of `tex` laid out in `units`.
+    pub fn with_units(tex: TexRef, units: [f32; 2]) -> Self {
+        Self { tex, units }
+    }
+
+    /// Its pixels per unit.
+    pub fn scale(&self) -> f32 {
+        self.tex.width as f32 / self.units[0]
+    }
 }
 
 #[derive(Clone)]
@@ -372,6 +400,10 @@ pub struct Renderer {
     /// The window is fully covered or minimised: `present` submits the frame's work but takes no surface
     /// texture (a hidden macOS window hands drawables back at once or after a second's stall)
     pub hidden: bool,
+    /// Pixels per canvas unit of the canvas targets (`create_canvas_target`)
+    scale: f32,
+    /// The scale follows the window (`set_follow_window`)
+    follow_window: bool,
 }
 
 pub enum Upload<'a> {
@@ -571,7 +603,59 @@ impl Renderer {
             lut_group,
             alter,
             hidden: false,
+            scale: 1.0,
+            follow_window: false,
         })
+    }
+
+    /// Render the canvas at the window's resolution (the largest 16:9 fit, never under 1080p) rather than at
+    /// 1920x1080 as the Switch does. The canvas targets made from now on take the scale (`create_canvas_target`;
+    /// `canvas_fits` tells the ones made before a change).
+    pub fn set_follow_window(&mut self, on: bool) {
+        self.follow_window = on;
+        self.fit_scale();
+    }
+
+    fn fit_scale(&mut self) {
+        self.scale = if self.follow_window {
+            let fit = (self.config.width as f32 / CANVAS_W as f32).min(self.config.height as f32 / CANVAS_H as f32);
+            let max = self.device.limits().max_texture_dimension_2d as f32 / CANVAS_W as f32;
+            fit.min(max).max(1.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// The pixel size of a canvas target of `w` x `h` units.
+    fn canvas_px(&self, w: u32, h: u32) -> (u32, u32) {
+        ((w as f32 * self.scale).round().max(1.0) as u32, (h as f32 * self.scale).round().max(1.0) as u32)
+    }
+
+    /// A render target laid out in `w` x `h` canvas units, `scale` pixels to the unit.
+    pub fn create_canvas_target(&self, w: u32, h: u32, label: &str) -> RenderTarget {
+        let (pw, ph) = self.canvas_px(w, h);
+        RenderTarget::with_units(self.create_target(pw, ph, label).tex, [w as f32, h as f32])
+    }
+
+    /// Whether `tex` has the pixels of a `w` x `h` unit canvas target at the current scale.
+    pub fn canvas_fits(&self, tex: &GpuTexture, w: u32, h: u32) -> bool {
+        (tex.width, tex.height) == self.canvas_px(w, h)
+    }
+
+    /// Make canvas target `rt` again when the scale has changed since, its picture scaled into the new one.
+    pub fn refit(&mut self, encoder: &mut wgpu::CommandEncoder, rt: &mut RenderTarget, label: &str) {
+        let [w, h] = rt.units;
+        if self.canvas_fits(&rt.tex, w as u32, h as u32) {
+            return;
+        }
+        let new = self.create_canvas_target(w as u32, h as u32, label);
+        let q = Quad { blend: Blend::Opaque, ..Quad::rect(rt.tex.clone(), [0.0, 0.0, w, h], [1.0; 4]) };
+        self.draw(encoder, &new, Some([0.0; 4]), &[q]);
+        *rt = new;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -581,6 +665,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.fit_scale();
     }
 
     fn bind_group_for(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -762,15 +847,13 @@ impl Renderer {
         });
         let view = texture.create_view(&Default::default());
         let bind_group = self.bind_group_for(&view);
-        RenderTarget {
-            tex: Arc::new(GpuTexture {
-                texture,
-                view,
-                bind_group,
-                width,
-                height,
-            }),
-        }
+        RenderTarget::new(Arc::new(GpuTexture {
+            texture,
+            view,
+            bind_group,
+            width,
+            height,
+        }))
     }
 
     fn pipeline(&mut self, key: PipeKey, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
@@ -836,17 +919,20 @@ impl Renderer {
     /// (`Blend::Ps`) ends the current pass: the target is copied, and the quad is drawn reading that copy.
     pub fn draw(&mut self, encoder: &mut wgpu::CommandEncoder, target: &RenderTarget, clear: Option<[f32; 4]>, quads: &[Quad]) {
         let (tw, th) = (target.tex.width as f32, target.tex.height as f32);
+        let [uw, uh] = target.units;
+        // the soft clip works in target pixels
+        let k = tw / uw;
         let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
         // vertex range of each quad
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(quads.len());
         for q in quads {
             let start = verts.len() as u32;
             let mk = |p: [f32; 4]| Vertex {
-                pos: [p[0] / tw * 2.0 - 1.0, 1.0 - p[1] / th * 2.0],
+                pos: [p[0] / uw * 2.0 - 1.0, 1.0 - p[1] / uh * 2.0],
                 uv: [p[2], p[3]],
                 color: q.color,
                 haze: q.haze,
-                soft: q.soft.map_or([[0.0; 4]; 3], |m| m.vertex()),
+                soft: q.soft.map_or([[0.0; 4]; 3], |m| m.vertex(k)),
             };
             let corners: Vec<[f32; 4]> = (0..4).map(|i| [q.pos[i][0], q.pos[i][1], q.uv[i][0], q.uv[i][1]]).collect();
             let poly = match &q.clip {
@@ -1079,14 +1165,14 @@ impl Renderer {
         })
     }
 
-    /// One separable gaussian blur pass of `src` into `dst` along `dir` (pixels of `src` per tap): the
-    /// Switch's 2 ceil(3 sigma) + 1 taps.
-    /// One blur pass of `src` into `dst` (overwritten), taps `dir` canvas px apart.
+    /// One separable gaussian blur pass of `src` into `dst` (overwritten) along `dir` (units of `dst` per tap,
+    /// `src` having its scale): the Switch's 2 ceil(3 sigma) + 1 taps.
     #[allow(clippy::too_many_arguments)]
     pub fn blur(&mut self, encoder: &mut wgpu::CommandEncoder, src: &GpuTexture, dst: &RenderTarget, dir: [f32; 2], sigma: f32, mode: BlurMode) {
         self.pipeline(PipeKey::Blur, TARGET_FORMAT);
         let half = (sigma * 3.0).ceil();
-        let params = [dir[0], dir[1], sigma, half, mode as u32 as f32, 0.0, 0.0, 0.0];
+        let k = dst.scale();
+        let params = [dir[0] * k, dir[1] * k, sigma, half, mode as u32 as f32, 0.0, 0.0, 0.0];
         let bg = self.effect_bind_group(&src.view, &self.white.view, &self.white.view, params);
         let verts = fullscreen_verts([1.0; 4]);
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

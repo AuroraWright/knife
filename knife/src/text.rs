@@ -18,6 +18,8 @@ struct Glyph {
     rect: [u32; 4],
     /// offset of the bitmap's top-left from the pen position on the baseline
     off: [f32; 2],
+    /// atlas pixels per base-size pixel (`FontAtlas::raster`)
+    px: f32,
 }
 
 /// exfont_nx01.bffnt, the bitmap font sub_CAE88 pairs with the message font (nn::font PairFont), and its sheet
@@ -162,6 +164,11 @@ pub struct FontAtlas {
     ex: Option<ExFont>,
     pub tex: TexRef,
     glyphs: HashMap<(char, u32), Option<Glyph>>,
+    /// the atlas's side
+    side: u32,
+    /// the glyphs' raster scale over the base size: the render scale, so a canvas drawn above 1080p keeps the
+    /// glyphs as sharp as the Switch's
+    raster: f32,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -181,6 +188,8 @@ impl FontAtlas {
             ex: None,
             tex,
             glyphs: HashMap::new(),
+            side: ATLAS,
+            raster: 1.0,
             shelf_x: 0,
             shelf_y: 0,
             shelf_h: 0,
@@ -391,7 +400,10 @@ impl FontAtlas {
         0
     }
 
-    fn reset(&mut self) {
+    /// Start over on a new atlas texture (quads already queued keep the old one), sized for the raster scale.
+    fn reset(&mut self, r: &Renderer) {
+        self.side = (ATLAS * self.raster.ceil() as u32).min(8192);
+        self.tex = r.create_writable(self.side, self.side, true, "font atlas");
         self.glyphs.clear();
         self.shelf_x = 0;
         self.shelf_y = 0;
@@ -399,27 +411,29 @@ impl FontAtlas {
     }
 
     /// The glyph as nn::font's cache holds it: rasterized at the base size (font manager +124, 40 px) with its
-    /// box on whole pixels, which the draw scales to the slot size.
+    /// box on whole pixels, which the draw scales to the slot size; above 1080p at the render scale times that.
     fn glyph(&mut self, r: &Renderer, c: char) -> Option<Glyph> {
+        if r.scale() != self.raster {
+            self.raster = r.scale();
+            self.reset(r);
+        }
         let key = (c, (BASE_SIZE * 4.0) as u32);
         if let Some(g) = self.glyphs.get(&key) {
             return *g;
         }
         let font = self.face(c);
         let id = font.glyph_id(c);
-        let outlined = font.outline_glyph(id.with_scale_and_position(Self::px(font, BASE_SIZE), ab_glyph::point(0.0, 0.0)));
+        let outlined = font.outline_glyph(id.with_scale_and_position(Self::px(font, BASE_SIZE * self.raster), ab_glyph::point(0.0, 0.0)));
         let g = outlined.map(|o| {
             let b = o.px_bounds();
             let (w, h) = (b.width().ceil() as u32 + 1, b.height().ceil() as u32 + 1);
-            if self.shelf_x + w + PAD > ATLAS {
+            if self.shelf_x + w + PAD > self.side {
                 self.shelf_x = 0;
                 self.shelf_y += self.shelf_h + PAD;
                 self.shelf_h = 0;
             }
-            if self.shelf_y + h + PAD > ATLAS {
-                // atlas full: start over (glyphs already queued this frame stay valid
-                // until overwritten, which is acceptable for a rare event)
-                self.reset();
+            if self.shelf_y + h + PAD > self.side {
+                self.reset(r);
             }
             let (x, y) = (self.shelf_x, self.shelf_y);
             self.shelf_x += w + PAD;
@@ -435,11 +449,13 @@ impl FontAtlas {
             Glyph {
                 rect: [x, y, w, h],
                 off: [b.min.x, b.min.y],
+                px: self.raster,
             }
         });
         let g = g.or(Some(Glyph {
             rect: [0, 0, 0, 0],
             off: [0.0, 0.0],
+            px: 1.0,
         }));
         self.glyphs.insert(key, g);
         g
@@ -458,8 +474,8 @@ impl FontAtlas {
             return None;
         }
         let [gx, gy, gw, gh] = g.rect;
-        let a = ATLAS as f32;
-        let k = size / BASE_SIZE;
+        let a = self.side as f32;
+        let k = size / BASE_SIZE / g.px;
         let q = Quad::rect(
             self.tex.clone(),
             [x + g.off[0] * k * sx - (sx - 1.0) * size / 2.0, baseline + g.off[1] * k, gw as f32 * k * sx, gh as f32 * k],

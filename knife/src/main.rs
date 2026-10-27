@@ -75,6 +75,13 @@ struct Cli {
     /// Every connected client receives each message as plain text, and each choice's options one per line.
     #[arg(short, long, value_name = "HOST:PORT")]
     text_websocket: Option<String>,
+    /// Render at this resolution: "window" draws at the window's resolution (the largest 16:9 area that fits,
+    /// at least 1920x1080), "original" at the Switch's 1920x1080, scaled to the window, for output that matches
+    /// the Switch pixel for pixel.
+    ///
+    /// Defaults to window (original with --shots).
+    #[arg(short, long, value_enum)]
+    resolution: Option<Resolution>,
     /// Start in this scene (allscr name or index) instead of START_SCRIPT
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
@@ -181,6 +188,11 @@ impl Cli {
     /// The selected mod folder, or the default next to the executable, when it exists.
     fn mod_assets_dir(&self) -> Option<PathBuf> {
         Some(self.mod_assets_dir.clone().unwrap_or_else(|| default_dir(MOD_ASSETS_DIR_NAME))).filter(|dir| dir.is_dir())
+    }
+
+    /// `--resolution`, by default the window's, or original for --shots (the comparisons with the Switch's captures).
+    fn resolution(&self) -> Resolution {
+        self.resolution.unwrap_or(if self.shots.is_some() { Resolution::Original } else { Resolution::Window })
     }
 }
 
@@ -315,7 +327,8 @@ impl App {
         #[cfg(target_os = "macos")]
         window.focus_window();
         let size = window.inner_size();
-        let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
+        let mut renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
+        renderer.set_follow_window(self.cli.resolution() == Resolution::Window);
         let roots = assets::Roots { base: self.cli.assets_dir(), mods: self.cli.mod_assets_dir() };
         if let Some(mods) = &roots.mods {
             tracing::info!("Using mod assets in {}", mods.display());
@@ -560,7 +573,8 @@ impl App {
             let path = dir.join(format!("shot_{:04}.png", self.shot_n));
             self.shot_n += 1;
             let _ = std::fs::create_dir_all(dir);
-            if let Err(e) = image::save_buffer(&path, &rgba, CANVAS_W, CANVAS_H, image::ExtendedColorType::Rgba8) {
+            let (w, h) = g.canvas_size();
+            if let Err(e) = image::save_buffer(&path, &rgba, w, h, image::ExtendedColorType::Rgba8) {
                 tracing::warn!("screenshot: {e}");
             }
             tracing::info!("shot {} scene {} pc {}\n{}", path.display(), g.scene_index, g.current_pc(), g.dump_layers());
@@ -760,6 +774,13 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// `--resolution`
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolution {
+    Window,
+    Original,
 }
 
 /// `--language`: the folder names of the overseas data's languages (sub_2DE70's order).

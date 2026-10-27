@@ -881,8 +881,9 @@ impl Ui {
         let k = if a.ch == 0 { 1.0 } else { 0.25 };
         let alpha = (a.ph[0].sin() + 1.0) * 0.5 * k;
         if !glow.is_empty() && alpha > 0.0 {
-            let rt = self.w.arc.rt.get_or_insert_with(|| r.create_target(W as u32, H as u32, "archive glow").tex).clone();
-            game.ui_passes.push((RenderTarget { tex: rt.clone() }, Some([0.0; 4]), glow));
+            self.w.arc.rt.take_if(|t| !r.canvas_fits(t, W as u32, H as u32));
+            let rt = self.w.arc.rt.get_or_insert_with(|| r.create_canvas_target(W as u32, H as u32, "archive glow").tex).clone();
+            game.ui_passes.push((RenderTarget::with_units(rt.clone(), [W, H]), Some([0.0; 4]), glow));
             let mut q = Quad::rect(rt, [0.0, 0.0, W, H], [1.0, 1.0, 1.0, alpha]);
             q.shade = Shade::ForceAlpha;
             q.blend = Blend::Add;

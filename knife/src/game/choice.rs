@@ -695,9 +695,9 @@ impl Game {
                 }
             }
         }
-        let text_rt = self.choice_text_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "choice text"));
+        let text_rt = self.choice_text_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "choice text"));
         r.draw(enc, text_rt, Some([0.0; 4]), &quads);
-        let glow = self.choice_glow.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "choice glow"));
+        let glow = self.choice_glow.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "choice glow"));
         // sub_A0A90(0, -2, 2.0): shader 51 whiteness, sigma 2 taps (13 taps) spaced 1.5 px of 1920. It queues
         // four passes (h, v, h, v, the last back into texture 5) like the menu blur, but the Switch glow is two
         // passes wide: against the Switch (first choice of 04_00_ARC04_1B) two passes give the glow's sum 0.97,

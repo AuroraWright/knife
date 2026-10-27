@@ -182,7 +182,7 @@ impl Ghost {
                 self.bright
             }
         };
-        let (w, h) = (canvas.tex.width as f32, canvas.tex.height as f32);
+        let [w, h] = canvas.units;
         let k = self.amp * w / 960.0;
         let th = self.angle.to_radians();
         let opp = th + PI;

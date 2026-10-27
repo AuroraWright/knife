@@ -748,8 +748,9 @@ impl Ui {
         pen.fill(&mut cap, &white, 0.0, 0.0, 640.0, 448.0);
         let mut view = old.view;
         Self::wcg_view_quads(c, &white, &mut cap, &mut view, old.pic.as_ref(), old.var, c.pic_a, false);
-        let rt = c.rt.get_or_insert_with(|| r.create_target(W as u32, H as u32, "cg capture").tex).clone();
-        game.ui_passes.push((RenderTarget { tex: rt.clone() }, Some([0.0, 0.0, 0.0, 1.0]), cap));
+        c.rt.take_if(|t| !r.canvas_fits(t, W as u32, H as u32));
+        let rt = c.rt.get_or_insert_with(|| r.create_canvas_target(W as u32, H as u32, "cg capture").tex).clone();
+        game.ui_passes.push((RenderTarget::with_units(rt.clone(), [W, H]), Some([0.0, 0.0, 0.0, 1.0]), cap));
         out.push(Quad::rect(rt, [0.0, 0.0, W, H], [1.0, 1.0, 1.0, c.xf]));
     }
 

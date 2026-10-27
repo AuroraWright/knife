@@ -827,8 +827,9 @@ impl Ui {
     /// sub_2E220's pattern for the save screen: BG_save / BG_load (shader noalpha) into surface 1, kusa1 /
     /// kusa2 (408 / 409) into surface 0 added onto it (sub_81C20(1)), surface 1 drawn at alpha a (jp_B1580).
     fn ws_backdrop(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, a: f32) {
+        self.w.save.rt.take_if(|t| !r.canvas_fits(&t[0], W as u32, H as u32));
         let [t0, t1] = self.w.save.rt.get_or_insert_with(|| {
-            let mk = |l| r.create_target(W as u32, H as u32, l).tex;
+            let mk = |l| r.create_canvas_target(W as u32, H as u32, l).tex;
             [mk("save surface 0"), mk("save surface 1")]
         });
         let (t0, t1) = (t0.clone(), t1.clone());
@@ -855,8 +856,8 @@ impl Ui {
         let mut add = Quad::rect(t0.clone(), [0.0, 0.0, W, H], [1.0; 4]);
         add.blend = Blend::Add;
         s1.push(add);
-        game.ui_passes.push((RenderTarget { tex: t0 }, Some([0.0; 4]), s0));
-        game.ui_passes.push((RenderTarget { tex: t1.clone() }, Some([0.0; 4]), s1));
+        game.ui_passes.push((RenderTarget::with_units(t0, [W, H]), Some([0.0; 4]), s0));
+        game.ui_passes.push((RenderTarget::with_units(t1.clone(), [W, H]), Some([0.0; 4]), s1));
         out.push(Quad::rect(t1, [0.0, 0.0, W, H], [1.0, 1.0, 1.0, a]));
     }
 

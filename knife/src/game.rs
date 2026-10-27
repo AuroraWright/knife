@@ -1064,7 +1064,7 @@ impl Game {
             disp: Vec::new(),
             border: Vec::new(),
             relaying: false,
-            stage_rt: r.create_target(CANVAS_W, CANVAS_H, "stage"),
+            stage_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "stage"),
             noise_rt: None,
             previews: Default::default(),
             preview_queue: Vec::new(),
@@ -1073,16 +1073,16 @@ impl Game {
             preview_decoded: std::sync::mpsc::channel(),
             prefetching: Default::default(),
             prefetched: std::sync::mpsc::channel(),
-            scene_rt: r.create_target(CANVAS_W, CANVAS_H, "scene"),
-            old_rt: r.create_target(CANVAS_W, CANVAS_H, "old frame"),
-            blur_rt: r.create_target(CANVAS_W, CANVAS_H, "blur"),
+            scene_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "scene"),
+            old_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "old frame"),
+            blur_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "blur"),
             ghost: ghost::Ghost::default(),
             ghost_rt: None,
             group_rt: None,
             focus: focus::Focus::default(),
             focus_saved: 0,
             focus_tex: None,
-            canvas: r.create_target(CANVAS_W, CANVAS_H, "canvas"),
+            canvas: r.create_canvas_target(CANVAS_W, CANVAS_H, "canvas"),
         }
     }
 
@@ -5798,7 +5798,7 @@ impl Game {
 
     fn group_targets(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) -> &[RenderTarget; 3] {
         if self.group_rt.is_none() {
-            let t = ["group pixel", "group mask", "group composite"].map(|n| r.create_target(CANVAS_W, CANVAS_H, n));
+            let t = ["group pixel", "group mask", "group composite"].map(|n| r.create_canvas_target(CANVAS_W, CANVAS_H, n));
             for rt in &t {
                 r.draw(enc, rt, Some([0.0; 4]), &[]);
             }
@@ -5807,8 +5807,48 @@ impl Game {
         self.group_rt.as_ref().unwrap()
     }
 
+    /// The canvas targets again at the render scale, if it has changed (the window resized), their pictures
+    /// kept.
+    fn refit_targets(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
+        for (rt, l) in [(&mut self.stage_rt, "stage"), (&mut self.scene_rt, "scene"), (&mut self.old_rt, "old frame")] {
+            r.refit(enc, rt, l);
+        }
+        r.refit(enc, &mut self.blur_rt, "blur");
+        r.refit(enc, &mut self.canvas, "canvas");
+        let slots = [
+            (self.menu_rt.as_mut(), "menu blur"),
+            (self.freeze_rt.as_mut(), "screen capture"),
+            (self.noise_rt.as_mut(), "noise rt40"),
+            (self.choice_text_rt.as_mut(), "choice text"),
+            (self.choice_glow.as_mut(), "choice glow"),
+        ];
+        for (rt, l) in slots {
+            if let Some(rt) = rt {
+                r.refit(enc, rt, l);
+            }
+        }
+        let sets = [
+            self.menu_half.as_mut().map(|t| t.as_mut_slice()),
+            self.menu_quarter.as_mut().map(|t| t.as_mut_slice()),
+            self.ghost_rt.as_mut().map(|t| t.as_mut_slice()),
+            self.group_rt.as_mut().map(|t| t.as_mut_slice()),
+        ];
+        for rt in sets.into_iter().flatten().flatten() {
+            r.refit(enc, rt, "scratch");
+        }
+        if let Some(rt) = &self.noise_rt {
+            self.stage.noise_rt = Some(rt.tex.clone());
+        }
+        // the previews are drawn again at the new scale
+        let (tw, th) = PREVIEW_TARGET;
+        self.preview_rt.take_if(|t| !r.canvas_fits(&t.tex, tw, th));
+        let (pw, ph) = PREVIEW_SIZE;
+        self.previews.retain(|_, t| r.canvas_fits(t, pw, ph));
+    }
+
     pub fn render(&mut self, r: &mut Renderer, overlay: &mut dyn FnMut(&mut Self, &Renderer, &mut Vec<Quad>)) {
         let mut enc = r.encoder();
+        self.refit_targets(r, &mut enc);
         self.render_previews(r, &mut enc);
         if self.snapshot {
             r.copy_target(&mut enc, &self.scene_rt, &self.old_rt);
@@ -5816,7 +5856,7 @@ impl Game {
         }
         if let Some(q) = self.stage.noise_pass() {
             let fresh = self.noise_rt.is_none();
-            let rt = self.noise_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "noise rt40"));
+            let rt = self.noise_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "noise rt40"));
             if fresh {
                 // nothing earlier to show through the uncovered strip yet: start from a full-screen copy
                 let full = Quad::rect(q.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
@@ -5837,7 +5877,7 @@ impl Game {
         // sub_3C490 draws the FADE(40) effect over the composed frame, before the text
         if self.ghost.active() {
             let [src, out] = self.ghost_rt.get_or_insert_with(|| {
-                [r.create_target(CANVAS_W, CANVAS_H, "ghost frame"), r.create_target(CANVAS_W, CANVAS_H, "ghost channels")]
+                [r.create_canvas_target(CANVAS_W, CANVAS_H, "ghost frame"), r.create_canvas_target(CANVAS_W, CANVAS_H, "ghost channels")]
             });
             let trans = self.trans.as_ref().map(|t| (t.t / t.dur).clamp(0.0, 1.0));
             self.ghost.render(r, &mut enc, &self.scene_rt, [src, &self.blur_rt, out], trans);
@@ -5893,7 +5933,7 @@ impl Game {
         }
         match self.menu_blur {
             Some(a) => {
-                let rt = self.menu_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "menu blur"));
+                let rt = self.menu_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "menu blur"));
                 if !self.menu_captured {
                     if witch {
                         // sub_7FDB0: the capture drawn at 0.25 into the Defocus buffer (jp_A5330(-2)), sub_78810(1.25)'s
@@ -5902,7 +5942,7 @@ impl Game {
                         // back over the screen (jp_A5690, uv 0..0.25)
                         let (qw, qh) = (CANVAS_W / 4, CANVAS_H / 4);
                         let [a, b] = self.menu_quarter.get_or_insert_with(|| {
-                            [r.create_target(qw, qh, "backbuffer defocus"), r.create_target(qw, qh, "defocus pass")]
+                            [r.create_canvas_target(qw, qh, "backbuffer defocus"), r.create_canvas_target(qw, qh, "defocus pass")]
                         });
                         let full = Quad::rect(self.canvas.tex.clone(), [0.0, 0.0, qw as f32, qh as f32], [1.0; 4]);
                         r.draw(&mut enc, a, Some([0.0, 0.0, 0.0, 1.0]), &[full]);
@@ -5917,7 +5957,7 @@ impl Game {
                         // vertically (shader 55, through the backbuffer and copied back), then scaled up 2x
                         let (hw, hh) = (CANVAS_W / 2, CANVAS_H / 2);
                         let [a, b] = self.menu_half.get_or_insert_with(|| {
-                            [r.create_target(hw, hh, "filter defocus"), r.create_target(hw, hh, "defocus pass")]
+                            [r.create_canvas_target(hw, hh, "filter defocus"), r.create_canvas_target(hw, hh, "defocus pass")]
                         });
                         let full = Quad::rect(self.canvas.tex.clone(), [0.0, 0.0, hw as f32, hh as f32], [1.0; 4]);
                         r.draw(&mut enc, a, Some([0.0, 0.0, 0.0, 1.0]), &[full]);
@@ -5959,7 +5999,7 @@ impl Game {
             r.draw(&mut enc, &self.canvas, None, &ui);
         }
         if let Some(f) = &mut self.freeze {
-            let rt = self.freeze_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "screen capture"));
+            let rt = self.freeze_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "screen capture"));
             if f.capture {
                 // sub_A2550 takes the frame being finished
                 r.copy_target(&mut enc, &self.canvas, rt);
@@ -6590,7 +6630,7 @@ impl Game {
         }
         // the "thumbnail surface" sub_89AD0 draws into (sub_A5C10)
         let (tw, th) = PREVIEW_TARGET;
-        let rt = self.preview_rt.get_or_insert_with(|| r.create_target(tw, th, "preview")).tex.clone();
+        let rt = self.preview_rt.get_or_insert_with(|| r.create_canvas_target(tw, th, "preview")).clone();
         for (slot, layers, pic) in ready {
             let scale = tw as f32 / CANVAS_W as f32;
             let quads: Vec<Quad> = if let Some(p) = pic {
@@ -6610,12 +6650,11 @@ impl Game {
             } else {
                 self.preview_stage_quads(r, &layers).into_iter().map(|q| q.scaled(scale)).collect()
             };
-            let full = RenderTarget { tex: rt.clone() };
-            r.draw(enc, &full, Some([0.0, 0.0, 0.0, 1.0]), &quads);
+            r.draw(enc, &rt, Some([0.0, 0.0, 0.0, 1.0]), &quads);
             // sub_4F240 draws the target bilinearly into the 248x140 slot picture (82.7 x 57.9 of 640x448)
             let (pw, ph) = PREVIEW_SIZE;
-            let out = r.create_target(pw, ph, "preview");
-            r.draw(enc, &out, Some([0.0, 0.0, 0.0, 1.0]), &[Quad::rect(rt.clone(), [0.0, 0.0, pw as f32, ph as f32], [1.0; 4])]);
+            let out = r.create_canvas_target(pw, ph, "preview");
+            r.draw(enc, &out, Some([0.0, 0.0, 0.0, 1.0]), &[Quad::rect(rt.tex.clone(), [0.0, 0.0, pw as f32, ph as f32], [1.0; 4])]);
             self.previews.insert(slot, out.tex);
         }
     }
@@ -7036,6 +7075,11 @@ impl Game {
             }
         }
         s
+    }
+
+    /// The canvas's pixel size (`screenshot`'s)
+    pub fn canvas_size(&self) -> (u32, u32) {
+        (self.canvas.tex.width, self.canvas.tex.height)
     }
 
     /// RGBA8 copy of the last presented canvas as the screen shows it (through the output curve).

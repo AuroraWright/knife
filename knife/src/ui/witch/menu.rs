@@ -376,8 +376,9 @@ impl Ui {
     /// (sub_81C20(1)); menu_window (396) into surface 0 for its alpha, and surface 1 drawn through it
     /// (sub_8A4E0(0) / jp_B2900). All at the menu's alpha.
     fn wm_window(&mut self, game: &mut Game, r: &Renderer, out: &mut Vec<Quad>, a: f32, v: f32) {
+        self.w.menu.rt.take_if(|t| !r.canvas_fits(&t[0], W as u32, H as u32));
         let [t0, t1] = self.w.menu.rt.get_or_insert_with(|| {
-            let mk = |l| r.create_target(W as u32, H as u32, l).tex;
+            let mk = |l| r.create_canvas_target(W as u32, H as u32, l).tex;
             [mk("menu surface 0"), mk("menu surface 1")]
         });
         let (t0, t1) = (t0.clone(), t1.clone());
@@ -420,8 +421,8 @@ impl Ui {
                 q.blend = Blend::MaskAlpha;
             }
         }
-        game.ui_passes.push((RenderTarget { tex: t0 }, Some([0.0; 4]), s0));
-        game.ui_passes.push((RenderTarget { tex: t1.clone() }, Some([0.0; 4]), s1));
+        game.ui_passes.push((RenderTarget::with_units(t0, [W, H]), Some([0.0; 4]), s0));
+        game.ui_passes.push((RenderTarget::with_units(t1.clone(), [W, H]), Some([0.0; 4]), s1));
         out.push(Quad::rect(t1, [0.0, 0.0, W, H], [1.0, 1.0, 1.0, a]));
     }
 

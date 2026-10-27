@@ -2013,6 +2013,11 @@ impl Ui {
         if self.debug_intro(game, r, name) {
             return;
         }
+        // Witch on the Holy Night's system menu: its own panel, as B / cancel opens it in the story
+        if crate::assets::witch() && name == "menu" {
+            self.wm_open(game, r);
+            return;
+        }
         // Witch on the Holy Night's save screen: the title's Load (state 25), else the system menu's entry
         if crate::assets::witch() && matches!(name, "save" | "load") {
             let save = name == "save";
@@ -7843,8 +7848,9 @@ impl Ui {
                     cap.push(Quad::rect(tex, rc, [1.0; 4]).with_uv_rect(u0, v0, u1, v1));
                     self.draw_guide(&mut cap, &white, 9, (1.0 - self.cg_cap_guide) * 25.0);
                     self.fade_quads(&mut cap, 2, self.cg_cap_guide);
-                    let rt = self.cg_rt.get_or_insert_with(|| r.create_target(CANVAS_W, CANVAS_H, "cg capture").tex).clone();
-                    game.ui_passes.push((knife_render::RenderTarget { tex: rt.clone() }, Some([0.0, 0.0, 0.0, 1.0]), cap));
+                    self.cg_rt.take_if(|t| !r.canvas_fits(t, CANVAS_W, CANVAS_H));
+                    let rt = self.cg_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "cg capture").tex).clone();
+                    game.ui_passes.push((knife_render::RenderTarget::with_units(rt.clone(), [W, H]), Some([0.0, 0.0, 0.0, 1.0]), cap));
                     let mut q = Quad::rect(rt, [0.0, 0.0, W, H], [1.0; 4]);
                     q.rule = game
                         .assets

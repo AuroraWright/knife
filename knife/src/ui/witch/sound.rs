@@ -794,8 +794,9 @@ impl Ui {
         // 320 units from x - 64 into surface 1, added through surface 0 at half the title's alpha (jp_B2900)
         let light_x = self.w.snd.light_x;
         if fade >= 1.0 && title_a > 0.0 {
+            self.w.snd.rt.take_if(|t| !r.canvas_fits(&t[0], W as u32, H as u32));
             let [mask_rt, light_rt] = self.w.snd.rt.get_or_insert_with(|| {
-                let mk = |l| r.create_target(W as u32, H as u32, l).tex;
+                let mk = |l| r.create_canvas_target(W as u32, H as u32, l).tex;
                 [mk("sound light mask"), mk("sound light")]
             });
             let (mask_rt, light_rt) = (mask_rt.clone(), light_rt.clone());
@@ -818,8 +819,8 @@ impl Ui {
             let mut m = Quad::rect(mask_rt.clone(), [0.0, 0.0, W, H], [1.0; 4]);
             m.blend = Blend::MaskAlpha;
             light.push(m);
-            game.ui_passes.push((RenderTarget { tex: mask_rt }, Some([0.0; 4]), mask));
-            game.ui_passes.push((RenderTarget { tex: light_rt.clone() }, Some([0.0; 4]), light));
+            game.ui_passes.push((RenderTarget::with_units(mask_rt, [W, H]), Some([0.0; 4]), mask));
+            game.ui_passes.push((RenderTarget::with_units(light_rt.clone(), [W, H]), Some([0.0; 4]), light));
             let mut q = Quad::rect(light_rt, [0.0, 0.0, W, H], [1.0, 1.0, 1.0, title_a * 0.5]);
             q.shade = Shade::Fill;
             q.blend = Blend::Add;
