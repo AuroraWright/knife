@@ -1354,8 +1354,8 @@ impl Game {
         if self.assets.build == Build::Witch {
             self.witch_duck(dt);
         }
-        for _ in 0..self.speed.max(1) {
-            self.update_step(r, dt);
+        for i in 0..self.speed.max(1) {
+            self.update_step(r, dt, i == 0);
         }
         if !self.paused {
             self.step_read_fades(dt);
@@ -1404,7 +1404,9 @@ impl Game {
         }
     }
 
-    fn update_step(&mut self, r: &Renderer, dt: f32) {
+    /// One of the frame's `speed` steps; `first`: the frame's first, which also steps what the exe updates once
+    /// a frame whatever the speed (the choice, sub_81B30 -> sub_83E50; the TeaTime menu, sub_745E0).
+    fn update_step(&mut self, r: &Renderer, dt: f32, first: bool) {
         self.time += dt;
         self.sound.update();
         if self.paused {
@@ -1497,8 +1499,10 @@ impl Game {
                 _ => self.page.revealed = self.page.order as f32,
             }
         }
-        self.update_choice(dt);
-        self.update_teatime(dt);
+        if first {
+            self.update_choice(dt);
+            self.update_teatime(dt);
+        }
 
         // movie
         if let Some(m) = &mut self.movie {
