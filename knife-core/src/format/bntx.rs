@@ -141,22 +141,24 @@ pub fn deswizzle(src: &[u8], width_blocks: u32, height_blocks: u32, bpb: u32, bl
     // BRTI stores the block height actually used for mip 0, so no adjustment here.
     let width_gobs = row_bytes.div_ceil(64);
     let bh = block_height as usize;
-    for y in 0..height_blocks as usize {
-        let gob_row_base = (y / (8 * bh)) * 512 * bh * width_gobs + ((y % (8 * bh)) / 8) * 512;
-        let yy = y % 8;
-        let y_part = (yy / 2) * 64 + (yy % 2) * 16;
-        for xb in 0..width_blocks as usize {
-            let x_bytes = xb * bpb as usize;
-            // all formats used have bpb in {1,4,8,16}, so a block never straddles 16-byte lines
-            let gob = gob_row_base + (x_bytes / 64) * 512 * bh;
-            let x = x_bytes % 64;
-            let off = gob + (x / 32) * 256 + y_part + ((x % 32) / 16) * 32 + (x % 16);
-            let dst = y * row_bytes + x_bytes;
-            let n = bpb as usize;
-            if off + n <= src.len() {
-                out[dst..dst + n].copy_from_slice(&src[off..off + n]);
+    crate::par::rows(&mut out, row_bytes, |first, band| {
+        for (i, row) in band.chunks_mut(row_bytes).enumerate() {
+            let y = first + i;
+            let gob_row_base = (y / (8 * bh)) * 512 * bh * width_gobs + ((y % (8 * bh)) / 8) * 512;
+            let yy = y % 8;
+            let y_part = (yy / 2) * 64 + (yy % 2) * 16;
+            for xb in 0..width_blocks as usize {
+                let x_bytes = xb * bpb as usize;
+                // all formats used have bpb in {1,4,8,16}, so a block never straddles 16-byte lines
+                let gob = gob_row_base + (x_bytes / 64) * 512 * bh;
+                let x = x_bytes % 64;
+                let off = gob + (x / 32) * 256 + y_part + ((x % 32) / 16) * 32 + (x % 16);
+                let n = bpb as usize;
+                if off + n <= src.len() {
+                    row[x_bytes..x_bytes + n].copy_from_slice(&src[off..off + n]);
+                }
             }
         }
-    }
+    });
     out
 }

@@ -58,20 +58,19 @@ pub enum Pixels {
     Baked(u32, u32, Vec<u8>),
 }
 
-/// An image `Assets::decode_async` read on a worker thread.
-pub struct Decoded {
-    key: String,
+/// An image `Assets::prefetch` is reading on a worker thread: its name, language strip, and where the pixels
+/// arrive.
+struct Decoding {
     name: String,
     strip: Option<(usize, usize)>,
-    pixels: Result<Pixels>,
+    pixels: std::sync::mpsc::Receiver<Result<Pixels>>,
 }
 
-impl Decoded {
-    /// The image's cache key (`Assets::image_key`).
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-}
+/// How many of the latest cached images `Assets::trim_images` keeps unreferenced (prefetched ones waiting for
+/// their command).
+const FRESH_IMAGES: usize = 64;
+/// How many prefetched images `Assets::finish_prefetched` uploads a frame.
+const UPLOADS_PER_FRAME: usize = 2;
 
 /// The game data folders: `--assets-dir`, and `--mod-assets` when there is one, whose files take the place of
 /// the game data's at the same relative path.
@@ -117,10 +116,16 @@ pub struct Assets {
     image_index: HashMap<String, usize>,
     pub scenes: SceneArchive,
     pub text: ScriptText,
-    pub sar: SoundArchive,
+    pub sar: Arc<SoundArchive>,
     parsed: HashMap<usize, Arc<Scene>>,
     images: HashMap<String, Option<Arc<Image>>>,
+    /// the images `prefetch` is decoding, by cache key
+    decoding: HashMap<String, Decoding>,
+    /// the most recently cached images, which `trim_images` keeps for the commands that asked ahead for them
+    fresh: std::collections::VecDeque<String>,
     sounds: HashMap<String, Option<Arc<Pcm>>>,
+    /// the sound effects `prefetch_sound` is decoding, by cache key
+    sounds_decoding: HashMap<String, std::sync::mpsc::Receiver<Result<Pcm>>>,
 }
 
 /// The build a romfs belongs to: the overseas data names its archives `w_allpac` / `w_allui` / ... (sub_AE050),
@@ -252,10 +257,13 @@ impl Assets {
             tables,
             image_index,
             scenes,
-            sar,
+            sar: Arc::new(sar),
             parsed: HashMap::new(),
             images: HashMap::new(),
+            decoding: HashMap::new(),
+            fresh: Default::default(),
             sounds: HashMap::new(),
+            sounds_decoding: HashMap::new(),
         };
         crate::text::set_line_break(a.tables.line_break.clone());
         OVERSEAS.store(a.build == Build::Overseas, std::sync::atomic::Ordering::Relaxed);
@@ -475,6 +483,13 @@ impl Assets {
         if let Some(i) = self.images.get(&key) {
             return i.clone();
         }
+        // one already on its way: wait for it rather than read it again
+        if let Some(d) = self.decoding.remove(&key)
+            && d.strip == self.strip(&name)
+            && let Ok(pixels) = d.pixels.recv()
+        {
+            return self.finish_image(r, key, &name, pixels);
+        }
         let pixels = Self::decode_pixels(&self.image_archives(), &name, grade, self.strip(&name));
         self.finish_image(r, key, &name, pixels)
     }
@@ -492,26 +507,58 @@ impl Assets {
         self.images.contains_key(&Self::image_key(name, bake).2)
     }
 
-    /// Read and decode an image for `image_graded` on a worker thread; the result arrives on `done`, for
-    /// `finish_decoded` to upload and cache. Returns the cache key.
-    pub fn decode_async(&self, name: &str, bake: Bake, done: std::sync::mpsc::Sender<Decoded>) {
+    /// Start reading and decoding an image for `image_graded` on a worker thread, unless it is cached or on
+    /// its way; `finish_prefetched` uploads and caches it once decoded, or `image_graded` waits for it.
+    pub fn prefetch(&mut self, name: &str, bake: Bake) {
         let (name, grade, k) = Self::image_key(name, bake);
+        if self.images.contains_key(&k) || self.decoding.contains_key(&k) {
+            return;
+        }
         let archives = self.image_archives();
         let strip = self.strip(&name);
+        let (done, pixels) = std::sync::mpsc::channel();
+        let job = name.clone();
         let spawned = std::thread::Builder::new().name("image decode".into()).spawn(move || {
-            let pixels = Self::decode_pixels(&archives, &name, grade, strip);
-            let _ = done.send(Decoded { key: k, name, strip, pixels });
+            let _ = done.send(Self::decode_pixels(&archives, &job, grade, strip));
         });
-        if let Err(e) = spawned {
-            tracing::warn!("image decode thread: {e}");
+        match spawned {
+            Ok(_) => {
+                self.decoding.insert(k, Decoding { name, strip, pixels });
+            }
+            Err(e) => tracing::warn!("image decode thread: {e}"),
         }
     }
 
-    /// Upload and cache an image `decode_async` read.
-    pub fn finish_decoded(&mut self, r: &Renderer, d: Decoded) {
-        // a language change while it decoded makes a language-strip image stale
-        if !self.images.contains_key(&d.key) && d.strip == self.strip(&d.name) {
-            self.finish_image(r, d.key, &d.name, d.pixels);
+    /// Upload and cache the prefetched images (and cache the sound effects) that have been decoded.
+    pub fn finish_prefetched(&mut self, r: &Renderer) {
+        let mut sounds = Vec::new();
+        self.sounds_decoding.retain(|k, d| match d.try_recv() {
+            Ok(res) => {
+                sounds.push((k.clone(), res));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (k, res) in sounds {
+            self.cache_sound(&k.clone(), k, res);
+        }
+        // a few uploads a frame (a command that needs one sooner takes it at once, `image_graded`)
+        let mut done = Vec::new();
+        self.decoding.retain(|k, d| match (done.len() < UPLOADS_PER_FRAME).then(|| d.pixels.try_recv()) {
+            None => true,
+            Some(Ok(pixels)) => {
+                done.push((k.clone(), d.name.clone(), d.strip, pixels));
+                false
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => true,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => false,
+        });
+        for (k, name, strip, pixels) in done {
+            // a language change while it decoded makes a language-strip image stale
+            if strip == self.strip(&name) {
+                self.finish_image(r, k, &name, pixels);
+            }
         }
     }
 
@@ -523,6 +570,10 @@ impl Assets {
                 None
             }
         };
+        self.fresh.push_back(key.clone());
+        if self.fresh.len() > FRESH_IMAGES {
+            self.fresh.pop_front();
+        }
         self.images.insert(key, img.clone());
         img
     }
@@ -532,7 +583,8 @@ impl Assets {
         if self.images.len() <= keep {
             return;
         }
-        self.images.retain(|_, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1));
+        let fresh = &self.fresh;
+        self.images.retain(|k, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1) || fresh.contains(k));
     }
 
     /// The (strip, strip count) an image draws: a language-strip image (overseas ImageInfo +67 bit 1) stacks
@@ -846,11 +898,42 @@ impl Assets {
         if let Some(s) = self.sounds.get(&key) {
             return s.clone();
         }
-        let res = self
-            .sar
-            .load_wave_sound(&format!("wsd_{key}"))
-            .or_else(|_| self.sar.load_wave_sound(&key))
-            .or_else(|_| self.load_stream_file(&format!("stream/{name}.opus")));
+        // one already on its way: wait for it rather than decode it again
+        let res = match self.sounds_decoding.remove(&key).and_then(|d| d.recv().ok()) {
+            Some(res) => res,
+            None => Self::read_sound(&self.sar, &self.path(format!("stream/{name}.opus")), &key),
+        };
+        self.cache_sound(name, key, res)
+    }
+
+    /// Start decoding a sound effect for `sound_effect` on a worker thread, unless it is cached or on its way.
+    pub fn prefetch_sound(&mut self, name: &str) {
+        let key = name.to_ascii_lowercase();
+        if self.sounds.contains_key(&key) || self.sounds_decoding.contains_key(&key) {
+            return;
+        }
+        let (sar, stream, job) = (self.sar.clone(), self.path(format!("stream/{name}.opus")), key.clone());
+        let (done, pcm) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("sound decode".into()).spawn(move || {
+            let _ = done.send(Self::read_sound(&sar, &stream, &job));
+        });
+        match spawned {
+            Ok(_) => {
+                self.sounds_decoding.insert(key, pcm);
+            }
+            Err(e) => tracing::warn!("sound decode thread: {e}"),
+        }
+    }
+
+    /// A sound effect: the wave sound `wsd_<name>` or `<name>` of the sound archive, else the stream file.
+    fn read_sound(sar: &SoundArchive, stream: &Path, key: &str) -> Result<Pcm> {
+        sar.load_wave_sound(&format!("wsd_{key}")).or_else(|_| sar.load_wave_sound(key)).or_else(|_| {
+            let data = std::fs::read(stream).with_context(|| format!("reading {}", stream.display()))?;
+            codec::decode_nopus(&data)
+        })
+    }
+
+    fn cache_sound(&mut self, name: &str, key: String, res: Result<Pcm>) -> Option<Arc<Pcm>> {
         let pcm = match res {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {

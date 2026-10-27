@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0.104"
 tracing = "0.1.44"
-flate2 = "1.0.35"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9.5"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 clap = { version = "4.6.7", features = ["derive"] }

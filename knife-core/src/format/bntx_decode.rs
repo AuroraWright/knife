@@ -20,12 +20,14 @@ pub fn to_rgba8(t: &Texture) -> Result<Vec<u8>> {
         // single channel -> grey RGBA
         let pitch = wb * 4;
         let mut r8 = vec![0u8; pitch * hb * 4];
-        for by in 0..hb {
-            for bx in 0..wb {
-                let src = &t.data[(by * wb + bx) * 8..][..8];
-                bcdec_rs::bc4(src, &mut r8[by * 4 * pitch + bx * 4..], pitch, false);
+        crate::par::rows(&mut r8, pitch * 4, |first, band| {
+            for (i, row) in band.chunks_mut(pitch * 4).enumerate() {
+                for bx in 0..wb {
+                    let src = &t.data[((first + i) * wb + bx) * 8..][..8];
+                    bcdec_rs::bc4(src, &mut row[bx * 4..], pitch, false);
+                }
             }
-        }
+        });
         let mut out = Vec::with_capacity(w * h * 4);
         for y in 0..h {
             out.extend(r8[y * pitch..y * pitch + w].iter().flat_map(|&v| [v, v, v, 255]));
@@ -34,17 +36,19 @@ pub fn to_rgba8(t: &Texture) -> Result<Vec<u8>> {
     }
     let pitch = wb * 4 * 4;
     let mut full = vec![0u8; pitch * hb * 4];
-    for by in 0..hb {
-        for bx in 0..wb {
-            let src = &t.data[(by * wb + bx) * bpb as usize..][..bpb as usize];
-            let dst = &mut full[by * 4 * pitch + bx * 16..];
-            match t.format {
-                TexFormat::Bc1Srgb | TexFormat::Bc1Unorm => bcdec_rs::bc1(src, dst, pitch),
-                TexFormat::Bc3Srgb | TexFormat::Bc3Unorm => bcdec_rs::bc3(src, dst, pitch),
-                _ => bcdec_rs::bc7(src, dst, pitch),
+    crate::par::rows(&mut full, pitch * 4, |first, band| {
+        for (i, row) in band.chunks_mut(pitch * 4).enumerate() {
+            for bx in 0..wb {
+                let src = &t.data[((first + i) * wb + bx) * bpb as usize..][..bpb as usize];
+                let dst = &mut row[bx * 16..];
+                match t.format {
+                    TexFormat::Bc1Srgb | TexFormat::Bc1Unorm => bcdec_rs::bc1(src, dst, pitch),
+                    TexFormat::Bc3Srgb | TexFormat::Bc3Unorm => bcdec_rs::bc3(src, dst, pitch),
+                    _ => bcdec_rs::bc7(src, dst, pitch),
+                }
             }
         }
-    }
+    });
     // crop to the real size
     let mut out = Vec::with_capacity(w * h * 4);
     for y in 0..h {

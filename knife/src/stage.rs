@@ -122,6 +122,9 @@ pub struct Layer {
     pub stec_color: [f32; 3],
     /// Replaces a shown layer with the same image: its texture is kept as built
     pub keeps_texture: bool,
+    /// An STEC / SNX2 / SNX3 changed `bake` since the texture was built: the commit builds it again
+    /// (`Game::build_textures`)
+    pub regrade: bool,
     pub motion: Option<MotionState>,
     pub motion_alpha: f32,
     pub motion_zoom: (f32, f32),
@@ -981,6 +984,7 @@ impl Layer {
             wquake: WitchQuake::default(),
             snx: [1.0; 2],
             snx4: [0.0; 2],
+            regrade: false,
             wfade: [255, 0],
             wfade_ease: 0,
             haze: Haze::default(),

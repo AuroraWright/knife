@@ -220,6 +220,8 @@ const UY: f32 = CANVAS_H as f32 / 448.0;
 pub const PREVIEW_SIZE: (u32, u32) = (248, 140);
 /// The preview render target ("thumbnail surface", sub_A5C10), the stage scaled by 256 / 1920
 const PREVIEW_TARGET: (u32, u32) = (256, 144);
+/// How many commands ahead `Game::prefetch_images` reads the images while skipping.
+const PREFETCH_SKIP: usize = 240;
 /// Message window types (stage word F1105, sub_391A0): image slot and origin in 1280x720 units
 /// (unk_34D94C). Types 0..2 are the full screen windows (DISP txtwindow01..03), 3..32 the QA corner bubbles
 /// (DISP 39..68, the "b" textures for even types).
@@ -806,13 +808,6 @@ pub struct Game {
     /// (slot, layers, overseas sub_86840 picture)
     preview_queue: Vec<(usize, Vec<Option<crate::save::LayerSave>>, Option<String>)>,
     preview_rt: Option<RenderTarget>,
-    /// images the queued previews need, read and decoded on worker threads so opening the save list does
-    /// not stall on large stage images (cache keys in flight, and where they arrive)
-    preview_decoding: std::collections::HashSet<String>,
-    preview_decoded: (std::sync::mpsc::Sender<crate::assets::Decoded>, std::sync::mpsc::Receiver<crate::assets::Decoded>),
-    /// the script's image look-ahead (`prefetch_images`): cache keys in flight, and where they arrive
-    prefetching: std::collections::HashSet<String>,
-    prefetched: (std::sync::mpsc::Sender<crate::assets::Decoded>, std::sync::mpsc::Receiver<crate::assets::Decoded>),
     /// Target 0's bucket-1 draws (the stage, the FADE(40) effect, the FCLN effect): what a FADS captures
     scene_rt: RenderTarget,
     old_rt: RenderTarget,
@@ -1069,10 +1064,6 @@ impl Game {
             previews: Default::default(),
             preview_queue: Vec::new(),
             preview_rt: None,
-            preview_decoding: Default::default(),
-            preview_decoded: std::sync::mpsc::channel(),
-            prefetching: Default::default(),
-            prefetched: std::sync::mpsc::channel(),
             scene_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "scene"),
             old_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "old frame"),
             blur_rt: r.create_canvas_target(CANVAS_W, CANVAS_H, "blur"),
@@ -1123,7 +1114,8 @@ impl Game {
     /// Present the stage (sub_5D3A0; Witch on the Holy Night's sub_3E130). Witch on the Holy Night's commit is
     /// also where an image counts as seen: every layer's image word (and stage word 0, never set) through
     /// jp_644A0, below 3200; its STCH marks nothing.
-    fn commit_stage(&mut self) {
+    fn commit_stage(&mut self, r: &Renderer) {
+        self.build_textures(r);
         self.stage.commit();
         if crate::assets::witch() {
             let names: Vec<String> = self.stage.layers.iter().flatten().map(|l| l.name.clone()).collect();
@@ -1624,7 +1616,7 @@ impl Game {
         // runs in one frame
         // overseas sub_40ED0: while off_3516E0 is set, sub_802C0 is not called; its last frame runs sub_7DDA0
         if std::mem::take(&mut self.seek_defer) {
-            self.seek_finish();
+            self.seek_finish(r);
             return;
         }
         if self.skip && !self.seek_node && self.wait == Wait::None && !self.ended {
@@ -1676,7 +1668,7 @@ impl Game {
         // sub_802C0: a stage an STCH / SCH2 changed with no FADS after it is presented as the dispatch returns
         // (sub_5D3A0(0, 0): sub_2E1B0(0, 0) ends any transition)
         if std::mem::take(&mut self.stage_dirty) && !self.seek_node {
-            self.commit_stage();
+            self.commit_stage(r);
             self.trans = None;
             if self.wait == Wait::Transition {
                 self.wait = Wait::None;
@@ -1686,7 +1678,7 @@ impl Game {
             if self.assets.build == knife_core::exe::Build::Overseas {
                 self.seek_defer = true;
             } else {
-                self.seek_finish();
+                self.seek_finish(r);
             }
         }
         // sub_391A0 (the message layer's draw) clears the page (sub_53AB0(1)) in page mode while F823 == 0: the
@@ -1700,39 +1692,94 @@ impl Game {
     /// sub_802C0 after each dispatch: sub_6F4D0(…, 24) queues the images the next 24 commands use into
     /// off_AE0990 and sub_AC420 loads them, so an STCH finds its image loaded (no stall at the command). knife reads and decodes the STCH /
     /// SCH2 images (the `_aa_bb` variant when it exists, else the base, as `cmd_stch` takes them) on worker
-    /// threads and uploads them as they arrive; one not ready yet still loads at the command.
+    /// threads and uploads them as they arrive; one not ready yet is waited for at the command. Each STCH /
+    /// SCH2 layer's STEC / SNX2 / SNX3 are followed to the next FADS, whose commit builds the graded image
+    /// (`build_textures`), so that build is read ahead too. A skip runs through the 24 commands within a frame
+    /// or two: then the look-ahead reaches `PREFETCH_SKIP` commands.
     fn prefetch_images(&mut self, r: &Renderer) {
-        while let Ok(d) = self.prefetched.1.try_recv() {
-            self.prefetching.remove(d.key());
-            self.assets.finish_decoded(r, d);
-        }
+        self.assets.finish_prefetched(r);
         if self.seek_node {
             return;
         }
         let none = crate::grade::Bake::NONE;
-        let end = (self.pc + 24).min(self.script.commands.len());
-        let mut names = Vec::new();
-        for c in self.script.commands.get(self.pc..end).unwrap_or_default() {
-            if !matches!(c.name.as_str(), "STCH" | "SCH2") {
-                continue;
+        let span = if self.skip { PREFETCH_SKIP } else { 24 };
+        let end = (self.pc + span).min(self.script.commands.len());
+        let mut want = Vec::new();
+        // each layer's image and grade (STEC mode, SNX2 / SNX3) as the commands ahead leave them
+        let mut grades: HashMap<i32, (String, i32, [f32; 2])> = HashMap::new();
+        let graded = |want: &mut Vec<(String, crate::grade::Bake)>, (name, mode, snx): (String, i32, [f32; 2])| {
+            let bake = crate::grade::Bake::new(mode, snx[0], snx[1]);
+            if bake.cpu() {
+                want.push((name, bake));
             }
-            let Some(base) = c.arg(1).filter(|b| !b.is_empty() && !b.eq_ignore_ascii_case("BLACK") && !b.eq_ignore_ascii_case("WHITE")) else {
-                continue;
-            };
-            let variant = match (c.int(9), c.int(10)) {
-                (Some(a), Some(b)) if (a, b) != (0, 0) => Some(format!("{base}_{a:02}_{b:02}")),
-                _ => None,
-            };
-            let known = |n: &str| self.assets.image_index_of(&n.to_ascii_uppercase()).is_some();
-            let name = variant.filter(|v| known(v)).unwrap_or_else(|| base.to_string());
-            if known(&name) && !self.assets.image_cached(&name, none) {
-                names.push(name);
+        };
+        for c in self.script.commands.get(self.pc..end).unwrap_or_default() {
+            let li = c.int_or(0, -1);
+            match c.name.as_str() {
+                "STCH" | "SCH2" => {
+                    grades.remove(&li);
+                    let Some(base) = c.arg(1).filter(|b| !b.is_empty() && !b.eq_ignore_ascii_case("BLACK") && !b.eq_ignore_ascii_case("WHITE")) else {
+                        continue;
+                    };
+                    let variant = match (c.int(9), c.int(10)) {
+                        (Some(a), Some(b)) if (a, b) != (0, 0) => Some(format!("{base}_{a:02}_{b:02}")),
+                        _ => None,
+                    };
+                    let known = |n: &str| self.assets.image_index_of(&n.to_ascii_uppercase()).is_some();
+                    let name = variant.filter(|v| known(v)).unwrap_or_else(|| base.to_string());
+                    if !known(&name) {
+                        continue;
+                    }
+                    want.push((name.clone(), none));
+                    // a source layer (SCH2 arg 18) brings its grade along; the layer is new otherwise (`cmd_stch`)
+                    let (mode, snx) = match c.int(18).filter(|&s| s >= 0) {
+                        Some(s) => grades.get(&s).map(|g| (g.1, g.2)).unwrap_or_else(|| {
+                            self.stage.layers.get(s as usize).cloned().flatten().map_or((0, [1.0; 2]), |l| (l.stec_mode, l.snx))
+                        }),
+                        None => (0, [1.0; 2]),
+                    };
+                    grades.insert(li, (name, mode, snx));
+                }
+                "STEC" => {
+                    let mode = c.int_or(1, 0);
+                    if let Some(g) = grades.get_mut(&li)
+                        && (0..=82).contains(&mode)
+                    {
+                        g.1 = mode;
+                    }
+                }
+                // as the exec reads them (brightness 1 + v / 255, contrast 1 + v / 100)
+                "SNX2" | "SNX3" => {
+                    if let Some(g) = grades.get_mut(&li) {
+                        let v = c.int(1).map_or(1.0, |v| if c.name == "SNX2" { 1.0 + v as f32 / 255.0 } else { 1.0 + v as f32 * 0.01 });
+                        g.2[usize::from(c.name == "SNX3")] = v;
+                    }
+                }
+                "FADS" => {
+                    for (_, g) in grades.drain() {
+                        graded(&mut want, g);
+                    }
+                }
+                // the sound effects too (`cmd_se`; a skip plays only the loops)
+                "SEPL" if !self.skip || c.int_or(1, 0) == 1 => {
+                    if let Some(n) = c.arg(2) {
+                        self.assets.prefetch_sound(n);
+                    }
+                }
+                "SEAC" if !self.skip => {
+                    if let Some(n) = c.arg(1) {
+                        self.assets.prefetch_sound(n);
+                    }
+                }
+                _ => {}
             }
         }
-        for name in names {
-            if self.prefetching.insert(crate::assets::Assets::image_key(&name, none).2) {
-                self.assets.decode_async(&name, none, self.prefetched.0.clone());
-            }
+        // a commit past the look-ahead: the grades as they stand so far
+        for (_, g) in grades.drain() {
+            graded(&mut want, g);
+        }
+        for (name, bake) in want {
+            self.assets.prefetch(&name, bake);
         }
     }
 
@@ -1755,7 +1802,7 @@ impl Game {
         let mode = c.int_or(0, 1);
         let dur = c.int_or(1, 0) as f32;
         let rule = c.int_or(2, 0);
-        self.commit_stage();
+        self.commit_stage(r);
         self.stage_dirty = false;
         // sub_60610 pushes a type 1 ring entry (sub_5A910(.., 1); Witch on the Holy Night's jp_60610 too), then
         // copies the committed stage into the backup (Switch: AE0460 steps in the frame AE04B8 gets 8, so a held
@@ -1911,13 +1958,13 @@ impl Game {
     /// stays): sub_32C10 zeroes every layer's position and alpha tween offsets, so those land while their
     /// progress runs on (rotation keeps its offset); the stage is presented without a transition
     /// (sub_5D3A0(0, -1)), which lands each zoom tween too.
-    fn seek_finish(&mut self) {
+    fn seek_finish(&mut self, r: &Renderer) {
         for l in self.stage.layers.iter_mut().flatten() {
             l.x.diff = 0.0;
             l.y.diff = 0.0;
             l.alpha.diff = 0.0;
         }
-        self.commit_stage();
+        self.commit_stage(r);
         self.trans = None;
         if self.wait == Wait::Transition {
             self.wait = Wait::None;
@@ -2985,7 +3032,7 @@ impl Game {
                             _ => l.fill = None,
                         }
                     }
-                    self.rebake(r, c.int_or(0, -1));
+                    self.rebake(c.int_or(0, -1));
                 }
             }
             // STBR(layer = 0, mode = 0, override) (sub_62490): a non-negative arg 2 replaces the mode; stage byte 124,
@@ -3066,7 +3113,7 @@ impl Game {
                     None => {
                         self.snapshot = true;
                         if self.stage.layers.iter().flatten().any(|l| l.pending) {
-                            self.commit_stage();
+                            self.commit_stage(r);
                             self.stage_dirty = false;
                             self.trans = Some(Transition::hold());
                             self.fads = Some(Fads { hold: 1, started: false });
@@ -3395,7 +3442,7 @@ impl Game {
                 };
                 if let Some(l) = self.stage.get(li) {
                     l.snx[k] = v;
-                    self.rebake(r, li);
+                    self.rebake(li);
                 }
             }
             // STRR(layer = 0, r) (sub_633D0): the clip rotation its children are composited with; -99999 stores
@@ -4524,10 +4571,9 @@ impl Game {
                 l.snx4 = p.snx4;
                 if p.bake.cpu()
                     && let Source::Image(_) = l.source
-                    && let Some(img) = self.assets.image_graded(r, &l.name, p.bake)
                 {
-                    l.source = Source::Image(img);
                     l.bake = p.bake;
+                    l.regrade = true;
                 }
             }
         }
@@ -4645,6 +4691,7 @@ impl Game {
                         l.fill = None;
                         l.shade = Shade::Sprite;
                         l.bake = crate::grade::Bake::NONE;
+                        l.regrade = false;
                     }
                     l
                 }
@@ -4663,7 +4710,7 @@ impl Game {
             l.stec_mode = stec;
             l.stec_color = if stec == 1 { [0.0; 3] } else { [1.0; 3] };
             self.stage.set(slot, l);
-            self.rebake(r, slot);
+            self.rebake(slot);
         }
         self.stage_dirty = true;
     }
@@ -6418,7 +6465,7 @@ impl Game {
         self.assets.image_index_of(&name).map(|_| name)
     }
 
-    fn rebake(&mut self, r: &Renderer, li: i32) {
+    fn rebake(&mut self, li: i32) {
         let Some(l) = self.stage.get(li) else { return };
         if !l.pending || l.keeps_texture {
             return;
@@ -6429,10 +6476,28 @@ impl Game {
         }
         if bake != l.bake {
             l.bake = bake;
-            if let Source::Image(_) = l.source
-                && let Some(img) = self.assets.image_graded(r, &l.name, bake)
-            {
-                l.source = Source::Image(img);
+            // the texture is built with it at the commit (sub_3C970 -> sub_3ECC0), after any further STEC /
+            // SNX2 / SNX3 on the layer
+            l.regrade = matches!(l.source, Source::Image(_));
+        }
+    }
+
+    /// The commit's texture builds (sub_3C970 -> sub_3ECC0): each layer an STEC / SNX2 / SNX3 regraded gets its
+    /// image built with the grade, the images decoding side by side.
+    fn build_textures(&mut self, r: &Renderer) {
+        let want: Vec<(usize, String, crate::grade::Bake)> = (self.stage.layers.iter().enumerate())
+            .filter_map(|(i, l)| l.as_ref().filter(|l| l.regrade).map(|l| (i, l.name.clone(), l.bake)))
+            .collect();
+        for (_, name, bake) in &want {
+            self.assets.prefetch(name, *bake);
+        }
+        for (i, name, bake) in want {
+            let img = self.assets.image_graded(r, &name, bake);
+            if let Some(l) = self.stage.layers[i].as_mut() {
+                l.regrade = false;
+                if let Some(img) = img {
+                    l.source = Source::Image(img);
+                }
             }
         }
     }
@@ -6587,10 +6652,7 @@ impl Game {
     /// `PREVIEW_SIZE`.
     /// A preview waits until the worker threads have decoded the images it is missing.
     fn render_previews(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
-        while let Ok(d) = self.preview_decoded.1.try_recv() {
-            self.preview_decoding.remove(d.key());
-            self.assets.finish_decoded(r, d);
-        }
+        self.assets.finish_prefetched(r);
         if self.preview_queue.is_empty() {
             return;
         }
@@ -6615,9 +6677,7 @@ impl Game {
                     continue;
                 }
                 waiting = true;
-                if self.preview_decoding.insert(crate::assets::Assets::image_key(name, bake).2) {
-                    self.assets.decode_async(name, bake, self.preview_decoded.0.clone());
-                }
+                self.assets.prefetch(name, bake);
             }
             if waiting {
                 self.preview_queue.push((slot, layers, pic));
@@ -6775,7 +6835,7 @@ impl Game {
         if self.assets.build == Build::Witch {
             self.stage.backdrop = u8::from(!crate::savedata::witch_dark_scene(d.scene));
         }
-        self.commit_stage();
+        self.commit_stage(r);
         // sub_5BAF0: the SE channels' volume and pan words and their queued key-68 ops come back (a record
         // without them: the reset words, 100 / centre, with the loops' volumes)
         self.sound.se_word = [100; 20];

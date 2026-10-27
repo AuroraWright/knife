@@ -331,23 +331,27 @@ impl Bake {
         if p.as_ref().is_some_and(|p| p.grey) {
             // the grey (54 R + 183 G + 19 B) / 256 is a float now: tabulate on a 1/256-level grid and interpolate
             let lut: Vec<[f32; 3]> = (0..=255 * 256).map(|k| last([k as f32 / 256.0; 3])).collect();
-            for q in px.as_chunks_mut::<4>().0 {
-                let g = (pre[usize::from(q[0])] * 54.0 + pre[usize::from(q[1])] * 183.0 + pre[usize::from(q[2])] * 19.0)
-                    / 256.0
-                    * 256.0;
-                let k = (g as usize).min(lut.len() - 2);
-                let f = g - k as f32;
-                for c in 0..3 {
-                    q[c] = srgb_byte(lut[k][c] + (lut[k + 1][c] - lut[k][c]) * f);
+            knife_core::par::rows(px, 4, |_, band| {
+                for q in band.as_chunks_mut::<4>().0 {
+                    let g = (pre[usize::from(q[0])] * 54.0 + pre[usize::from(q[1])] * 183.0 + pre[usize::from(q[2])] * 19.0)
+                        / 256.0
+                        * 256.0;
+                    let k = (g as usize).min(lut.len() - 2);
+                    let f = g - k as f32;
+                    for c in 0..3 {
+                        q[c] = srgb_byte(lut[k][c] + (lut[k + 1][c] - lut[k][c]) * f);
+                    }
                 }
-            }
+            });
         } else {
             let lut: Vec<[u8; 3]> = pre.iter().map(|&x| last([x; 3]).map(srgb_byte)).collect();
-            for q in px.as_chunks_mut::<4>().0 {
-                for c in 0..3 {
-                    q[c] = lut[usize::from(q[c])][c];
+            knife_core::par::rows(px, 4, |_, band| {
+                for q in band.as_chunks_mut::<4>().0 {
+                    for c in 0..3 {
+                        q[c] = lut[usize::from(q[c])][c];
+                    }
                 }
-            }
+            });
         }
     }
 
