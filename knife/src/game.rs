@@ -3730,7 +3730,7 @@ impl Game {
     }
 
     pub fn play_movie(&mut self, r: &Renderer, name: &str) {
-        let path = self.assets.romfs.join(format!("movie/{name}.mp4"));
+        let path = self.assets.path(format!("movie/{name}.mp4"));
         match crate::movie::Movie::open(r, &path, false) {
             Ok(m) => {
                 if let Some(pcm) = crate::movie::decode_audio(&path) {
@@ -3774,7 +3774,7 @@ impl Game {
     /// Title movie titlebg`n` (sub_17C0(n - 1, 0, 1)), n = `title_bg`.
     pub fn play_title_movie(&mut self, r: &Renderer) {
         let n = self.title_bg();
-        let path = self.assets.romfs.join(format!("movie/titlebg{n}.mp4"));
+        let path = self.assets.path(format!("movie/titlebg{n}.mp4"));
         match crate::movie::Movie::open(r, &path, true) {
             // sub_8E200 state 1: sub_1C20(flt_34DCD0[stage] / 30), 240 frames for every stage
             Ok(mut m) => {
@@ -3909,7 +3909,7 @@ impl Game {
         }
         match self.assets.sar.stream_sound(n as usize - 1) {
             Ok(s) => {
-                let path = self.assets.romfs.join(&s.path);
+                let path = self.assets.path(&s.path);
                 self.sound.play_bgm(n, vol, fade, start, path, s.loop_range);
             }
             Err(e) => tracing::warn!("MPLY {n}: {e:#}"),
@@ -5042,7 +5042,7 @@ impl Game {
     /// (of `<folder>3`), each with the exfont runs (exfont_nx01.bffnt).
     pub fn load_fonts(assets: &Assets, r: &Renderer) -> anyhow::Result<(FontAtlas, Option<FontAtlas>)> {
         use anyhow::Context as _;
-        let exfont = std::fs::read(assets.romfs.join("exfont_nx01.bffnt"));
+        let exfont = std::fs::read(assets.path("exfont_nx01.bffnt"));
         if let Err(e) = &exfont {
             tracing::warn!("exfont: {e}");
         }

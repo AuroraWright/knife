@@ -15,7 +15,7 @@ use super::Cli;
 pub const FILE_NAME: &str = "knife.ini";
 
 /// Options whose relative values resolve against the ini's folder rather than the working directory.
-const PATH_OPTIONS: &[&str] = &["assets-dir", "save-file"];
+const PATH_OPTIONS: &[&str] = &["assets-dir", "mod-assets-dir", "save-file"];
 
 /// `knife.ini` candidates, most specific first.
 pub fn candidates(executable: &Path) -> Vec<PathBuf> {
@@ -147,13 +147,14 @@ mod tests {
     fn ini_fills_omitted_options_and_command_line_wins() {
         let folder = Path::new("/games/knife");
         let text = "\u{feff}; comment\n# comment\n[knife]\nlanguage = en\nassets-dir = \"assets dir\"\n\
-                    save_file=/abs/savedata000\nskip-intro = true\nskip-movies = off\n\
+                    mod_assets_dir = mods\nsave_file=/abs/savedata000\nskip-intro = true\nskip-movies = off\n\
                     --text-websocket = 127.0.0.1:6677\n";
         let mut argv = vec![OsString::from("knife")];
         argv.extend(to_args(text, folder, &[]).unwrap());
         let cli = Cli::try_parse_from(&argv).unwrap();
         assert_eq!(cli.language, Some(1));
         assert_eq!(cli.assets_dir(), folder.join("assets dir"));
+        assert_eq!(cli.mod_assets_dir.as_deref(), Some(folder.join("mods").as_path()));
         assert_eq!(cli.save_file.as_deref(), Some(Path::new("/abs/savedata000")));
         assert!(cli.skip_intro && !cli.skip_movies);
         assert_eq!(cli.text_websocket.as_deref(), Some("127.0.0.1:6677"));
@@ -183,6 +184,7 @@ mod tests {
         argv.extend(to_args(include_str!("../../knife.ini.example"), folder, &[]).unwrap());
         let cli = Cli::try_parse_from(&argv).unwrap();
         assert_eq!(cli.assets_dir(), folder.join("assets"));
+        assert_eq!(cli.mod_assets_dir, Some(folder.join("mod_assets")));
         assert_eq!(cli.save_file, None);
     }
 }

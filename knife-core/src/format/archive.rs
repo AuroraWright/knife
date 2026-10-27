@@ -31,10 +31,15 @@ pub struct Archive {
 impl Archive {
     /// Open `<dir>/<base>.hed`, `.nam` (optional) and `.mrg`.
     pub fn open(dir: &Path, base: &str) -> Result<Self> {
-        let hed = std::fs::read(dir.join(format!("{base}.hed")))
+        Self::open_with(base, |file| dir.join(file))
+    }
+
+    /// Open archive `base` with each of its files (`<base>.hed`, `.nam`, `.mrg`) at `path(file name)`.
+    pub fn open_with(base: &str, path: impl Fn(&str) -> std::path::PathBuf) -> Result<Self> {
+        let hed = std::fs::read(path(&format!("{base}.hed")))
             .with_context(|| format!("reading {base}.hed"))?;
-        let nam = std::fs::read(dir.join(format!("{base}.nam"))).ok();
-        let file = File::open(dir.join(format!("{base}.mrg")))
+        let nam = std::fs::read(path(&format!("{base}.nam"))).ok();
+        let file = File::open(path(&format!("{base}.mrg")))
             .with_context(|| format!("opening {base}.mrg"))?;
         // SAFETY: the game files are read-only inputs and not modified while mapped.
         let mrg = unsafe { Mmap::map(&file)? };

@@ -16,6 +16,12 @@
 ; Contents/Resources/assets).
 assets-dir = assets
 
+; Folder of files to use in place of the game data's: a file here replaces the
+; one at the same path in the assets folder. Used only if it exists. Defaults to
+; "mod_assets" next to the executable (inside a macOS app bundle, also
+; Contents/Resources/mod_assets).
+mod-assets-dir = mod_assets
+
 ; Language: ja, en, zc (Simplified Chinese) or zt (Traditional Chinese). The
 ; Japanese release has Japanese only. Empty: the config's setting.
 language =

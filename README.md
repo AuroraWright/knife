@@ -42,6 +42,13 @@ knife needs the game data from your own copy of the game:
 By default knife looks for this folder as `assets` next to the executable (inside a macOS app bundle, also
 `Contents/Resources/assets`).
 
+### Mod/translation support
+
+Files in a `mod_assets` folder (found the same way as `assets`, or set with `-m`) are used in place of the game
+data's files at the same path: an archive's `.hed`, `.nam` or `.mrg`, a movie, a stream, a font and so on. A font
+folder (`ja`, `en2`, ...) with files of its own replaces the game data's. Everything else still comes from
+`assets`.
+
 ## Building and running
 
 ```sh
@@ -58,6 +65,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | Option | |
 |---|---|
 | `-a`, `--assets-dir DIR` | the game data folder |
+| `-m`, `--mod-assets-dir DIR` | the mod folder, whose files replace the game data's (see above; used only if it exists) |
 | `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (Tsukihime's overseas release and Witch on the Holy Night; by default the config's setting) |
 | `-s`, `--save-file PATH` | the save file (see below for the default) |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |

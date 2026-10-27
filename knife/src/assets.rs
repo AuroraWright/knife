@@ -73,8 +73,29 @@ impl Decoded {
     }
 }
 
+/// The game data folders: `--assets-dir`, and `--mod-assets` when there is one, whose files take the place of
+/// the game data's at the same relative path.
+#[derive(Clone)]
+pub struct Roots {
+    pub base: PathBuf,
+    pub mods: Option<PathBuf>,
+}
+
+impl Roots {
+    /// The file at `rel`: the mod folder's when it has one, else the game data's.
+    pub fn path(&self, rel: impl AsRef<Path>) -> PathBuf {
+        let rel = rel.as_ref();
+        self.mods.as_ref().map(|m| m.join(rel)).filter(|p| p.is_file()).unwrap_or_else(|| self.base.join(rel))
+    }
+
+    /// Archive `base`, each of its files from either folder (`path`).
+    pub fn archive(&self, base: &str) -> Result<Archive> {
+        Archive::open_with(base, |file| self.path(file))
+    }
+}
+
 pub struct Assets {
-    pub romfs: PathBuf,
+    pub roots: Roots,
     /// Japanese or overseas data (`detect_build`)
     pub build: Build,
     /// The game language (sub_2DE70: config word +0x12 when it is below `languages`, else the system language):
@@ -191,7 +212,7 @@ thread_local! {
 
 impl Assets {
     /// `language` is the config word (`cfg::LANGUAGE`); `language()` resolves it like sub_2DE70.
-    pub fn open(romfs: &Path, nso: &Nso, language: i16) -> Result<Self> {
+    pub fn open(roots: &Roots, nso: &Nso, language: i16) -> Result<Self> {
         let tables = ExeTables::load(nso)?;
         let build = tables.build;
         // sub_AE050: the overseas archives allpac / allpacml / allui / allpaccg carry a `w_` prefix; Witch on the
@@ -209,24 +230,24 @@ impl Assets {
             .enumerate()
             .map(|(i, im)| (im.name.to_ascii_uppercase(), i))
             .collect();
-        let scenes = SceneArchive::parse(&std::fs::read(romfs.join("allscr.mrg")).context("reading allscr.mrg")?)?;
-        let script_text = std::fs::read(romfs.join("script_text.mrg")).context("reading script_text.mrg")?;
+        let scenes = SceneArchive::parse(&std::fs::read(roots.path("allscr.mrg")).context("reading allscr.mrg")?)?;
+        let script_text = std::fs::read(roots.path("script_text.mrg")).context("reading script_text.mrg")?;
         let sar_name = if build == Build::Witch { "witch.bfsar" } else { "knife1.bfsar" };
-        let sar = SoundArchive::parse(std::fs::read(romfs.join(sar_name)).with_context(|| format!("reading {sar_name}"))?)?;
-        let allui = Arc::new(Archive::open(romfs, &w("allui"))?);
+        let sar = SoundArchive::parse(std::fs::read(roots.path(sar_name)).with_context(|| format!("reading {sar_name}"))?)?;
+        let allui = Arc::new(roots.archive(&w("allui"))?);
         let languages = Self::sysmes_file(&allui, build).map_or(1, |d| sysmes_u32(&d, 0).unwrap_or(1).max(1) as usize);
         let mut a = Self {
-            romfs: romfs.to_path_buf(),
+            roots: roots.clone(),
             build,
             language: 0,
             languages,
             text: ScriptText::parse(&script_text, 0)?,
             script_text,
-            allpac: Arc::new(Archive::open(romfs, &w("allpac"))?),
-            allpacml: Archive::open(romfs, &w("allpacml")).ok().map(Arc::new),
-            allpachd: Archive::open(romfs, hd).ok().map(Arc::new),
-            allpachdml: if build == Build::Witch { Archive::open(romfs, "allpachdml").ok().map(Arc::new) } else { None },
-            allpaccg: if build == Build::Witch { None } else { Archive::open(romfs, &w("allpaccg")).ok().map(Arc::new) },
+            allpac: Arc::new(roots.archive(&w("allpac"))?),
+            allpacml: roots.archive(&w("allpacml")).ok().map(Arc::new),
+            allpachd: roots.archive(hd).ok().map(Arc::new),
+            allpachdml: if build == Build::Witch { roots.archive("allpachdml").ok().map(Arc::new) } else { None },
+            allpaccg: if build == Build::Witch { None } else { roots.archive(&w("allpaccg")).ok().map(Arc::new) },
             allui,
             tables,
             image_index,
@@ -658,7 +679,7 @@ impl Assets {
     /// 0 logo_fix, 1 caution2 (both cautions on one screen), 2 caution, 3 caution1.
     pub fn parts_texture(&self, r: &Renderer, index: usize) -> Option<TexRef> {
         let load = || -> Result<TexRef> {
-            let data = Archive::open(&self.romfs, "parts")?.read(index)?;
+            let data = self.roots.archive("parts")?.read(index)?;
             let t = bntx::parse(&data)?.into_iter().next().context("empty BNTX")?;
             upload_bntx(r, &t)
         };
@@ -729,13 +750,22 @@ impl Assets {
     }
 
     /// sub_AB0F0: the first file of the language's font folder `<folder><suffix>` (suffix "" the story text,
-    /// "2" the UI text, "3" the bubble text).
+    /// "2" the UI text, "3" the bubble text); a mod folder with files of its own there takes the place of the
+    /// game data's.
     pub fn font_path(&self, suffix: &str) -> Option<PathBuf> {
-        let dir = self.romfs.join(format!("{}{suffix}", self.language_folder()));
-        let mut files: Vec<PathBuf> =
-            std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file()).collect();
-        files.sort();
-        files.into_iter().next()
+        let rel = format!("{}{suffix}", self.language_folder());
+        let first = |dir: PathBuf| {
+            let mut files: Vec<PathBuf> =
+                std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file()).collect();
+            files.sort();
+            files.into_iter().next()
+        };
+        self.roots.mods.as_ref().and_then(|m| first(m.join(&rel))).or_else(|| first(self.roots.base.join(&rel)))
+    }
+
+    /// A game data file (`Roots::path`): the mod folder's when it has one.
+    pub fn path(&self, rel: impl AsRef<Path>) -> PathBuf {
+        self.roots.path(rel)
     }
 
     /// The pair font metrics at the 40 px base size (sub_CAE88, `sfnt::pair_metrics`) of the message font set
@@ -751,7 +781,7 @@ impl Assets {
                 suffixes.iter().filter_map(|s| self.font_path(s)).filter_map(read).filter_map(|d| sfnt::metrics(&d)).collect();
             sfnt::set_metrics(&m, crate::text::BASE_SIZE)
         };
-        let ex = std::fs::read(self.romfs.join("exfont_nx01.bffnt"))
+        let ex = std::fs::read(self.path("exfont_nx01.bffnt"))
             .ok()
             .and_then(|d| bffnt::Font::parse(&d).ok())
             .map(|f| sfnt::SetMetrics {
@@ -795,7 +825,7 @@ impl Assets {
     pub fn shared_fonts(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for name in self.shared_font_names() {
-            let path = self.romfs.join(name);
+            let path = self.path(name);
             match std::fs::read(&path) {
                 Ok(d) => out.push(knife_core::format::bfttf::decode(&d).unwrap_or(d)),
                 Err(e) => tracing::warn!("system font {}: {e}", path.display()),
@@ -856,7 +886,7 @@ impl Assets {
     }
 
     pub fn load_stream_file(&self, rel: &str) -> Result<Pcm> {
-        let data = std::fs::read(self.romfs.join(rel)).with_context(|| format!("reading {rel}"))?;
+        let data = std::fs::read(self.path(rel)).with_context(|| format!("reading {rel}"))?;
         codec::decode_nopus(&data)
     }
 

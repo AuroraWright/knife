@@ -48,6 +48,14 @@ struct Cli {
     /// Contents/Resources/assets).
     #[arg(short, long)]
     assets_dir: Option<PathBuf>,
+    /// Files to use in place of the game data's: a file here replaces the one at the same path in the assets
+    /// folder (an archive's .hed, .nam or .mrg, a movie, a stream, a font, ...); a font folder with files of its
+    /// own replaces the game data's. Used only if the folder exists.
+    ///
+    /// Defaults to "mod_assets" next to the executable (inside a macOS app bundle, also
+    /// Contents/Resources/mod_assets).
+    #[arg(short, long)]
+    mod_assets_dir: Option<PathBuf>,
     /// Play in this language: ja, en, zc (Simplified Chinese) or zt (Traditional Chinese). It stands in for the
     /// console language and replaces the config's language setting, as the overseas config's language
     /// buttons do. The Japanese data has Japanese only.
@@ -167,11 +175,17 @@ struct Cli {
 impl Cli {
     /// The selected assets directory, or the default next to the executable.
     fn assets_dir(&self) -> PathBuf {
-        self.assets_dir.clone().unwrap_or_else(default_assets_dir)
+        self.assets_dir.clone().unwrap_or_else(|| default_dir(ASSETS_DIR_NAME))
+    }
+
+    /// The selected mod folder, or the default next to the executable, when it exists.
+    fn mod_assets_dir(&self) -> Option<PathBuf> {
+        Some(self.mod_assets_dir.clone().unwrap_or_else(|| default_dir(MOD_ASSETS_DIR_NAME))).filter(|dir| dir.is_dir())
     }
 }
 
 const ASSETS_DIR_NAME: &str = "assets";
+const MOD_ASSETS_DIR_NAME: &str = "mod_assets";
 
 /// Folders searched for the default assets directory: the executable's own folder, then, inside a macOS app
 /// bundle (`Name.app/Contents/MacOS/<executable>`), `Contents/Resources`.
@@ -189,18 +203,13 @@ fn executable_dirs(executable: &std::path::Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// The first existing "assets" folder among [`executable_dirs`], else the one next to the executable.
-fn default_assets_dir() -> PathBuf {
+/// The first existing folder `name` among [`executable_dirs`], else the one next to the executable.
+fn default_dir(name: &str) -> PathBuf {
     let Ok(executable) = std::env::current_exe() else {
-        return PathBuf::from(ASSETS_DIR_NAME);
+        return PathBuf::from(name);
     };
-    let candidates: Vec<_> = executable_dirs(&executable).into_iter().map(|dir| dir.join(ASSETS_DIR_NAME)).collect();
-    candidates
-        .iter()
-        .find(|path| path.is_dir())
-        .or(candidates.first())
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(ASSETS_DIR_NAME))
+    let candidates: Vec<_> = executable_dirs(&executable).into_iter().map(|dir| dir.join(name)).collect();
+    candidates.iter().find(|path| path.is_dir()).or(candidates.first()).cloned().unwrap_or_else(|| PathBuf::from(name))
 }
 
 struct App {
@@ -307,10 +316,15 @@ impl App {
         window.focus_window();
         let size = window.inner_size();
         let renderer = Renderer::new(window.clone(), size.width.max(1), size.height.max(1))?;
-        let assets_dir = self.cli.assets_dir();
-        let nso = assets::exe_tables(assets::detect_build(&assets_dir))?;
+        let roots = assets::Roots { base: self.cli.assets_dir(), mods: self.cli.mod_assets_dir() };
+        if let Some(mods) = &roots.mods {
+            tracing::info!("Using mod assets in {}", mods.display());
+        } else if let Some(dir) = &self.cli.mod_assets_dir {
+            tracing::warn!("mod assets folder {} not found", dir.display());
+        }
+        let nso = assets::exe_tables(assets::detect_build(&roots.base))?;
         let language = savedata::SaveFile::load().language();
-        let assets = assets::Assets::open(&assets_dir, &nso, language)?;
+        let assets = assets::Assets::open(&roots, &nso, language)?;
         match assets.soft_lut_rows() {
             Ok(rows) => renderer.set_soft_lut(&rows),
             Err(e) => tracing::warn!("clip inset mask: {e:#}"),
