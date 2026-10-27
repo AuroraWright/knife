@@ -518,6 +518,8 @@ pub struct Ui {
     /// music panel button to come back to (a1 + 60) and the one the volume slider returns to (a1 + 64)
     music_btn: usize,
     music_vol_from: usize,
+    /// The volume slider held (loc_1F0D4, flag 9): the touch x and the volume at the grab (a1 + 52 / 56)
+    music_grab: Option<(f32, f32)>,
     /// music list cursor row (cGalleryMusicList a1 + 52), kept while the panel or the buttons have the focus
     music_row: usize,
     /// the key event being handled is an auto-repeat (the exe wraps lists only on the trigger set)
@@ -1208,6 +1210,7 @@ impl Ui {
             gal_track: false,
             music_btn: 0,
             music_vol_from: 4,
+            music_grab: None,
             music_row: 0,
             nav_repeat: false,
             stick: [0; 2],
@@ -3248,6 +3251,19 @@ impl Ui {
         if self.bar_frame(game) {
             return;
         }
+        // loc_1F0D4 while the slider is held: the grab's volume plus the touch's move / 364, clamped
+        if let Some((x0, v0)) = self.music_grab {
+            if !self.touch.down || self.screen != Screen::Music {
+                self.music_grab = None;
+            } else {
+                let v = (v0 + (self.mouse.0 - x0) / 364.0).clamp(0.0, 1.0);
+                if v != self.music_vol {
+                    self.music_vol = v;
+                    game.sound.set_bgm_volume(Self::music_gain(v), 0.1);
+                }
+                return;
+            }
+        }
         let v = self.drag.vel;
         match self.screen {
             Screen::Flowchart { .. } => self.flow_frame(game),
@@ -3987,6 +4003,10 @@ impl Ui {
             self.key_focus = false;
             return;
         }
+        // the held volume slider keeps the focus wherever the drag goes (loc_1F0D4 runs before any object)
+        if self.music_grab.is_some() && self.touch.down {
+            return;
+        }
         let mut hover = self.items(game).iter().position(|(r, _)| rect_hit(*r, (x, y)));
         if self.screen == Screen::Title && !self.press {
             // sub_8E200 state 17: off the entries the cursor stays; moving onto another one plays sound 0
@@ -4012,7 +4032,9 @@ impl Ui {
             let slot = hover.filter(|&h| matches!(items[h].1, Action::Slot(_)));
             page_hit = slot.is_some();
             hover = slot.or(self.hover);
-        } else if self.screen == Screen::Config {
+        } else if self.screen == Screen::Config || Self::gal_mode(self.screen).is_some() {
+            // the gallery modes likewise: a touch off their objects leaves the focus where it was (the music
+            // list lights its cursor row only while neither the panel nor the side bar has it)
             hover = hover.or(self.hover);
         }
         // with the tabs focused, pointing at the page's own objects hands the cursor back to the page
@@ -4041,6 +4063,8 @@ impl Ui {
                     match a {
                         Action::MusicCtl(k) => self.music_btn = usize::from(k),
                         Action::Track(i) => self.music_row = i,
+                        // sub_1EC0C: the slider takes the focus, returning to the button it had (prev at least)
+                        Action::MusicVol => self.music_vol_from = self.music_btn.max(4),
                         _ => {}
                     }
                 }
@@ -5121,9 +5145,9 @@ impl Ui {
                 }
             }
             Action::MusicVol => {
-                let v = ((self.mouse.0 - 1412.0) / 364.0).clamp(0.0, 1.0);
-                self.music_vol = (v * 20.0).round() / 20.0;
-                game.sound.set_bgm_volume(Self::music_gain(self.music_vol), 0.1);
+                // loc_1F0D4: a touch on the slider grabs it (sub_25218) without moving it; the drag moves it
+                // (`drag_frame`)
+                self.music_grab = Some((self.mouse.0, self.music_vol));
             }
             Action::OpenMovies => self.enter_mode(game, Screen::Movies),
             Action::Movie(i) => {
@@ -5398,6 +5422,8 @@ impl Ui {
     fn play_track(&mut self, game: &mut Game, i: usize) {
         self.music_paused = false;
         self.music_fade = None;
+        // sub_1A028 stops what plays first, so the same track starts over (and a paused one plays again)
+        game.sound.stop_bgm(0.0);
         game.play_bgm(crate::gallery_table::MUSIC[i].0, Self::music_gain(self.music_vol), 0.0);
         self.playing_track = Some(i);
         self.last_track = Some(i);
