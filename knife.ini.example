@@ -35,7 +35,7 @@ save-file =
 ; Serve displayed text over WebSocket at HOST:PORT, e.g. 127.0.0.1:6677.
 text-websocket =
 
-; Start in fullscreen, as pressing F switches to.
+; Start in fullscreen.
 fullscreen = false
 
 ; Leave out the TYPE-MOON logo movie and the notice before the title.

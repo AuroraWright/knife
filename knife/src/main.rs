@@ -75,7 +75,7 @@ struct Cli {
     /// Every connected client receives each message as plain text, and each choice's options one per line.
     #[arg(short, long, value_name = "HOST:PORT")]
     text_websocket: Option<String>,
-    /// Start in fullscreen, as pressing F switches to
+    /// Start in fullscreen
     #[arg(short, long)]
     fullscreen: bool,
     /// Start in this scene (allscr name or index) instead of START_SCRIPT
