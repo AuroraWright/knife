@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## 0.9.9 (2026-10-28)
 
 - `-f` / `--fullscreen` (or `fullscreen = true` in `knife.ini`) starts the game in fullscreen, as pressing F
   switches to.
