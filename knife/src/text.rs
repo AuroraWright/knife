@@ -1476,6 +1476,7 @@ pub fn layout(
     let under = runs.iter().any(|r| matches!(r, Run::Ruby { under: true, .. }));
     // the line starts (sub_BF0F8, `plan_lines`), by the index of each `push`
     let plan = plan_lines(atlas, lay, runs, x);
+    let mut flow = Flow::new(atlas, runs, x > lay.left);
     let unit = std::cell::Cell::new(0usize);
     // `n` > 0: a run of n source chars `c` drawn as one stretched exfont glyph (`ex`) over n cells. `cell`:
     // the glyph's cell width and x scale when not the layout's (an ASCII glyph, `ascii_cell`), the glyph
@@ -1554,11 +1555,11 @@ pub fn layout(
     let push_char = |c: char, st: &Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
         push(c, None, None, lay.spacing, st, x, baseline, order, out)
     };
-    let text = |t: &str, pass: Pass, next: Option<char>, st: &mut Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
+    let text = |t: &str, pass: Pass, next: Option<char>, st: &mut Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>, flow: &mut Flow| {
         let chars = lone_dashes(t.chars().collect(), pass, |g| atlas.has_ex(g));
         if english() {
             let first = out.len();
-            english_text(atlas, lay, &chars, pass, st, (x, baseline), order, out);
+            english_text(atlas, lay, &chars, pass, st, (x, baseline), order, out, flow);
             for pc in &mut out[first..] {
                 pc.wobble = (st.wobble > 0).then(|| Wobble::new(st.wobble));
                 pc.fill = st.fill;
@@ -1590,8 +1591,9 @@ pub fn layout(
             Run::Newline => {
                 x = lay.left;
                 baseline += lay.line_height;
+                flow.newline();
             }
-            Run::Text(t) => text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out),
+            Run::Text(t) => text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow),
             Run::Italic => {
                 style.italic = ITALIC_RATIO;
                 style.seen = crate::assets::witch() || crate::assets::overseas();
@@ -1606,7 +1608,7 @@ pub fn layout(
             Run::Edge(_) | Run::Indent => {}
             Run::Bar { row, text: t } => {
                 let first = out.len();
-                text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out);
+                text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow);
                 if let Some(pc) = out.get_mut(first) {
                     let len = t.chars().count().min(usize::from(u8::MAX)) as u8;
                     pc.bar = Some(Bar { row: *row, len, top: pc.baseline - lay.ascent, cell: lay.size * lay.sx + lay.spacing });
@@ -1626,10 +1628,12 @@ pub fn layout(
                 // sub_C1080 lays the base out as the text around it (ASCII runs, dash runs)
                 if english() {
                     for c in base.chars() {
+                        let (at, y) = (out.len(), baseline);
                         push_char(c, &style, &mut x, &mut baseline, &mut order, out);
+                        flow.placed(at, out.get(at).map_or(x, |pc| pc.x), baseline != y);
                     }
                 } else {
-                    text(base, Pass::Base, next, &mut style, &mut x, &mut baseline, &mut order, out);
+                    text(base, Pass::Base, next, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow);
                 }
                 // sub_DDA1C: the ruby writer at 0.52 of the text's scale and spacing, centred over the base (the
                 // spread flag +101008 is 0 in sub_A7790's slot init); nn::font string widths have no trailing
@@ -1935,13 +1939,89 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
     Some(LinePlan { starts, trailing })
 }
 
+/// The characters of a message's English text as sub_BF0F8 hands them to the line breaker: the slot's whole
+/// string, not each markup run (Switch, overseas: "…bien trop @ieffrontées@r." breaks before the italic word,
+/// "…lit blanc @id'hôp@rital." would break before d'), with where each was placed so far.
+struct Flow {
+    /// the text runs', bars' and ruby bases' characters in order (as `layout` takes them), a line feed per `@n`
+    chars: Vec<char>,
+    /// per placed character: its index in `out` and the pen it was drawn from (none inside an exfont run)
+    at: Vec<Option<(usize, f32)>>,
+    /// the next character to place
+    pos: usize,
+    /// the current line's first character
+    line: usize,
+    /// the current line was started by the text before the message (a pen past the left edge)
+    mid: bool,
+}
+
+impl Flow {
+    fn new(atlas: &FontAtlas, runs: &[Run], mid: bool) -> Flow {
+        let mut chars = Vec::new();
+        if english() {
+            for run in runs {
+                match run {
+                    Run::Text(t) | Run::Bar { text: t, .. } => chars.extend(lone_dashes(t.chars().collect(), Pass::Text, |g| atlas.has_ex(g))),
+                    Run::Ruby { base, .. } => chars.extend(base.chars()),
+                    Run::Newline => chars.push('\n'),
+                    _ => {}
+                }
+            }
+        }
+        Flow { at: vec![None; chars.len()], chars, pos: 0, line: 0, mid }
+    }
+
+    fn newline(&mut self) {
+        self.pos = (self.pos + 1).min(self.chars.len());
+        self.line = self.pos;
+        self.mid = false;
+    }
+
+    /// A ruby base character placed at `out[at]` from pen `x`, `wrapped` when it started a line.
+    fn placed(&mut self, at: usize, x: f32, wrapped: bool) {
+        if let Some(a) = self.at.get_mut(self.pos) {
+            *a = Some((at, x));
+        }
+        if wrapped {
+            self.line = self.pos;
+            self.mid = false;
+        }
+        self.pos += 1;
+    }
+
+    /// Start a new line with character `from`, moving what was placed of it and the characters after it
+    /// (`out` from the first of them on, their rubies with them) to the left edge of the next line.
+    fn wrap(&mut self, from: usize, lay: &Layout, (x, baseline): (&mut f32, &mut f32), out: &mut [PlacedChar]) {
+        if let Some((first, pen)) = self.at.get(from..).and_then(|a| a.iter().flatten().next().copied()) {
+            let dx = lay.left - pen;
+            for pc in &mut out[first..] {
+                pc.x += dx;
+                pc.baseline += lay.line_height;
+                if let Some(bar) = &mut pc.bar {
+                    bar.top += lay.line_height;
+                }
+            }
+            for (_, p) in self.at[from..].iter_mut().flatten() {
+                *p += dx;
+            }
+            *x += dx;
+        } else {
+            *x = lay.left;
+        }
+        *baseline += lay.line_height;
+        self.line = from;
+        self.mid = false;
+    }
+}
+
 /// English message text (the overseas build's +101009 = English, sub_A7790): no per-line character count
 /// (sub_BD7EC), but nn::font's line breaking. For each line sub_BF0F8 finds the first character that runs past
 /// the slot width (sub_C7240 / sub_145334: pen + spacing + kerning + advance > width; a line's first character
-/// always fits) and asks sub_148988 for the line's last character; sub_C471C breaks right after it, so a line
-/// keeps its trailing spaces. Glyphs advance by their own width plus the kerning before them and the spacing.
+/// always fits) and asks sub_148988 for the line's last character over the whole text (`Flow`); sub_C471C
+/// breaks right after it, so a line keeps its trailing spaces. Glyphs advance by their own width plus the
+/// kerning before them and the spacing.
 #[allow(clippy::too_many_arguments)]
-fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st: &mut Style, (x, baseline): (&mut f32, &mut f32), order: &mut usize, out: &mut Vec<PlacedChar>) {
+fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st: &mut Style, (x, baseline): (&mut f32, &mut f32), order: &mut usize, out: &mut Vec<PlacedChar>, flow: &mut Flow) {
     // the parsers' exfont runs (tag 13, `makes_run`) for English text too: units of (first char index, char
     // count, exfont glyph)
     let mut units: Vec<(usize, usize, Option<char>)> = Vec::new();
@@ -1990,6 +2070,8 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st:
     let next_prev = |u: (usize, usize, Option<char>)| if u.2.is_some() { None } else { Some(chars[u.0]) };
     let italic_after = |u: (usize, usize, Option<char>), italic: f32| if u.2.is_some() { run_moves(u.1, italic).4 } else { italic };
     let lb = LINE_BREAK.get();
+    // the characters' places in the flow
+    let base = flow.pos;
     let mut i = 0;
     let mut prev: Option<char> = None;
     while i < units.len() {
@@ -2011,24 +2093,27 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st:
         let last = match overflow {
             None => units.len() - 1,
             Some(o) => {
+                let (here, over) = (base + units[i].0, base + units[o].0);
                 let c = match lb {
-                    Some(lb) => lb.last_on_line(chars, units[i].0, Some(units[o].0)),
-                    None => units[o].0.saturating_sub(1).max(units[i].0),
+                    Some(lb) => lb.last_on_line(&flow.chars, flow.line, Some(over)),
+                    None => over.saturating_sub(1).max(flow.line),
                 };
+                // text that continues a line whose first word no longer fits starts on the next one; a break
+                // before this run's part of the line takes the characters after it there too
+                let from = if flow.mid && c >= over { Some(flow.line) } else { (c < here).then_some(c + 1) };
+                if let Some(from) = from {
+                    flow.wrap(from, lay, (x, baseline), out);
+                    prev = None;
+                    continue;
+                }
                 // the unit holding that character
-                units.iter().rposition(|u| u.0 <= c).unwrap_or(i).max(i)
+                units.iter().rposition(|u| base + u.0 <= c).unwrap_or(i).max(i)
             }
         };
-        // text that continues a line whose first word no longer fits starts on the next one
-        if *x > lay.left && overflow.is_some_and(|o| last >= o && o == i) {
-            *x = lay.left;
-            *baseline += lay.line_height;
-            prev = None;
-            continue;
-        }
         for &u in &units[i..=last] {
             let (kern, w, after) = width(prev, u, st.italic);
             *x += kern;
+            flow.at[base + u.0] = Some((out.len(), *x));
             let (c, run, gx, italic) = match u.2 {
                 Some(g) => {
                     let (v, _, _, it, _) = run_moves(u.1, st.italic);
@@ -2047,8 +2132,11 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st:
             *x = lay.left;
             *baseline += lay.line_height;
             prev = None;
+            flow.line = base + units[i].0;
+            flow.mid = false;
         }
     }
+    flow.pos = base + chars.len();
 }
 
 /// A text colour word (RGB565) as the exe's sub_1007C0 widens it: each channel's top bits repeated below.
