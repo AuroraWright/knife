@@ -27,7 +27,7 @@ jobs:
       - name: enable windows longpaths
         if: runner.os == 'Windows'
         run: git config --global core.longpaths true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       # rustup installs the toolchain pinned in rust-toolchain.toml

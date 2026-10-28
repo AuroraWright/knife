@@ -25,6 +25,8 @@ include = ["knife.ini.example"]
 # build the aarch64 linux release on an aarch64 runner
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+# dist's default, macos-14, is being retired (2026-11-02) and its jobs stay queued
+aarch64-apple-darwin = "macos-15"
 
 # install additional packages when building the linux release
 [dist.dependencies.apt]
