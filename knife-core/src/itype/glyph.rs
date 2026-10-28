@@ -6,7 +6,8 @@ use super::cff;
 use super::effect;
 use super::raster::{self, Graymap, Outline};
 use super::rtgah::{self, Globals};
-use super::tt::{self, Element, Font, Scale};
+use super::fixed::{vardiv, varmul};
+use super::tt::{self, Composite, Element, Font, Scale};
 
 /// fsFlags while the SDK fills a glyph cache: autohinting on and forced over any glyph program.
 const FS_FLAGS: u32 = 0x2140_4000;
@@ -41,7 +42,7 @@ impl Hinter {
     }
 
     /// A glyph's points ready for the scan converter (26.6, y up), hinted when the font allows; None for a
-    /// composite glyph or one that will not load.
+    /// glyph that will not load.
     pub fn glyph(&mut self, font: &Font, gid: u16) -> Option<Element> {
         self.outline(font, gid, self.autohint)
     }
@@ -62,7 +63,10 @@ impl Hinter {
     fn outline(&mut self, font: &Font, gid: u16, hint: bool) -> Option<Element> {
         let (mut e, code) = match &font.cff {
             Some(c) => (c.load(gid, self.scale.ppem / i32::from(font.upem))?, &[][..]),
-            None => font.load(gid)?,
+            None => match font.load(gid) {
+                Some(l) => l,
+                None => return self.composite(font, gid, hint),
+            },
         };
         tt::scale(&mut e, &self.scale);
         let n = e.points();
@@ -82,6 +86,135 @@ impl Hinter {
             }
         }
         Some(e)
+    }
+
+    /// get_comp for a composite glyph: its advance points from its own box and metrics, put on the grid as a
+    /// simple glyph's (comp_phantom_points), then its components one after another (`assemble`); the whole
+    /// is autohinted when the font allows it, unless the glyph has instructions (they run instead) or one of its
+    /// components ran a program of its own (do_hints marks the font, +109 bit 0); while get_ref_lines forces
+    /// autohinting it always is.
+    fn composite(&mut self, font: &Font, gid: u16, hint: bool) -> Option<Element> {
+        let c = font.composite(gid)?;
+        let mut p = Element::default();
+        font.push_phantoms(&mut p, gid, c.x_min, c.y_max);
+        tt::scale(&mut p, &self.scale);
+        tt::round_phantoms(&mut p, &self.scale, font.upem, hint);
+        let mut st = Assembly { ran: false, transform: false, metrics: [0, 1, 2, 3].map(|i| (p.x[i], p.y[i])), simple: 0 };
+        let mut e = self.assemble(font, &c, IDENTITY, hint, &mut st, p)?;
+        e.f.fill(0);
+        if hint && !e.sp.is_empty() {
+            if self.autohint && (self.forced || (!c.instructions && !st.ran)) {
+                to_font_units(&mut e, font.upem, self.scale.ppem);
+                let ch = font.inverse(gid);
+                let script = tt::which_script(ch, self.ranges);
+                self.g.g416 = u16::from(self.autohint);
+                rtgah::rtgah(&mut e, script, ch as i32, &mut self.g);
+            } else if c.instructions && !c.code.is_empty() {
+                to_font_units(&mut e, font.upem, self.scale.ppem);
+                program(&mut e, c.code);
+            }
+        }
+        Some(e)
+    }
+
+    /// A composite glyph's components (get_comp's loop) under the matrix `m`: each loaded, scaled and on the grid
+    /// as a glyph of its own, its program run (none while get_ref_lines forces autohinting), from the first
+    /// scaled component on transformed by its matrix (apply_transformation), then moved by its offset
+    /// (apply_offsets) and appended, its contours numbered on. The advance points are the last component's with
+    /// the first four the glyph's (`Assembly::metrics`); `none` stands in when there are no components.
+    fn assemble(&mut self, font: &Font, c: &Composite, m: [i32; 4], hint: bool, st: &mut Assembly, none: Element) -> Option<Element> {
+        let mut out = Element::default();
+        let mut last = none;
+        for comp in &c.components {
+            // compose_trans: a scaled component's matrix under the composite's, and all after it transformed
+            let cm = match comp.scale {
+                Some(s) => {
+                    st.transform = true;
+                    compose(s, m)
+                }
+                None => m,
+            };
+            let (mut e, code, simple) = match font.composite(comp.gid) {
+                Some(inner) => {
+                    let e = self.assemble(font, &inner, cm, hint, st, last.clone())?;
+                    (e, inner.instructions.then_some(inner.code), false)
+                }
+                None => {
+                    let (mut e, code) = font.load(comp.gid)?;
+                    tt::scale(&mut e, &self.scale);
+                    tt::round_phantoms(&mut e, &self.scale, font.upem, hint);
+                    if hint && !code.is_empty() && !(self.forced && self.autohint) {
+                        program(&mut e, code);
+                        st.ran = true;
+                    }
+                    if st.transform {
+                        transform(&mut e, cm);
+                    }
+                    (e, None, true)
+                }
+            };
+            let n = e.points();
+            // apply_offsets: x / y offsets scaled as the points (by the composite's matrix when it only scales),
+            // on the grid with ROUND_XY_TO_GRID; else the composite's point arg 1 matched with the
+            // component's point arg 2 (after the first simple component)
+            let (dx, dy) = if comp.flags & 2 != 0 {
+                let (mut dx, mut dy) = (self.scale.apply(comp.args.0), self.scale.apply(comp.args.1));
+                if m[1] == 0 && m[2] == 0 {
+                    (dx, dy) = (varmul(dx, m[0], 16), varmul(dy, m[3], 16));
+                }
+                if comp.flags & 4 != 0 {
+                    (dx, dy) = ((dx + 32) & !63, (dy + 32) & !63);
+                }
+                (dx, dy)
+            } else if st.simple != 0 {
+                let at = |v: &[i32], i: i32| usize::try_from(i).ok().and_then(|i| v.get(i).copied()).unwrap_or(0);
+                let (a, b) = comp.args;
+                (at(&out.x, a) - at(&e.x[..n], b), at(&out.y, a) - at(&e.y[..n], b))
+            } else {
+                (0, 0)
+            };
+            e.x.iter_mut().for_each(|v| *v += dx);
+            e.y.iter_mut().for_each(|v| *v += dy);
+            e.ox.clone_from(&e.x);
+            e.oy.clone_from(&e.y);
+            // a nested composite's own instructions, after its offset
+            if let Some(code) = code
+                && hint
+                && !code.is_empty()
+            {
+                to_font_units(&mut e, font.upem, self.scale.ppem);
+                program(&mut e, code);
+                st.ran = true;
+            }
+            if simple {
+                st.simple += 1;
+            }
+            if comp.flags & 0x200 != 0 {
+                st.metrics = [0, 1, 2, 3].map(|i| (e.x[n + i], e.y[n + i]));
+            }
+            let base = out.x.len() as u16;
+            for (to, from) in [(&mut out.x, &e.x), (&mut out.y, &e.y), (&mut out.ox, &e.ox), (&mut out.oy, &e.oy), (&mut out.oox, &e.oox), (&mut out.ooy, &e.ooy)] {
+                to.extend_from_slice(&from[..n]);
+            }
+            out.on.extend_from_slice(&e.on[..n]);
+            out.f.extend_from_slice(&e.f[..n]);
+            out.sp.extend(e.sp.iter().map(|&v| v + base));
+            out.ep.extend(e.ep.iter().map(|&v| v + base));
+            last = e;
+        }
+        let n = last.points();
+        for (to, from) in [(&mut out.x, &last.x), (&mut out.y, &last.y), (&mut out.ox, &last.ox), (&mut out.oy, &last.oy), (&mut out.oox, &last.oox), (&mut out.ooy, &last.ooy)] {
+            to.extend_from_slice(&from[n..]);
+        }
+        out.on.extend_from_slice(&last.on[n..]);
+        out.f.extend_from_slice(&last.f[n..]);
+        let n = out.points();
+        for (i, &(x, y)) in st.metrics.iter().enumerate() {
+            (out.x[n + i], out.y[n + i]) = (x, y);
+        }
+        out.ox.clone_from(&out.x);
+        out.oy.clone_from(&out.y);
+        Some(out)
     }
 
     /// A reference letter's lowest and highest points (26.6) as get_ref_lines reads them from the outline it
@@ -308,6 +441,56 @@ impl Hinter {
         if r1 & 0x2000 != 0 || r2 & 0x8000_0000 != 0 || r3 & 8 != 0 {
             self.put(font, 0x62A, None, Some(64));
         }
+    }
+}
+
+/// The unit matrix (16.16).
+const IDENTITY: [i32; 4] = [0x10000, 0, 0, 0x10000];
+
+/// Where a composite glyph's assembly stands (get_comp's state in the key): whether a component ran a program
+/// of its own (do_hints, +109 bit 0), whether a scaled component was met (+528 cleared, so every component from
+/// it on is transformed), the advance points the glyph takes (the glyph's own, or a USE_MY_METRICS
+/// component's) and the simple components placed so far (+518).
+struct Assembly {
+    ran: bool,
+    transform: bool,
+    metrics: [(i32, i32); 4],
+    simple: usize,
+}
+
+/// compose_trans: a component's matrix `c` under its composite's `p` (16.16 xx, xy, yx, yy).
+fn compose(c: [i32; 4], p: [i32; 4]) -> [i32; 4] {
+    let mul = |a: i32, b: i32| varmul(a, b, 16);
+    [
+        mul(p[0], c[0]) + mul(p[1], c[2]),
+        mul(p[0], c[1]) + mul(p[1], c[3]),
+        mul(p[2], c[0]) + mul(p[3], c[2]),
+        mul(p[2], c[1]) + mul(p[3], c[3]),
+    ]
+}
+
+/// apply_transformation at the glyph cache's unit transform (+532 / +536 = 1.0): every point by the matrix,
+/// the originals following; an advance the matrix turned round swaps the first two advance points.
+fn transform(e: &mut Element, m: [i32; 4]) {
+    for (x, y) in e.x.iter_mut().zip(e.y.iter_mut()) {
+        (*x, *y) = (varmul(*x, m[0], 16) + varmul(*y, m[2], 16), varmul(*x, m[1], 16) + varmul(*y, m[3], 16));
+    }
+    e.ox.clone_from(&e.x);
+    e.oy.clone_from(&e.y);
+    let n = e.points();
+    if (e.x[n + 1] ^ e.oox[n + 1]) < 0 {
+        e.x.swap(n, n + 1);
+        e.y.swap(n, n + 1);
+    }
+}
+
+/// do_hints for a composite glyph: its points and its first advance point back in font units for its hinting
+/// (the components' offsets included), x upem / ppem.
+fn to_font_units(e: &mut Element, upem: u16, ppem: i32) {
+    let k = vardiv(i32::from(upem) << 10, ppem, 16);
+    for i in 0..=e.points() {
+        e.oox[i] = varmul(e.x[i], k, 16);
+        e.ooy[i] = varmul(e.y[i], k, 16);
     }
 }
 

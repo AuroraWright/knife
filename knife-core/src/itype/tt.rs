@@ -333,7 +333,6 @@ impl<'a> Font<'a> {
     /// instructions; None for a composite glyph.
     pub fn load(&self, gid: u16) -> Option<(Element, &'a [u8])> {
         let g = self.glyph_data(gid);
-        let (lsb, adv, _tsb, adv_h) = self.metrics(gid);
         let mut e = Element::default();
         let mut code: &[u8] = &[];
         let (mut x_min, mut y_max) = (0, 0);
@@ -383,6 +382,14 @@ impl<'a> Font<'a> {
                 e.on = flags.iter().map(|f| f & 1).collect();
             }
         }
+        self.push_phantoms(&mut e, gid, x_min, y_max);
+        Some((e, code))
+    }
+
+    /// The eight phantom points (font units) after a glyph's own, from its metrics and the left and top of its
+    /// box (get_comp; comp_phantom_points for a composite glyph).
+    pub fn push_phantoms(&self, e: &mut Element, gid: u16, x_min: i32, y_max: i32) {
+        let (lsb, adv, _tsb, adv_h) = self.metrics(gid);
         let left = x_min - i32::from(lsb);
         let right = left + i32::from(adv);
         let mid = (left + right) / 2;
@@ -392,8 +399,79 @@ impl<'a> Font<'a> {
         let n = e.oox.len();
         e.on.resize(n, 0);
         e.f = vec![0; n];
-        Some((e, code))
     }
+
+    /// A composite glyph (number of contours -1, get_comp): the left and top of its box, its component records
+    /// (read_comp_parms_ttf) and the instructions after them; None for any other glyph.
+    pub fn composite(&self, gid: u16) -> Option<Composite<'a>> {
+        let g = self.glyph_data(gid);
+        if g.len() < 10 || i16_at(g, 0)? != -1 {
+            return None;
+        }
+        let (x_min, y_max) = (i32::from(i16_at(g, 2)?), i32::from(i16_at(g, 8)?));
+        let mut p = 10;
+        let mut components = Vec::new();
+        let mut instructions = false;
+        loop {
+            let (flags, gid) = (u16_at(g, p)?, u16_at(g, p + 2)?);
+            // words with ARG_1_AND_2_ARE_WORDS, else bytes, either read signed
+            let args = if flags & 1 != 0 {
+                p += 8;
+                (i32::from(i16_at(g, p - 4)?), i32::from(i16_at(g, p - 2)?))
+            } else {
+                p += 6;
+                (i32::from(*g.get(p - 2)? as i8), i32::from(*g.get(p - 1)? as i8))
+            };
+            // 2.14 to 16.16
+            let f2 = |at: usize| i16_at(g, at).map(|v| 4 * i32::from(v));
+            let scale = if flags & 8 != 0 {
+                p += 2;
+                let s = f2(p - 2)?;
+                Some([s, 0, 0, s])
+            } else if flags & 0x40 != 0 {
+                p += 4;
+                Some([f2(p - 4)?, 0, 0, f2(p - 2)?])
+            } else if flags & 0x80 != 0 {
+                p += 8;
+                Some([f2(p - 8)?, f2(p - 6)?, f2(p - 4)?, f2(p - 2)?])
+            } else {
+                None
+            };
+            instructions |= flags & 0x100 != 0;
+            components.push(Component { flags, gid, args, scale });
+            if flags & 0x20 == 0 {
+                break;
+            }
+        }
+        let code = match instructions {
+            true => {
+                let len = usize::from(u16_at(g, p)?);
+                g.get(p + 2..).map_or(&[][..], |c| &c[..len.min(c.len())])
+            }
+            false => &[],
+        };
+        Some(Composite { x_min, y_max, components, instructions, code })
+    }
+}
+
+/// A composite glyph's component (read_comp_parms_ttf).
+pub struct Component {
+    pub flags: u16,
+    pub gid: u16,
+    /// offsets in font units (ARGS_ARE_XY_VALUES) or point numbers
+    pub args: (i32, i32),
+    /// the scale as a 16.16 matrix (xx, xy, yx, yy), when the record has one
+    pub scale: Option<[i32; 4]>,
+}
+
+/// A composite glyph's records.
+pub struct Composite<'a> {
+    pub x_min: i32,
+    pub y_max: i32,
+    pub components: Vec<Component>,
+    /// WE_HAVE_INSTRUCTIONS on any record
+    pub instructions: bool,
+    pub code: &'a [u8],
 }
 
 /// Scale the font-unit points to 26.6 (sub_189FD0), the scaled ones also the originals.
