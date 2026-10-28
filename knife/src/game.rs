@@ -5212,7 +5212,8 @@ impl Game {
     }
 
     /// The QA bubble font (ja3 FOT-Seurat), set once at startup.
-    pub fn set_bubble_font(&mut self, font: FontAtlas) {
+    pub fn set_bubble_font(&mut self, mut font: FontAtlas) {
+        font.bubble = true;
         self.font_bubble = Some(font);
     }
 
@@ -5472,10 +5473,19 @@ impl Game {
             order = o;
         }
         let mut out = Vec::new();
+        // each entry is its own draw buffer (`text::Batches`)
+        let mut batches = text::Batches::default();
         for (i, pc) in placed.iter().enumerate() {
+            if edges.iter().any(|e| e.0 == i) {
+                batches.flush(&mut out);
+            }
             let edge = edges.iter().rev().find(|e| e.0 <= i).map_or([0; 3], |e| e.1);
-            Self::rimmed_glyph_edge(font, r, &mut out, pc, edge, 1.0);
+            let mut q = Vec::new();
+            Self::rimmed_glyph_edge(font, r, &mut q, pc, edge, 1.0);
+            let ex = font.is_ex(pc);
+            q.into_iter().for_each(|q| batches.push(ex, q));
         }
+        batches.flush(&mut out);
         out.extend(placed.iter().filter_map(|pc| self.bar_quad(pc, None, [1.0; 4], true)));
         out
     }
@@ -5504,11 +5514,11 @@ impl Game {
 
     /// `rimmed_glyph` with the rim in `edge` (the text's edge code's colour, `text::text_edge`).
     fn rimmed_glyph_edge(font: &mut FontAtlas, r: &Renderer, out: &mut Vec<Quad>, pc: &text::PlacedChar, edge: [u8; 3], alpha: f32) {
-        // the edge of font index 1 (`text::edge_rim`) scaled with the glyph, composited with the fill in the
-        // shader: sub_391A0 fades a message by one alpha on the whole bordered glyph (Switch fire page: faded
-        // line = B + 0.39 (full - B) per pixel), not by fading separately drawn rim and fill quads
+        // the edged cache of font index 1 scaled with the glyph, edge and fill in one texel: sub_391A0 fades a
+        // message by one alpha on the whole bordered glyph (Switch fire page: faded line = B + 0.39 (full - B)
+        // per pixel), not by fading separately drawn edge and fill quads
         let rgb = text::fill_rgb(pc, [1.0; 3]);
-        if let Some(q) = font.rimmed_quad_edge(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, rgb, edge, alpha) {
+        if let Some(q) = font.rimmed_quad_edge(r, pc, 1, rgb, edge, alpha) {
             out.push(q);
         }
     }
@@ -5621,9 +5631,12 @@ impl Game {
                 .collect();
             let mut m = 0;
             let mut bars = Vec::new();
+            // each message is its own draw buffer (`text::Batches`)
+            let mut batches = text::Batches::default();
             for (ci, pc) in self.page.chars.iter().enumerate() {
                 while m + 1 < msgs.len() && msgs[m + 1].0 <= ci {
                     m += 1;
+                    batches.flush(&mut out);
                 }
                 let fade = fades.get(m).copied().unwrap_or(1.0);
                 let (sx, sy) = shift.filter(|_| ci >= cur).unwrap_or((0.0, 0.0));
@@ -5652,12 +5665,16 @@ impl Game {
                     Some(f) if bubble_font || zs.get(m).copied().flatten().is_some() => f,
                     _ => &mut *font_main,
                 };
-                if edge || slot_edges[m].1 {
-                    out.extend(font.rimmed_quad_edge(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, rgb, slot_edges[m].0, alpha));
+                let q = if edge || slot_edges[m].1 {
+                    font.rimmed_quad_edge(r, pc, 1, rgb, slot_edges[m].0, alpha)
                 } else {
-                    out.extend(font.placed_quad(r, pc, 0.0, 0.0, [rgb[0], rgb[1], rgb[2], alpha]));
+                    font.placed_quad(r, pc, 0.0, 0.0, [rgb[0], rgb[1], rgb[2], alpha])
+                };
+                if let Some(q) = q {
+                    batches.push(font.is_ex(pc), q);
                 }
             }
+            batches.flush(&mut out);
             // the message text is edged (+101003) as the config says; the bar takes the slot alpha, not the
             // glyph fade-in
             for (pc, count, alpha, rgb) in bars {

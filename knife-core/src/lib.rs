@@ -2,6 +2,8 @@
 
 pub mod exe;
 pub mod format;
+pub mod itype;
+pub mod kinsoku;
 pub mod linebreak;
 pub mod par;
 pub mod vm;

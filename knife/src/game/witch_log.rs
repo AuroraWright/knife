@@ -215,7 +215,7 @@ impl Game {
         for pc in &shown {
             let [cr, cg, cb] = text::fill_rgb(pc, [1.0; 3]);
             if edge {
-                out.extend(font.rimmed_quad_edge(r, pc, text::edge_rim(1, pc.size), text::RIM_ALPHA, [cr, cg, cb], rim, alpha));
+                out.extend(font.rimmed_quad_edge(r, pc, 1, [cr, cg, cb], rim, alpha));
             } else {
                 out.extend(font.placed_quad(r, pc, 0.0, 0.0, [cr, cg, cb, alpha]));
             }

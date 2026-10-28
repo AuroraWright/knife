@@ -21,6 +21,17 @@ const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// sub_A3180's altered textures (see `Renderer::upload_altered`)
 const ALTERED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// sub_A3180's bake of a texture side of `full` texels at scale `k`: a sprite of (u32)(full / k) at scale k from
+/// the top-left of the altered texture of the source's size (Switch: the overseas QA page's aru_a_81_01_n02, 957 x
+/// 1706 texels, a 1435 x 2559 sprite into a 957 x 1706 altered texture; its art 0.035 % narrower than the
+/// texture from its left edge, within 0.002 px once modelled). The uv range over the `size` texels from `off` (a
+/// language strip's rows, else all of it) that puts the source where the sprite does; 0..1 at k = 1.
+fn bake_span(size: u32, k: f32, full: u32, off: u32) -> [f32; 2] {
+    let (side, full, off) = (size as f32, full as f32, off as f32);
+    let c = (full / k) as u32 as f32 * k / full;
+    [(off / c - off) / side, ((off + side) / c - off) / side]
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Vertex {
@@ -120,10 +131,6 @@ pub enum Shade {
     Sprite,
     Fill,
     Text,
-    /// glyph coverage with its rim composited in one pass (fill over the rim taps), so a faded glyph blends
-    /// once like nn::font's bordered glyph; `Quad::haze` = [uv clamp rect, (u, v per canvas px, rim alpha, rim
-    /// colour 0xRRGGBB: 0 black)]
-    RimText,
     Mono,
     Nega,
     /// The texture's rgb with alpha 1 (shader noalpha: the exe draws a clipped layer of a layer group this way)
@@ -397,6 +404,8 @@ pub struct Renderer {
     lut_group: wgpu::BindGroup,
     /// pre_alter without a grade, into an sRGB texture (`upload_altered`)
     alter: wgpu::RenderPipeline,
+    /// the same bake of texels already through pre_alter (`upload_baked`)
+    alter_copy: wgpu::RenderPipeline,
     /// The window is fully covered or minimised: `present` submits the frame's work but takes no surface
     /// texture (a hidden macOS window hands drawables back at once or after a second's stall)
     pub hidden: bool,
@@ -555,8 +564,8 @@ impl Renderer {
         });
 
         let white = upload_texture(&device, &queue, &sprite_layout, &sampler, 1, 1, Upload::Rgba8(&[255, 255, 255, 255]), false, "white");
-        let alter = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fs_alter"),
+        let bake_pipeline = |entry: &str| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
             layout: Some(&sprite_pl),
             vertex: wgpu::VertexState {
                 module: &module,
@@ -573,7 +582,7 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &module,
-                entry_point: Some("fs_alter"),
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: ALTERED_FORMAT,
@@ -584,6 +593,7 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let (alter, alter_copy) = (bake_pipeline("fs_alter"), bake_pipeline("fs_alter_copy"));
         Ok(Self {
             device,
             queue,
@@ -602,6 +612,7 @@ impl Renderer {
             soft_lut,
             lut_group,
             alter,
+            alter_copy,
             hidden: false,
             scale: 1.0,
             follow_window: false,
@@ -699,18 +710,29 @@ impl Renderer {
         upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, false, label)
     }
 
-    /// Upload RGBA8 pixels already baked the way pre_alter would (sRGB-encoded, see `upload_altered`).
-    pub fn upload_baked(&self, width: u32, height: u32, data: &[u8], label: &str) -> TexRef {
-        upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, Upload::Rgba8(data), true, label)
+    /// Upload RGBA8 pixels already baked the way pre_alter would (sRGB-encoded, see `upload_altered`), placed in
+    /// the altered texture as sub_A3180's bake places them (`k`, `strip`: see `upload_altered`).
+    pub fn upload_baked(&self, width: u32, height: u32, data: &[u8], k: f32, strip: Option<(u32, u32)>, label: &str) -> TexRef {
+        let src = upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, Upload::Rgba8(data), true, label);
+        self.bake(&src, &self.alter_copy, k, strip, label)
     }
 
     /// Upload an image the way sub_A3180 builds every sprite texture: the source (sampled through an sRGB view
     /// when `srgb`, as the exe's "Jpeg Tex" / "Png Tex" and the BC7 sRGB art are) is drawn once through
     /// pre_alter, which starts with pow(x, 1 / 2.2), into an "altered texture" of the graphics config's format
     /// 0 (sub_CD5F8 -> 2822, R8G8B8A8 sRGB); draws sample that copy. The output curve then shows an opaque
-    /// texel at its file value.
-    pub fn upload_altered(&self, width: u32, height: u32, data: Upload, srgb: bool, label: &str) -> TexRef {
+    /// texel at its file value. `k` is the bake's scale (its v8: 1 for the UI atlases and effect parts, 0.66667
+    /// for the story images and boot parts), see `bake_span`; `strip`: the full texture's height and the top row
+    /// of the language strip these texels are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_altered(&self, width: u32, height: u32, data: Upload, srgb: bool, k: f32, strip: Option<(u32, u32)>, label: &str) -> TexRef {
         let src = upload_texture(&self.device, &self.queue, &self.sprite_layout, &self.sampler, width, height, data, srgb, label);
+        self.bake(&src, &self.alter, k, strip, label)
+    }
+
+    /// Draw `src` through `pipeline` into a new altered texture of its size, over `bake_span` (scale `k`).
+    fn bake(&self, src: &GpuTexture, pipeline: &wgpu::RenderPipeline, k: f32, strip: Option<(u32, u32)>, label: &str) -> TexRef {
+        let (width, height) = (src.width, src.height);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -727,15 +749,20 @@ impl Renderer {
         });
         let view = texture.create_view(&Default::default());
         let [u, v] = src.uv_max();
+        let (full, top) = strip.unwrap_or((height, 0));
+        let ([u0, u1], [v0, v1]) = (bake_span(width, k, width, 0), bake_span(height, k, full, top));
+        let (u0, u1, v0, v1) = (u0 * u, u1 * u, v0 * v, v1 * v);
         let c = [1.0; 4];
-        let vx = |pos: [f32; 2], uv: [f32; 2]| Vertex { pos, uv, color: c, haze: [[0.0; 4]; 2], soft: [[0.0; 4]; 3] };
+        // the last texel's centre: the exe's source clamps there, past it knife's block-aligned one has padding
+        let last = [[(width as f32 - 0.5) / width as f32 * u, (height as f32 - 0.5) / height as f32 * v, 0.0, 0.0], [0.0; 4]];
+        let vx = |pos: [f32; 2], uv: [f32; 2]| Vertex { pos, uv, color: c, haze: last, soft: [[0.0; 4]; 3] };
         let verts = [
-            vx([-1.0, 1.0], [0.0, 0.0]),
-            vx([1.0, 1.0], [u, 0.0]),
-            vx([1.0, -1.0], [u, v]),
-            vx([-1.0, 1.0], [0.0, 0.0]),
-            vx([1.0, -1.0], [u, v]),
-            vx([-1.0, -1.0], [0.0, v]),
+            vx([-1.0, 1.0], [u0, v0]),
+            vx([1.0, 1.0], [u1, v0]),
+            vx([1.0, -1.0], [u1, v1]),
+            vx([-1.0, 1.0], [u0, v0]),
+            vx([1.0, -1.0], [u1, v1]),
+            vx([-1.0, -1.0], [u0, v1]),
         ];
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("alter"),
@@ -760,7 +787,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.alter);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &src.bind_group, &[]);
             pass.set_bind_group(1, &self.lut_group, &[]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
@@ -864,7 +891,6 @@ impl Renderer {
                         Shade::Sprite => "fs_sprite",
                         Shade::Fill => "fs_fill",
                         Shade::Text => "fs_text",
-                        Shade::RimText => "fs_rim_text",
                         Shade::Mono => "fs_mono",
                         Shade::Nega => "fs_nega",
                         Shade::NoAlpha => "fs_noalpha",
@@ -1510,5 +1536,20 @@ mod tests {
         // train scene 004 levels: knife frame -> Switch screen (Astris, sRGB-converted)
         let f = super::output_level;
         assert_eq!((f(0), f(8), f(12), f(21), f(63), f(255)), (0, 2, 4, 13, 61, 255));
+    }
+
+    #[test]
+    fn bake_span_places_the_sprite_like_sub_a3180() {
+        // aru_a_81_01_n02: 957 texels -> a 1435 sprite at 2 / 3, 956.67 texels of the altered texture
+        let [u0, u1] = super::bake_span(957, 2.0 / 3.0, 957, 0);
+        assert_eq!(u0, 0.0);
+        assert!((u1 - 957.0 / (1435.0 * (2.0f32 / 3.0))).abs() < 1e-6);
+        // 1706 -> 2559: the whole height; the UI atlases' scale 1 keeps the texture as is
+        assert_eq!(super::bake_span(1706, 2.0 / 3.0, 1706, 0), [0.0, 1.0]);
+        assert_eq!(super::bake_span(957, 1.0, 957, 0), [0.0, 1.0]);
+        // a language strip (rows 400..800 of 1601: a 2401 sprite) takes its rows' share of the squeeze
+        let c = 2401.0 * (2.0f32 / 3.0) / 1601.0;
+        let [v0, v1] = super::bake_span(400, 2.0 / 3.0, 1601, 400);
+        assert!((v0 - (400.0 / c - 400.0) / 400.0).abs() < 1e-6 && (v1 - (800.0 / c - 400.0) / 400.0).abs() < 1e-6);
     }
 }

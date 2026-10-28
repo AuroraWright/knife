@@ -6,10 +6,15 @@ use std::sync::{Arc, OnceLock};
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use knife_core::format::bffnt;
+use knife_core::itype::glyph::Hinter;
+use knife_core::itype::raster::Graymap;
+use knife_core::itype::tt;
+use knife_core::kinsoku;
 use knife_core::linebreak::LineBreak;
 use knife_render::{Blend, Quad, Renderer, Shade, TexRef};
 
 const ATLAS: u32 = 2048;
+/// the empty texels around each atlas glyph, the first row and column too (its padded quad samples half of one)
 const PAD: u32 = 2;
 
 #[derive(Clone, Copy)]
@@ -22,6 +27,30 @@ struct Glyph {
     px: f32,
 }
 
+/// A face of the font list (TrueType or CFF) rasterized as nn::font's glyph caches do (`knife_core::itype`:
+/// hinted, scan converted, outlined and trimmed bit for bit), with its hinting state at the atlas's raster size.
+struct TtFace {
+    data: Arc<Vec<u8>>,
+    hinter: Option<(u16, Hinter)>,
+}
+
+impl TtFace {
+    fn new(data: Arc<Vec<u8>>) -> Option<TtFace> {
+        tt::Font::new(&data)?;
+        Some(TtFace { data, hinter: None })
+    }
+
+    /// `c`'s cache map at `ppem` with outline width `ow` (`cache_cell`); None for a glyph that will not load.
+    fn map(&mut self, c: char, ppem: u16, ow: u16) -> Option<Graymap> {
+        let font = tt::Font::new(&self.data)?;
+        if self.hinter.as_ref().is_none_or(|&(p, _)| p != ppem) {
+            self.hinter = Some((ppem, Hinter::new(&font, ppem)));
+        }
+        let (_, h) = self.hinter.as_mut()?;
+        h.cache_map(&font, font.glyph(c as u32), ow)
+    }
+}
+
 /// exfont_nx01.bffnt, the bitmap font sub_CAE88 pairs with the message font (nn::font PairFont), and its sheet
 /// as an upright R8 texture.
 struct ExFont {
@@ -32,7 +61,8 @@ struct ExFont {
 /// The game language (sub_2DE70): 0 Japanese, 1 English, 2 / 3 Simplified / Traditional Chinese. The text
 /// engine's slot setup (sub_A7790) reads it for every slot.
 static LANGUAGE: AtomicUsize = AtomicUsize::new(0);
-/// nn::font's line breaker over the executable's tables (sub_148988), for English text.
+/// nn::font's line breaker over the executable's tables (sub_148988): English lines, and each Japanese / Chinese
+/// line's last character before the kinsoku (`plan_lines`).
 static LINE_BREAK: OnceLock<Arc<LineBreak>> = OnceLock::new();
 
 pub fn set_language(language: usize) {
@@ -57,18 +87,13 @@ pub fn english() -> bool {
 /// 3 and 4, and `jp_CBC68` picks the sub-set by the index. sub_A7790 gives index 1 to a slot with flag
 /// 0x200000 (2 with 0x2000000 too); otherwise it keeps the index set when the slot was made (1 while the
 /// text edge setting, 0x46B080 + 0x14, is on).
-pub const OUTLINE: [f32; 4] = [0.0, 2.0, 3.0, 4.0];
+pub const OUTLINE: [u16; 4] = [0, 2, 3, 4];
 
-/// The rim shader's taps per cache px of edge and their alpha (`FontAtlas::rim`), fitted on the overseas Switch's
-/// message text, Japanese and English pages (mean abs 4.10 -> 3.22 and 6.37 -> 5.43 against fixed 2 px taps at
-/// 0.55; dark pixels 12175 / 4628 against the Switch's 14593 / 4633).
-pub const RIM_TAP: f32 = 1.1;
-pub const RIM_ALPHA: f32 = 0.65;
-
-/// The rim width (`FontAtlas::rim`) of font index `index` at glyph height `px`: `OUTLINE[index]` cache px scaled
-/// from the 40 px base.
-pub fn edge_rim(index: usize, px: f32) -> f32 {
-    OUTLINE[index] * RIM_TAP * px / BASE_SIZE
+/// A glyph quad of an edged cache in fs_text's bordered mode: half coverage the edge in `edge` (RGB bytes),
+/// full the fill in the vertex colour.
+fn edged_glyph(q: Quad, edge: [u8; 3]) -> Quad {
+    let packed = (u32::from(edge[0]) << 16 | u32::from(edge[1]) << 8 | u32::from(edge[2])) as f32;
+    Quad { haze: [[packed, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], ..q }
 }
 
 /// sub_A7790: every text slot's glyph size is W / 32, times 0.9 for English (overseas build).
@@ -105,20 +130,20 @@ const GLYPH_DROP: f32 = 1.0;
 pub const JA_ASCENT: f32 = 41.0;
 static MSG_ASCENT: AtomicUsize = AtomicUsize::new(41);
 static MSG_BASELINE: AtomicUsize = AtomicUsize::new(41);
+/// The message font set's own baseline position (+36 of its ScalableFont, before the exfont pairing): its glyph
+/// cache cells' baseline, a base px above their quads' italic origin (`italic_quad`).
+static GLYPH_BASELINE: AtomicUsize = AtomicUsize::new(41);
 static BUBBLE_ASCENT: AtomicUsize = AtomicUsize::new(41);
 
 /// The fonts' base size (the font manager's +124, from sub_AB0F0's init struct): glyph scale = size / 40.
 pub const BASE_SIZE: f32 = 40.0;
-/// The pair font's (exfont + the system shared font at the base size) width, in base px: the shared font's 50
-/// (the exfont's is 41). Switch: the 3- and 6-dash runs 140.0 / 285.9 px wide (the 0xD stretch gives 141.6 /
-/// 286.4 with 50).
-const PAIR_METRIC: f32 = 50.0;
-
-/// The writer font's width (`PAIR_METRIC`). Witch on the Holy Night's pair font (PairFont::GetWidth jp_13D2B0:
-/// the larger of its fonts') is the exfont's FINF width 41 against its ScalableFont's 40 (jp_140448: the base
-/// size). Switch: the `@_` rubies 22.65 px right of their bases' start, half of 41 at the 44.4 px glyphs.
+/// The writer font's width (sub_13BCF0: scale.x x PairFont::GetWidth, the larger of its fonts'): the exfont's
+/// FINF width 41 against the ScalableFont's 40 (the base size), in every build. Switch: Witch on the Holy
+/// Night's `@_` rubies 22.65 px right of their bases' start, half of 41 at the 44.4 px glyphs; the Japanese
+/// build's three-dash run moves the pen on by 52.5 px at tag 0xD (`run_shifts` gives 52.3 with 41, 62.0 with
+/// the shared font's 50).
 pub fn pair_width() -> f32 {
-    if crate::assets::witch() { 41.0 } else { PAIR_METRIC }
+    41.0
 }
 
 /// The message pair font's line feed at the base size (`knife_core::format::sfnt::pair_metrics` over the
@@ -130,7 +155,8 @@ static BUBBLE_LINE_FEED: AtomicUsize = AtomicUsize::new(50);
 
 /// The language's font metrics: the message pair font's line feed, ascent and baseline position and the bubble
 /// pair font's ascent and line feed, in base px.
-pub fn set_font_metrics(line_feed: i32, msg_ascent: i32, msg_baseline: i32, bubble_ascent: i32, bubble_line_feed: i32) {
+pub fn set_font_metrics(line_feed: i32, msg_ascent: i32, msg_baseline: i32, bubble_ascent: i32, bubble_line_feed: i32, glyph_baseline: i32) {
+    GLYPH_BASELINE.store(glyph_baseline.max(0) as usize, Ordering::Relaxed);
     LINE_FEED.store(line_feed.max(1) as usize, Ordering::Relaxed);
     BUBBLE_LINE_FEED.store(bubble_line_feed.max(1) as usize, Ordering::Relaxed);
     MSG_ASCENT.store(msg_ascent.max(0) as usize, Ordering::Relaxed);
@@ -149,10 +175,43 @@ pub fn bubble_line_feed() -> f32 {
     BUBBLE_LINE_FEED.load(Ordering::Relaxed) as f32
 }
 
-/// An exfont cell's top above the line's baseline, in base-size px. Switch (Astris): the dash ink centre
-/// (cell row 23) 18.35 px above the baseline at 45.6 px, so the cell's glyph baseline (TGLP 37) sits 0.8
-/// base px above the line's.
-const EX_TOP: f32 = 37.8;
+/// An exfont cell's top above the line's baseline, in base-size px: the cell's glyph baseline (TGLP 37) sits a
+/// base px above the line's. Switch (Astris with its Nearest scaling filter, exact game pixels; Japanese at
+/// 45.6 px): the edged dash's rows (the sheet's 21..24) 14 166 255 155 19 over a 93 grey, as knife's.
+const EX_TOP: f32 = 38.0;
+/// An exfont glyph's italic origin above the line's baseline (base px): its quad's top, half a scaled pixel
+/// above its cell (`italic_quad`), in every language. Switch (overseas Japanese and Simplified Chinese,
+/// two-dash italic runs leaning over the text's and a ruby's height): both ends of each within 0.2 px.
+const EX_SHEAR_TOP: f32 = EX_TOP + 0.5;
+
+/// One nn::font draw buffer's glyph quads in draw order (DispStringBuffer, sub_13C5A4): the buffer draws one
+/// texture at a time, in the order the textures first appear, and each texture's glyphs in their own order, so
+/// a message's exfont glyphs (the sheet) all draw after its glyph cache glyphs, or all before them when the
+/// first glyph is one. Switch, the Japanese build: an italic six-dash run over the い after it draws on top of
+/// い, and a two-dash run's end beside い keeps its full white under い's rim (exact pixels, Astris Nearest).
+#[derive(Default)]
+pub struct Batches {
+    ex_first: Option<bool>,
+    font: Vec<Quad>,
+    ex: Vec<Quad>,
+}
+
+impl Batches {
+    pub fn push(&mut self, ex: bool, q: Quad) {
+        self.ex_first.get_or_insert(ex);
+        if ex { self.ex.push(q) } else { self.font.push(q) }
+    }
+
+    /// Append the buffer's quads to `out` and start a new buffer.
+    pub fn flush(&mut self, out: &mut Vec<Quad>) {
+        if self.ex_first == Some(true) {
+            out.append(&mut self.ex);
+        }
+        out.append(&mut self.font);
+        out.append(&mut self.ex);
+        self.ex_first = None;
+    }
+}
 
 pub struct FontAtlas {
     font: FontArc,
@@ -161,9 +220,12 @@ pub struct FontAtlas {
     /// the font file, for the GPOS pair kerning ab_glyph does not read (`kern`)
     data: Arc<Vec<u8>>,
     gpos_kern: std::cell::RefCell<HashMap<(u16, u16), i16>>,
+    /// the font list's faces for iType (the font, then the fallbacks)
+    tt: Vec<Option<TtFace>>,
     ex: Option<ExFont>,
     pub tex: TexRef,
-    glyphs: HashMap<(char, u32), Option<Glyph>>,
+    /// by char and outline width
+    glyphs: HashMap<(char, u16), Option<Glyph>>,
     /// the atlas's side
     side: u32,
     /// the glyphs' raster scale over the base size: the render scale, so a canvas drawn above or below 1080p keeps
@@ -172,27 +234,30 @@ pub struct FontAtlas {
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
+    /// Tsukihime's QA bubble font (`Game::msg_font`): its text carries style 0x40 (`plan_lines`)
+    pub bubble: bool,
 }
 
 impl FontAtlas {
-    pub fn new(r: &Renderer, mut data: Vec<u8>) -> anyhow::Result<Self> {
-        // the glyphs with bytes after their endchar, which nn::fontll draws (`cff::normalize`)
-        knife_core::format::cff::normalize(&mut data);
+    pub fn new(r: &Renderer, data: Vec<u8>) -> anyhow::Result<Self> {
         let font = FontArc::try_from_vec(data.clone())?;
         let tex = r.create_writable(ATLAS, ATLAS, true, "font atlas");
+        let data = Arc::new(data);
         Ok(Self {
             font,
             fallback: Vec::new(),
-            data: Arc::new(data),
+            tt: vec![TtFace::new(data.clone())],
+            data,
             gpos_kern: Default::default(),
             ex: None,
             tex,
             glyphs: HashMap::new(),
             side: ATLAS,
             raster: 1.0,
-            shelf_x: 0,
-            shelf_y: 0,
+            shelf_x: PAD,
+            shelf_y: PAD,
             shelf_h: 0,
+            bubble: false,
         })
     }
 
@@ -218,51 +283,80 @@ impl FontAtlas {
         self.ex.as_ref().is_some_and(|e| e.font.glyph(c).is_some())
     }
 
+    /// Whether the placed char draws from the exfont sheet (a run, or an exfont glyph), not the glyph cache.
+    pub fn is_ex(&self, pc: &PlacedChar) -> bool {
+        pc.run.is_some() || self.has_ex(pc.c)
+    }
+
     /// Add the next font of the language's font list: sub_CA500 gives each of the message glyph cache's
     /// faces the language's three font files as one nn::font font list, and the cache takes a glyph from the
     /// first font that has it (English: Helvetica Neue has no U+3000 or ■, which come from FOT-Seurat, en3).
-    pub fn add_fallback(&mut self, mut data: Vec<u8>) -> anyhow::Result<()> {
-        knife_core::format::cff::normalize(&mut data);
-        self.fallback.push(FontArc::try_from_vec(data)?);
+    pub fn add_fallback(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.fallback.push(FontArc::try_from_vec(data.clone())?);
+        self.tt.push(TtFace::new(Arc::new(data)));
         Ok(())
+    }
+
+    /// The character nn::font draws for `c`: ■ (U+25A0) when neither the font list nor the exfont has it
+    /// (Switch, overseas Japanese: 杀 and 唧, which TT_TsukuMin-D lacks, draw as its filled box, 34 px wide at
+    /// 45.6 px, in the text and in the ruby).
+    fn shown(&self, c: char) -> char {
+        let missing = |c: char| self.font.glyph_id(c).0 == 0 && self.fallback.iter().all(|f| f.glyph_id(c).0 == 0);
+        if !c.is_control() && !self.has_ex(c) && missing(c) && !missing('■') { '■' } else { c }
     }
 
     /// The font of the list that has `c`, else the first.
     fn face(&self, c: char) -> &FontArc {
-        if self.font.glyph_id(c).0 != 0 {
-            return &self.font;
+        match self.face_index(c) {
+            0 => &self.font,
+            i => &self.fallback[i - 1],
         }
-        self.fallback.iter().find(|f| f.glyph_id(c).0 != 0).unwrap_or(&self.font)
+    }
+
+    /// `face`'s place in the list (0 the font, then the fallbacks).
+    fn face_index(&self, c: char) -> usize {
+        if self.font.glyph_id(c).0 != 0 {
+            return 0;
+        }
+        self.fallback.iter().position(|f| f.glyph_id(c).0 != 0).map_or(0, |i| i + 1)
     }
 
     /// A single exfont glyph (the pair font's first font, sub_CAE88, so the inline glyph tags' characters come
     /// from it): its cell scaled by size / 40 at the pen plus its left bearing, the cell top `EX_TOP` above the
     /// baseline. The edged set (`EX_TAGS`) carries its own border at half coverage, which nn::font draws in the
     /// edge colour (Switch, QA bubble `[heart]`: a white heart in a black rim; fs_text's bordered mode).
+    /// The pair font is padded (PrintGlyph jp_13BE3C with the font's +9 set): the quad and its uv rect reach
+    /// half a texel past the cell on every side, so the sheet's empty gap blends in at the cell's edge (Switch,
+    /// nearest-scaled capture: the edged dash's ends get a column of edge colour, 64 28 13 30 65).
     fn ex_quad(&self, c: char, size: f32, (x, baseline): (f32, f32), color: [f32; 4]) -> Option<Quad> {
         let ex = self.ex.as_ref()?;
         let g = ex.font.glyph(c)?;
         let sx = size / BASE_SIZE;
         let (tw, th) = (ex.font.sheet.width as f32, ex.font.sheet.height as f32);
-        let ch = ex.font.cell_h as f32;
-        let q = Quad::rect(ex.tex.clone(), [x + f32::from(g.left) * sx, baseline - EX_TOP * sx, f32::from(g.width) * sx, ch * sx], color)
-            .with_uv_rect(g.x as f32 / tw, g.y as f32 / th, (g.x as f32 + f32::from(g.width)) / tw, (g.y as f32 + ch) / th);
-        let bordered = if EX_TAGS.iter().any(|t| t.2 == c) { 1.0 } else { 0.0 };
-        Some(Quad { blend: Blend::Alpha, shade: Shade::Text, haze: [[0.0; 4], [0.0, 0.0, bordered, 1.0]], ..q })
+        let (gw, ch) = (f32::from(g.width), ex.font.cell_h as f32);
+        let q = Quad::rect(
+            ex.tex.clone(),
+            [x + (f32::from(g.left) - 0.5) * sx, baseline - (EX_TOP + 0.5) * sx, (gw + 1.0) * sx, (ch + 1.0) * sx],
+            color,
+        )
+        .with_uv_rect((g.x as f32 - 0.5) / tw, (g.y as f32 - 0.5) / th, (g.x as f32 + gw + 0.5) / tw, (g.y as f32 + ch + 0.5) / th);
+        let border = if bordered(c) { 1.0 } else { 0.0 };
+        Some(Quad { blend: Blend::Alpha, shade: Shade::Text, haze: [[0.0; 4], [0.0, 0.0, border, 0.0]], ..q })
     }
 
     /// Quad for a placed char (a font glyph, or an exfont glyph stretched over a run) offset by (dx, dy).
     pub fn placed_quad(&mut self, r: &Renderer, pc: &PlacedChar, dx: f32, dy: f32, color: [f32; 4]) -> Option<Quad> {
-        let q = self.upright_quad(r, pc, dx, dy, color)?;
-        Some(italic_quad(q, pc, dy))
+        let q = self.upright_quad(r, pc, dx, dy, color, 0)?;
+        let ex = pc.run.is_some() || self.has_ex(pc.c);
+        Some(italic_quad(q, pc, dy, ex))
     }
 
-    /// `placed_quad` before the italic shear.
-    fn upright_quad(&mut self, r: &Renderer, pc: &PlacedChar, dx: f32, dy: f32, color: [f32; 4]) -> Option<Quad> {
+    /// `placed_quad` before the italic shear, a font glyph from the cache of outline width `ow`.
+    fn upright_quad(&mut self, r: &Renderer, pc: &PlacedChar, dx: f32, dy: f32, color: [f32; 4], ow: u16) -> Option<Quad> {
         let q = match pc.run {
             Some((n, spacing)) => self.run_quad(pc.c, (n, spacing), pc.size, (pc.x + dx, pc.baseline + dy), color),
             None if self.has_ex(pc.c) => self.ex_quad(pc.c, pc.size, (pc.x + dx, pc.baseline + dy), color),
-            None => self.quad_stretched(r, pc.c, pc.size, (pc.x + dx, pc.baseline + dy), pc.stretch, color),
+            None => self.quad_stretched(r, pc.c, pc.size, (pc.x + dx, pc.baseline + dy), pc.stretch, color, ow),
         }?;
         if pc.sx == 1.0 {
             return Some(q);
@@ -272,31 +366,29 @@ impl FontAtlas {
         Some(Quad { pos: q.pos.map(|[x, y]| [x0 + (x - x0) * pc.sx, y]), ..q })
     }
 
-    /// The placed char as one glyph filled `rgb` over its rim in `edge` (RGB bytes, the slot's edge colour;
-    /// `Shade::RimText`): the quad grows by the `rim` px the taps reach, each tap at `rim_alpha`, and `alpha`
-    /// fades the composite once.
+    /// The placed char filled `rgb` over its edge in `edge` (RGB bytes, the slot's edge colour), from the edged
+    /// cache of font index `index` (`OUTLINE`), `alpha` fading the composite once.
     #[allow(clippy::too_many_arguments)]
-    pub fn rimmed_quad_edge(&mut self, r: &Renderer, pc: &PlacedChar, rim: f32, rim_alpha: f32, rgb: [f32; 3], edge: [u8; 3], alpha: f32) -> Option<Quad> {
-        let q = self.upright_quad(r, pc, 0.0, 0.0, [rgb[0], rgb[1], rgb[2], alpha])?;
-        // a single exfont glyph is a sheet bitmap, not a glyph of the outlined cache sub-set: no rim of its own
-        if pc.run.is_none() && self.has_ex(pc.c) {
-            return Some(italic_quad(q, pc, 0.0));
+    pub fn rimmed_quad_edge(&mut self, r: &Renderer, pc: &PlacedChar, index: usize, rgb: [f32; 3], edge: [u8; 3], alpha: f32) -> Option<Quad> {
+        let color = [rgb[0], rgb[1], rgb[2], alpha];
+        // an exfont glyph (a run or not) is a sheet bitmap, not a glyph of the outlined cache sub-set: no rim of
+        // its own, the edged slot's dash and box carrying their border (`edged`), drawn in the edge colour
+        if pc.run.is_some() || self.has_ex(pc.c) {
+            let mut q = self.upright_quad(r, &PlacedChar { c: edged(pc.c), ..*pc }, 0.0, 0.0, color, 0)?;
+            q.haze[0][0] = (u32::from(edge[0]) << 16 | u32::from(edge[1]) << 8 | u32::from(edge[2])) as f32;
+            return Some(italic_quad(q, pc, 0.0, true));
         }
-        let mut q = Self::rim(q, rim, rim_alpha);
-        q.haze[1][3] = (u32::from(edge[0]) << 16 | u32::from(edge[1]) << 8 | u32::from(edge[2])) as f32;
-        Some(italic_quad(q, pc, 0.0))
+        let q = self.upright_quad(r, pc, 0.0, 0.0, color, OUTLINE[index])?;
+        Some(italic_quad(edged_glyph(q, edge), pc, 0.0, false))
     }
 
-    /// A glyph quad grown by `rim` px and drawn with `Shade::RimText`: the shader's taps (2 px orthogonal,
-    /// 1.5 px diagonal) scaled to `rim` / 2.
-    pub fn rim(q: Quad, rim: f32, rim_alpha: f32) -> Quad {
-        let ([x0, y0], [x1, y1]) = (q.pos[0], q.pos[2]);
-        let ([u0, v0], [u1, v1]) = (q.uv[0], q.uv[2]);
-        let (du, dv) = ((u1 - u0) / (x1 - x0), (v1 - v0) / (y1 - y0));
-        let k = rim / 2.0;
-        let q = Quad::rect(q.tex.clone(), [x0 - rim, y0 - rim, x1 - x0 + 2.0 * rim, y1 - y0 + 2.0 * rim], q.color)
-            .with_uv_rect(u0 - rim * du, v0 - rim * dv, u1 + rim * du, v1 + rim * dv);
-        Quad { shade: Shade::RimText, haze: [[u0, v0, u1, v1], [du * k, dv * k, rim_alpha, 0.0]], ..q }
+    /// How far right of the pen `run_quad` draws a run's glyph: centred over its n cells, English at the pen.
+    pub fn run_inset(&self, c: char, (n, spacing): (u8, f32), size: f32) -> f32 {
+        let Some(g) = self.ex.as_ref().and_then(|e| e.font.glyph(c)) else { return 0.0 };
+        if english() {
+            return 0.0;
+        }
+        (f32::from(n) * (size + spacing) - g.width as f32 * run_scale((n, spacing), size)) / 2.0
     }
 
     /// An exfont glyph stretched over n cells (nn::font tag 0xD in sub_DD334): x scale
@@ -309,21 +401,21 @@ impl FontAtlas {
     fn run_quad(&self, c: char, (n, spacing): (u8, f32), size: f32, (x, baseline): (f32, f32), color: [f32; 4]) -> Option<Quad> {
         let ex = self.ex.as_ref()?;
         let g = ex.font.glyph(c)?;
-        let n = n as f32;
+        let qw = g.width as f32 * run_scale((n, spacing), size);
         let sx = size / BASE_SIZE;
-        let w = pair_width() * sx;
-        let stretch = (w * n + spacing * (n - 1.0)) * sx / w * if crate::assets::overseas() { 0.98 } else { 0.965 };
-        let qw = g.width as f32 * stretch;
-        let cells = if english() { qw } else { n * (size + spacing) };
         let qh = ex.font.cell_h as f32 * sx;
         let (tw, th) = (ex.font.sheet.width as f32, ex.font.sheet.height as f32);
-        let u0 = (g.x as f32 + g.left.max(0) as f32) / tw;
-        let u1 = u0 + g.width as f32 / tw;
-        let q = Quad::rect(ex.tex.clone(), [x + (cells - qw) / 2.0, baseline - EX_TOP * sx, qw, qh], color)
-            .with_uv_rect(u0, g.y as f32 / th, u1, (g.y as f32 + ex.font.cell_h as f32) / th);
-        // haze[1][3] = 1: fs_text box-filters the sheet over each pixel's footprint (the sheet's hard 2-texel
-        // dash drawn below its 40 px base size)
-        Some(Quad { blend: Blend::Alpha, shade: Shade::Text, haze: [[0.0; 4], [0.0, 0.0, 0.0, 1.0]], ..q })
+        // the padded quad (`ex_quad`) at the run's x scale
+        let px = qw / g.width as f32 * 0.5;
+        let u0 = g.x as f32 + g.left.max(0) as f32;
+        let q = Quad::rect(
+            ex.tex.clone(),
+            [x + self.run_inset(c, (n, spacing), size) - px, baseline - (EX_TOP + 0.5) * sx, qw + 2.0 * px, qh + sx],
+            color,
+        )
+        .with_uv_rect((u0 - 0.5) / tw, (g.y as f32 - 0.5) / th, (u0 + g.width as f32 + 0.5) / tw, (g.y as f32 + ex.font.cell_h as f32 + 0.5) / th);
+        let border = if bordered(c) { 1.0 } else { 0.0 };
+        Some(Quad { blend: Blend::Alpha, shade: Shade::Text, haze: [[0.0; 4], [0.0, 0.0, border, 0.0]], ..q })
     }
 
     /// nn::font sizes a scalable font by its em (Switch, English: Helvetica Neue's caps 27 px tall in a 37.8 px
@@ -343,6 +435,7 @@ impl FontAtlas {
         if let Some(g) = self.ex.as_ref().and_then(|e| e.font.glyph(c)) {
             return f32::from(g.advance) * size / BASE_SIZE;
         }
+        let c = self.shown(c);
         let font = self.face(c);
         let base = font.as_scaled(Self::px(font, BASE_SIZE)).h_advance(font.glyph_id(c));
         base.round() * size / BASE_SIZE
@@ -405,31 +498,33 @@ impl FontAtlas {
         self.side = (ATLAS * self.raster.ceil() as u32).min(8192);
         self.tex = r.create_writable(self.side, self.side, true, "font atlas");
         self.glyphs.clear();
-        self.shelf_x = 0;
-        self.shelf_y = 0;
+        self.shelf_x = PAD;
+        self.shelf_y = PAD;
         self.shelf_h = 0;
     }
 
-    /// The glyph as nn::font's cache holds it: rasterized at the base size (font manager +124, 40 px) with its
-    /// box on whole pixels, which the draw scales to the slot size; above or below 1080p at the render scale times
-    /// that.
-    fn glyph(&mut self, r: &Renderer, c: char) -> Option<Glyph> {
+    /// The glyph as nn::font's glyph cache holds it (sub_143070): rasterized at the base size (font manager +124,
+    /// 40 px) with its box on whole pixels and, for an edged cache, grown by the outline width `ow`
+    /// (`cache_cell`: half coverage the edge, full the fill); the draw scales it to the slot size. Above or below
+    /// 1080p at the render scale times that, to the nearest whole ppem, the outline width scaled alike.
+    /// The faces rasterize as the Switch's iType does, TrueType and CFF, bit for bit at 1080p.
+    fn glyph(&mut self, r: &Renderer, c: char, ow: u16) -> Option<Glyph> {
         if r.scale() != self.raster {
             self.raster = r.scale();
             self.reset(r);
         }
-        let key = (c, (BASE_SIZE * 4.0) as u32);
-        if let Some(g) = self.glyphs.get(&key) {
+        let c = self.shown(c);
+        if let Some(g) = self.glyphs.get(&(c, ow)) {
             return *g;
         }
-        let font = self.face(c);
-        let id = font.glyph_id(c);
-        let outlined = font.outline_glyph(id.with_scale_and_position(Self::px(font, BASE_SIZE * self.raster), ab_glyph::point(0.0, 0.0)));
-        let g = outlined.map(|o| {
-            let b = o.px_bounds();
-            let (w, h) = (b.width().ceil() as u32 + 1, b.height().ceil() as u32 + 1);
+        let ppem = (BASE_SIZE * self.raster).round().max(1.0) as u16;
+        let scaled_ow = (f32::from(ow) * f32::from(ppem) / BASE_SIZE).round() as u16;
+        let i = self.face_index(c);
+        let map = self.tt.get_mut(i).and_then(Option::as_mut).and_then(|face| face.map(c, ppem, scaled_ow));
+        let g = map.filter(|m| m.width > 0 && m.height > 0).map(|m| {
+            let (w, h) = (m.width as u32, m.height as u32);
             if self.shelf_x + w + PAD > self.side {
-                self.shelf_x = 0;
+                self.shelf_x = PAD;
                 self.shelf_y += self.shelf_h + PAD;
                 self.shelf_h = 0;
             }
@@ -439,18 +534,11 @@ impl FontAtlas {
             let (x, y) = (self.shelf_x, self.shelf_y);
             self.shelf_x += w + PAD;
             self.shelf_h = self.shelf_h.max(h);
-            let mut buf = vec![0u8; (w * h) as usize];
-            o.draw(|px, py, cov| {
-                let i = (py * w + px) as usize;
-                if i < buf.len() {
-                    buf[i] = (cov.clamp(0.0, 1.0) * 255.0) as u8;
-                }
-            });
-            r.write_region(&self.tex, [x, y, w, h], 1, &buf);
+            r.write_region(&self.tex, [x, y, w, h], 1, &m.bits);
             Glyph {
                 rect: [x, y, w, h],
-                off: [b.min.x, b.min.y],
-                px: self.raster,
+                off: [f32::from(m.lo_x), -f32::from(m.hi_y) - 1.0],
+                px: f32::from(ppem) / BASE_SIZE,
             }
         });
         let g = g.or(Some(Glyph {
@@ -458,31 +546,34 @@ impl FontAtlas {
             off: [0.0, 0.0],
             px: 1.0,
         }));
-        self.glyphs.insert(key, g);
+        self.glyphs.insert((c, ow), g);
         g
     }
 
-    /// Quad for one glyph with its pen at (x, baseline).
-    pub fn quad(&mut self, r: &Renderer, c: char, size: f32, x: f32, baseline: f32, color: [f32; 4]) -> Option<Quad> {
-        self.quad_stretched(r, c, size, (x, baseline), 1.0, color)
+    /// Quad for one glyph with its pen at (x, baseline) from the edged cache of font index `index` (`OUTLINE`):
+    /// filled in the vertex colour over its edge in black (fs_text's bordered mode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn edged_quad(&mut self, r: &Renderer, c: char, size: f32, x: f32, baseline: f32, color: [f32; 4], index: usize) -> Option<Quad> {
+        self.quad_stretched(r, c, size, (x, baseline), 1.0, color, OUTLINE[index]).map(|q| edged_glyph(q, [0; 3]))
     }
 
     /// A glyph quad with its x scaled by `sx` about the middle of its em (Switch, train page ……: the stretched
     /// dots stay centred on the unstretched glyph).
-    fn quad_stretched(&mut self, r: &Renderer, c: char, size: f32, (x, baseline): (f32, f32), sx: f32, color: [f32; 4]) -> Option<Quad> {
-        let g = self.glyph(r, c)?;
+    /// `ow`: the cache's outline width (`glyph`).
+    #[allow(clippy::too_many_arguments)]
+    fn quad_stretched(&mut self, r: &Renderer, c: char, size: f32, (x, baseline): (f32, f32), sx: f32, color: [f32; 4], ow: u16) -> Option<Quad> {
+        let g = self.glyph(r, c, ow)?;
         if g.rect[2] == 0 {
             return None;
         }
         let [gx, gy, gw, gh] = g.rect;
         let a = self.side as f32;
         let k = size / BASE_SIZE / g.px;
-        let q = Quad::rect(
-            self.tex.clone(),
-            [x + g.off[0] * k * sx - (sx - 1.0) * size / 2.0, baseline + g.off[1] * k, gw as f32 * k * sx, gh as f32 * k],
-            color,
-        )
-        .with_uv_rect(gx as f32 / a, gy as f32 / a, (gx + gw) as f32 / a, (gy + gh) as f32 / a);
+        // padded by half a texel on every side as PrintGlyph pads every font's glyphs (the nn::font::Font
+        // constructor, 0x13DD40, sets the +9 it reads): the atlas's empty gap blends in at the cell's edge
+        let (x0, y0) = (x + (g.off[0] - 0.5) * k * sx - (sx - 1.0) * size / 2.0, baseline + (g.off[1] - 0.5) * k);
+        let q = Quad::rect(self.tex.clone(), [x0, y0, (gw as f32 + 1.0) * k * sx, (gh as f32 + 1.0) * k], color)
+            .with_uv_rect((gx as f32 - 0.5) / a, (gy as f32 - 0.5) / a, (gx + gw) as f32 / a + 0.5 / a, (gy + gh) as f32 / a + 0.5 / a);
         Some(Quad {
             blend: Blend::Alpha,
             shade: Shade::Text,
@@ -501,37 +592,37 @@ impl FontAtlas {
         self.slot_line(r, out, s, size, spacing, pos, color, None, english())
     }
 
-    /// `draw_str_slot` with the text engine's dark rim (`rimmed_quad`; the slots share sub_A7790 with the
-    /// messages) of the slot's font index (`OUTLINE`): the glyph caches render each font at the base size
-    /// (font manager +124, 40 px), so the edge is `OUTLINE[index]` cache px scaled to the glyph height.
+    /// `draw_str_slot` with the text engine's dark edge (the slots share sub_A7790 with the messages): the
+    /// glyphs of the edged cache of the slot's font index (`OUTLINE`), which the draw scales from the base size
+    /// (font manager +124, 40 px) with the glyph.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_str_slot_rimmed(&mut self, r: &Renderer, out: &mut Vec<Quad>, s: &str, size: [f32; 2], spacing: f32, pos: [f32; 2], color: [f32; 4], index: usize) -> f32 {
-        let rim = edge_rim(index, size[1] * glyph_scale());
-        self.slot_line(r, out, s, size, spacing, pos, color, Some(rim), english())
+        self.slot_line(r, out, s, size, spacing, pos, color, Some(index), english())
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// `free`: the writer's +289 (English or flag 0x10000): own advances and kerning, no fixed cells.
-    fn slot_line(&mut self, r: &Renderer, out: &mut Vec<Quad>, s: &str, [w, h]: [f32; 2], spacing: f32, [x, baseline]: [f32; 2], color: [f32; 4], rim: Option<f32>, free: bool) -> f32 {
+    /// `free`: the writer's +289 (English or flag 0x10000): own advances and kerning, no fixed cells. `rim`: the
+    /// edged font index.
+    fn slot_line(&mut self, r: &Renderer, out: &mut Vec<Quad>, s: &str, [w, h]: [f32; 2], spacing: f32, [x, baseline]: [f32; 2], color: [f32; 4], rim: Option<usize>, free: bool) -> f32 {
         let (w, h) = (w * glyph_scale(), h * glyph_scale());
         let mut pen = x;
         let mut prev = None;
-        let chars: Vec<char> = slot_chars(s).collect();
+        let chars = lone_dashes(slot_chars(s).collect(), Pass::Text, |g| self.has_ex(g));
         let prop = prop_runs(&chars, Pass::Text);
+        let mut batches = Batches::default();
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
             i += 1;
-            // the writer parses slot text like the messages (sub_BD7EC): a dash run is one exfont glyph over
-            // its n cells (tag 0xD)
-            if let Some(g) = run_kind(c).filter(|&g| g == EX_DASH && self.has_ex(g)) {
-                let n = 1 + chars[i..].iter().take_while(|&&d| run_kind(d) == Some(g)).count().min(254);
+            // the writer parses slot text like the messages (sub_BD7EC -> sub_BDC2C): two or more dashes or
+            // boxes are one exfont glyph over their n cells (tag 0xD), a single dash the plain exfont glyph
+            // (`makes_run`); the rimmed slot's glyphs are the edged set with their own border (`edged`)
+            let n = run_kind(c).filter(|&g| self.has_ex(g)).map_or(0, |g| 1 + chars[i..].iter().take_while(|&&d| run_kind(d) == Some(g)).count().min(254));
+            if let Some(g) = run_kind(c).filter(|&g| n > 0 && makes_run(g, n, Pass::Text)) {
                 i += n - 1;
+                let g = if rim.is_some() { edged(g) } else { g };
                 if let Some(q) = self.run_quad(g, (n as u8, spacing), w, (pen, baseline), color) {
-                    out.push(match rim {
-                        Some(rim) => Self::rim(q, rim, RIM_ALPHA),
-                        None => q,
-                    });
+                    batches.push(true, q);
                 }
                 // English: no spacing after the run, as in the messages
                 pen += n as f32 * (w + spacing) - spacing;
@@ -546,23 +637,31 @@ impl FontAtlas {
             }
             let (cell, sx) = self.slot_cell(c, w, h, free, prop[i - 1]);
             let gx = pen + (cell - self.advance(c, h) * sx) / 2.0;
+            if self.has_ex(c) {
+                let g = if rim.is_some() { edged(c) } else { c };
+                // the writer's x scale squeezes the glyph about its pen
+                if let Some(q) = self.ex_quad(g, h, (gx, baseline), color) {
+                    batches.push(true, Quad { pos: q.pos.map(|[x, y]| [gx + (x - gx) * sx, y]), ..q });
+                }
+                pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing) };
+                continue;
+            }
             // quad_stretched centres its stretch on the em; shift it back so the glyph starts at gx
-            if let Some(q) = self.quad_stretched(r, c, h, (gx + (sx - 1.0) * h / 2.0, baseline), sx, color) {
-                out.push(match rim {
-                    Some(rim) => Self::rim(q, rim, RIM_ALPHA),
-                    None => q,
-                });
+            let ow = rim.map_or(0, |i| OUTLINE[i]);
+            if let Some(q) = self.quad_stretched(r, c, h, (gx + (sx - 1.0) * h / 2.0, baseline), sx, color, ow) {
+                batches.push(false, if rim.is_some() { edged_glyph(q, [0; 3]) } else { q });
             }
             // nn::font's TextWriter spaces each glyph from the one before at its own spacing (`steps`)
             pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing) };
         }
+        batches.flush(out);
         pen - x
     }
 
     /// Width of a text slot line: the advances plus the spacing between glyphs.
     pub fn measure_slot(&self, s: &str, [w, h]: [f32; 2], spacing: f32) -> f32 {
         let (w, h) = (w * glyph_scale(), h * glyph_scale());
-        let chars: Vec<char> = slot_chars(s).collect();
+        let chars = lone_dashes(slot_chars(s).collect(), Pass::Text, |g| self.has_ex(g));
         let prop = prop_runs(&chars, Pass::Text);
         // the spacing goes before each glyph but the first (`steps`)
         let first = chars.first().map_or(0.0, |&c| slot_space(c, spacing));
@@ -586,7 +685,7 @@ impl FontAtlas {
             return self.measure_slot(s, [w, h], spacing);
         }
         let (w, h) = (w * glyph_scale(), h * glyph_scale());
-        let chars: Vec<char> = slot_chars(s).collect();
+        let chars = lone_dashes(slot_chars(s).collect(), Pass::Text, |g| self.has_ex(g));
         let mut prev = None;
         let total: f32 = chars.iter().map(|&c| self.kern(prev.replace(c), c, h) + self.slot_cell(c, w, h, true, false).0 + spacing).sum();
         total - if chars.is_empty() { 0.0 } else { spacing }
@@ -641,7 +740,8 @@ impl FontAtlas {
     }
 }
 
-/// A text slot string as sub_AB4D0 hands it on: each double space becomes U+3000 (not for English).
+/// A text slot string as sub_AB4D0 (every text slot's setter, the messages' too) hands it on to sub_A7790:
+/// each double space becomes U+3000 (not for English).
 fn slot_chars(s: &str) -> impl Iterator<Item = char> + '_ {
     let mut it = s.chars().peekable();
     let english = english();
@@ -660,9 +760,8 @@ fn slot_chars(s: &str) -> impl Iterator<Item = char> + '_ {
 /// the text object's +0x18A96 and sub_B697C hands the writer as +131; jp_DD0D8 then clears the fixed width
 /// (+56) for a run opened by tag 16, as for tag 27. jp_BDC2C picks the tag from the run's first characters:
 /// 27 for "!!!", 26 (fixed half cells kept) for "!" or "?" followed by "!" or "?", 16 otherwise. Switch
-/// (WoH config help, 蒼崎 青子): the space 6.7 px wide, not the half cell's 11.75. A ruby's base and text
-/// (jp_C1080, `Pass`) know no tag 27, and the ruby text's run turns fixed (26) when everything after its
-/// first character is spaces.
+/// (WoH config help, 蒼崎 青子): the space 6.7 px wide, not the half cell's 11.75. A ruby's base (jp_C1080,
+/// `Pass`) knows no tag 27; the ruby text's runs print proportional whatever their tag (`steps`).
 fn prop_runs(chars: &[char], pass: Pass) -> Vec<bool> {
     let ascii = |c: char| (' '..='~').contains(&c);
     let mut prop = vec![false; chars.len()];
@@ -679,7 +778,7 @@ fn prop_runs(chars: &[char], pass: Pass) -> Vec<bool> {
         let run = &chars[i..i + n];
         let mark = |j: usize| run.get(j).is_some_and(|&c| c == '!' || c == '?');
         let bang3 = pass == Pass::Text && run.starts_with(&['!', '!', '!']);
-        let fixed = !bang3 && mark(0) && mark(1) || pass == Pass::Ruby && run[1..].iter().all(|&c| c == ' ');
+        let fixed = !bang3 && mark(0) && mark(1);
         prop[i..i + n].fill(!fixed);
         i += n;
     }
@@ -694,10 +793,15 @@ pub enum Pass {
     Ruby,
 }
 
-/// The character space after `c`: inside sub_BDC2C's ASCII runs (tag 0x10) +100932 (sub_C36D8: 0.5 for
-/// Japanese, 1.0 for Chinese); English has no ASCII runs.
+/// The character space after `c`: inside sub_BDC2C's ASCII runs (tag 0x10) scaled by `run_spacing`; English
+/// has no ASCII runs.
 fn slot_space(c: char, spacing: f32) -> f32 {
-    if language() == 0 && (' '..='~').contains(&c) { spacing * 0.5 } else { spacing }
+    if (' '..='~').contains(&c) { spacing * run_spacing() } else { spacing }
+}
+
+/// The character space's factor inside an ASCII run, +100932 (sub_C36D8): 0.5 for Japanese, 1.0 for Chinese.
+fn run_spacing() -> f32 {
+    if language() == 0 { 0.5 } else { 1.0 }
 }
 
 /// One laid-out character of a page.
@@ -726,6 +830,8 @@ pub struct PlacedChar {
     pub wobble: Option<Wobble>,
     /// the glyph's fill colour index (`fill_colour`; 0 the slot's colour)
     pub fill: u8,
+    /// the height the glyph's italic leans over, in px (`italic_quad`; 0 its own cell's)
+    pub shear: f32,
 }
 
 /// A glyph's wobble (Witch on the Holy Night's `@a1` / `@a2`; the text object's 32-byte records at +55408):
@@ -832,8 +938,9 @@ pub enum Run {
     /// a run of bar tags (`[ber..]` / `[zap00]`): its text (a U+3000 per tag) under one bar from the sheet
     /// row `row` on (`Bar`)
     Bar { row: u8, text: String },
-    /// `@i` (jp_BDC2C tag 14, once per slot text): the italic ratio 0.25, and ASCII runs at 0.85 of the x
-    /// scale instead of 0.725 (jp_DD0D8's +132, kept to the end of the text)
+    /// `@i` (jp_BDC2C tag 14, once per slot text): the italic ratio 0.25, and in Witch on the Holy Night
+    /// ASCII runs at 0.85 of the x scale instead of 0.725 (jp_DD0D8's +132, kept to the end of the text;
+    /// Tsukihime's sub_DD0D8 / sub_DD334 and the overseas sub_DB650 keep 0.725)
     Italic,
     /// `@a1` / `@a2` / `@a` (jp_BDC2C: `a4` flag 0x10 ignores it): the wobble of the glyphs that follow, 0 none
     Wobble(u8),
@@ -950,11 +1057,11 @@ pub fn parse_markup(s: &str) -> Vec<Run> {
 /// (sub_A6220) and puts the replacement in: an exfont character (`EX_TAGS`, the edged set when `edge`) or, for
 /// the bar tags, U+3000 inside nn::font tags 22 (ber) / 25 (zap) ... 23 that mark the bar's first and last
 /// character (+101860 / +101864) and its first sheet row (+101868); tags after the first extend the bar.
-/// Unknown tags stay as text.
+/// Unknown tags stay as text. The slot gets the string from sub_AB4D0, each double space a U+3000 (`slot_chars`).
 pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
     let mut runs = Vec::new();
     let mut cur = String::new();
-    let mut it = s.chars().peekable();
+    let mut it = slot_chars(s).peekable();
     // the bar is open while tags follow each other
     let mut bar_open = false;
     while let Some(c) = it.next() {
@@ -962,7 +1069,9 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
             bar_open = false;
         }
         match c {
-            '<' => {
+            // the overseas sub_A7790 sets +101013 for English text, and its sub_BDC2C then takes `<` as a
+            // character: no ruby (Switch, English: `The <sky|Jacob's Ladder> and` drawn as written)
+            '<' if !(crate::assets::overseas() && english()) => {
                 let mut body = String::new();
                 for d in it.by_ref() {
                     if d == '>' {
@@ -974,16 +1083,31 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                     if !cur.is_empty() {
                         runs.push(Run::Text(std::mem::take(&mut cur)));
                     }
-                    // jp_C1080 skips `@` and the character after it in the ruby text
+                    // sub_BDC2C parses the ruby with sub_C1FDC (every slot's +295 is 2, set by sub_A7790).
+                    // Witch on the Holy Night's and the overseas one skip `@` and the character after it in the
+                    // ruby text; the Japanese one copies them (Switch: `<漢字|@_かんじ>` rubied "@_かんじ").
+                    // With the ASCII tags on (not English) they also drop a space read right after a U+3000 when
+                    // a U+3000 follows (Switch, WoH: 「かん　 　じ」 parses to "かん　　じ"); a skipped `@x` leaves
+                    // no previous character, `@_` keeps it
+                    let drop_space = (crate::assets::witch() || crate::assets::overseas()) && !english();
                     let mut ruby = String::new();
                     let mut under = false;
-                    let mut rt = r.chars();
+                    let mut rt = r.chars().peekable();
+                    let mut prev = None;
                     while let Some(d) = rt.next() {
-                        if d == '@' {
-                            under |= rt.next() == Some('_');
-                        } else {
-                            ruby.push(d);
+                        if d == '@' && (crate::assets::witch() || crate::assets::overseas()) {
+                            match rt.next() {
+                                Some('_') => under = true,
+                                _ => prev = None,
+                            }
+                            continue;
                         }
+                        if drop_space && d == ' ' && prev == Some('\u{3000}') && rt.peek() == Some(&'\u{3000}') {
+                            prev = None;
+                            continue;
+                        }
+                        ruby.push(d);
+                        prev = Some(d);
                     }
                     runs.push(Run::Ruby {
                         base: b.to_string(),
@@ -1082,10 +1206,51 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
 }
 
 /// The exfont glyphs sub_C1080 / sub_C0BB0 put in place of runs: for ―, ─ and — a line, for ■ a box, in the
-/// thin variants œ / ½ while the slot's +101003 switch (TsukuGo text, flag 0x200000) is off, as for message
-/// text (the thick Œ / ¼ go with the gothic font).
+/// plain variants œ / ½ while the slot's edge switch (+101003; Witch on the Holy Night's and the overseas
+/// +101007) is off, else the edged Œ / ¼ (`edged`).
 const EX_DASH: char = 'œ';
 const EX_BOX: char = '½';
+
+/// The edged exfont glyph for `c` (`EX_DASH` / `EX_BOX`), which sub_BDC2C and the ruby parsers pick while the
+/// slot has the edge (the text edge setting, flags 0x200000 / 0x80000): the same cell with a border at half
+/// coverage, which nn::font draws in the edge colour (`ex_quad`). Switch, overseas Japanese with the edge: the
+/// tagged line holds Œ, and a dash, a run or not, has a 1 px dark edge above and below its 3 white rows.
+fn edged(c: char) -> char {
+    match c {
+        EX_DASH => 'Œ',
+        EX_BOX => '¼',
+        c => c,
+    }
+}
+
+/// Whether exfont glyph `c` carries its own border at half coverage (the edged dash and box, the inline glyph
+/// tags' edged set).
+fn bordered(c: char) -> bool {
+    c == edged(EX_DASH) || c == edged(EX_BOX) || EX_TAGS.iter().any(|t| t.2 == c)
+}
+
+/// Whether `n` run characters of exfont glyph `g` (`run_kind`) in `pass` are one stretched run (tag 13). The
+/// ruby parsers (sub_C1080 for a base, sub_C1FDC for ruby text) run dashes of any length and two or more boxes;
+/// the message text's (sub_BDC2C; Witch on the Holy Night's jp_BDC2C, the overseas 0xBC8C0) runs only two or
+/// more of either and copies a single dash as the plain exfont glyph (`lone_dashes`), leaving a single box ■.
+fn makes_run(g: char, n: usize, pass: Pass) -> bool {
+    n >= 2 || g == EX_DASH && pass != Pass::Text
+}
+
+/// `chars` with each single dash of the message text (`makes_run`) as the exfont glyph sub_BDC2C copies in
+/// its place, drawn in its cell like any glyph. Switch, overseas Japanese: 「あ―い」's tagged line holds Œ with
+/// no tag 13 and the dash is drawn 3 px left of a one-cell run's.
+fn lone_dashes(mut chars: Vec<char>, pass: Pass, has_ex: impl Fn(char) -> bool) -> Vec<char> {
+    if pass == Pass::Text && has_ex(EX_DASH) {
+        for i in 0..chars.len() {
+            let dash = |j: Option<usize>| j.and_then(|j| chars.get(j)).is_some_and(|&d| run_kind(d) == Some(EX_DASH));
+            if dash(Some(i)) && !dash(i.checked_sub(1)) && !dash(Some(i + 1)) {
+                chars[i] = EX_DASH;
+            }
+        }
+    }
+    chars
+}
 
 fn run_kind(c: char) -> Option<char> {
     match c {
@@ -1125,23 +1290,42 @@ pub struct Layout {
     pub ruby_y: f32,
 }
 
-/// The glyph cache cell nn::font's italic shears (base px): its top `ITALIC_TOP` above the baseline,
-/// `ITALIC_CELL` tall.
-const ITALIC_TOP: f32 = 45.0;
-const ITALIC_CELL: f32 = 55.0;
+/// The height nn::font's italic leans a message's glyphs over when its last glyph is at `size`: the draw
+/// buffer's +188 from PrintGlyph (jp_13CEF8: scale.y x the pair font's GetHeight, vtable +40, the line feed,
+/// plus scale.y).
+fn italic_height(size: f32) -> f32 {
+    (line_feed() + 1.0) * size / BASE_SIZE
+}
 
-/// nn::font's italic (CharWriter::PrintGlyph): the top of the glyph's cell moves right by the italic ratio x
-/// the writer's x scale x the font's width (vtable +32: `pair_width`), its bottom stays, so
-/// every point of the quad leans in proportion to its height in the cell.
-fn italic_quad(q: Quad, pc: &PlacedChar, dy: f32) -> Quad {
+/// nn::font's italic (CharWriter::PrintGlyph): the glyph's record carries its shear, the whole pixels of the
+/// italic ratio x the writer's x scale x the font's width (+48, an int; vtable +32: `pair_width`), and the
+/// draw buffer one height (`italic_height`), which every glyph sets and the draw of the message's batch uses
+/// for all of them: the top of a glyph's quad (half a scaled pixel above its glyph cache cell, whose baseline
+/// is the ScalableFont's own baseline position + 1 down, `GLYPH_BASELINE`) moves right by its shear, less its
+/// shear for every such height of the last glyph below that (`PlacedChar::shear`). A message that ends with a ruby leans every italic glyph over the ruby's height,
+/// 0.52 of the text's (Switch, overseas: `@iあいう@rかき<漢字|かんじ>` leans あいう 1.94 times as steeply,
+/// level 0.52 of a cell below its top; `@iあいう@r<漢字|かんじ>かき` does not). Switch, overseas Simplified
+/// Chinese (line feed 49, ascent 39): `@i我們說――話了@r的人<漢字|中―文>` leans 0.378 px a row, 11 px over
+/// 50 x the ruby's scale, level 40.8 base px above the baseline; English (ascent 43, baseline position 40):
+/// italic text 0.5 px further right than from the ascent; Traditional Chinese (the pair's baseline position the
+/// exfont's 37, SungASC's own 43): italic text 1.4 px left of the pair's, 2.7 px with a ruby at the end. An
+/// exfont glyph (`ex`) leans from `EX_SHEAR_TOP`.
+fn italic_quad(q: Quad, pc: &PlacedChar, dy: f32, ex: bool) -> Quad {
     if pc.italic == 0.0 {
         return q;
     }
     let k = pc.size / BASE_SIZE;
-    let off = pc.italic * pair_width() * k * pc.sx;
-    let bottom = pc.baseline + dy + (ITALIC_CELL - ITALIC_TOP) * k;
-    let h = ITALIC_CELL * k;
-    Quad { pos: q.pos.map(|[x, y]| [x + off * (bottom - y) / h, y]), ..q }
+    // a run's glyph shears at the x scale tag 0xD stretched it to (Switch, `@i` over four dashes: the run
+    // 18 px right of the unstretched shear's)
+    let scale = match pc.run {
+        Some(r) => run_scale(r, pc.size),
+        None => k,
+    };
+    let off = (pc.italic * pair_width() * scale * pc.sx).trunc();
+    let cell = GLYPH_BASELINE.load(Ordering::Relaxed) as f32 + 1.0;
+    let top = pc.baseline + dy - if ex { EX_SHEAR_TOP } else { cell + 0.5 } * k;
+    let h = if pc.shear > 0.0 { pc.shear } else { italic_height(pc.size) };
+    Quad { pos: q.pos.map(|[x, y]| [x + off * (1.0 - (y - top) / h), y]), ..q }
 }
 
 /// nn::font's italic ratio after `@i` (jp_DD334 case 0xE: CharWriter +36 = 0.25).
@@ -1152,8 +1336,12 @@ const ITALIC_RATIO: f32 = 0.25;
 struct Style {
     /// the italic ratio (`ITALIC_RATIO` after `@i`, 0 after `@r`)
     italic: f32,
-    /// jp_DD0D8's +132 (tag 14): ASCII runs at 0.85 of the x scale, to the end of the text
-    wide: bool,
+    /// Witch on the Holy Night's +132 (jp_DD0D8 / jp_DD334) and the overseas +136 (sub_DB650): set by tag 14
+    /// (`@i`) and kept to the end of the text, as `@r` is tag 11 (italic ratio 0) and only sub_DC364, before
+    /// each pass of the writers, clears it. It scales Witch on the Holy Night's ASCII runs by 0.85 and moves
+    /// both builds' exfont runs (`run_shifts`). Switch, overseas: 「かき■■すと@iか@rき■■す」 draws its second
+    /// box run 4.5 px left and the す after it 4.5 px right of the first's spacing
+    seen: bool,
     /// the wobble type of the glyphs (`Wobble`)
     wobble: u8,
     /// the fill colour index (`fill_colour`, 0 the slot's)
@@ -1161,9 +1349,10 @@ struct Style {
 }
 
 impl Style {
-    /// The x scale jp_DD0D8 gives an ASCII run (tags 16 / 26 / 27): 0.725, 0.85 after `@i`.
+    /// The x scale jp_DD0D8 gives an ASCII run (tags 16 / 26 / 27): 0.725, 0.85 after Witch on the Holy
+    /// Night's `@i`.
     fn ascii_scale(&self) -> f32 {
-        if self.wide { 0.85 } else { 0.725 }
+        if self.seen && crate::assets::witch() { 0.85 } else { 0.725 }
     }
 }
 
@@ -1178,13 +1367,13 @@ impl Style {
 /// writer is not free (+289 clear: no kerning; Switch, 「dies. Te」 without the font's T-e
 /// pair), and nn::font's TextWriter moves the cursor by the character space before each glyph but a line's
 /// first, at the spacing the glyph prints with: the gap after a character is the next one's (`next` after
-/// the last; Switch, 「“Vivo」's V 2 px nearer the quote, the ” after an ASCII run 2 px further). The ruby text
-/// prints with the tag processor's +126 set (jp_DDA1C), so its runs keep the ruby writer's scale, spacing and
-/// fixed width: only a proportional run leaves the fixed width (jp_DD0D8's +56).
+/// the last; Switch, 「“Vivo」's V 2 px nearer the quote, the ” after an ASCII run 2 px further). The ruby
+/// writer has no fixed width (sub_DDA1C clears its +56), so each ruby glyph advances by its own width (every
+/// non-ASCII ruby character in the scripts is a full em).
 #[allow(clippy::too_many_arguments)]
 fn steps(atlas: &FontAtlas, chars: &[char], next: Option<char>, pass: Pass, size: f32, sx: f32, spacing: f32, st: &Style) -> Vec<(f32, f32, f32)> {
     let prop = prop_runs(chars, pass);
-    let gap = |c: char| if pass == Pass::Ruby { spacing } else { slot_space(c, spacing) };
+    let gap = |c: char| if pass == Pass::Ruby && !ruby_runs_scaled() { spacing } else { slot_space(c, spacing) };
     chars
         .iter()
         .enumerate()
@@ -1196,16 +1385,62 @@ fn steps(atlas: &FontAtlas, chars: &[char], next: Option<char>, pass: Pass, size
             if !(' '..='~').contains(&c) {
                 return (size * sx, sx, after);
             }
-            let k = if pass == Pass::Ruby { sx } else { sx * st.ascii_scale() };
-            if prop[i] {
+            let k = match pass {
+                Pass::Ruby if !ruby_runs_scaled() => sx,
+                Pass::Ruby => sx * 0.725,
+                _ => sx * st.ascii_scale(),
+            };
+            if prop[i] || pass == Pass::Ruby {
                 (atlas.advance(c, size) * k, k, after)
-            } else if pass == Pass::Ruby {
-                (size * sx, k, after)
             } else {
                 (size * sx * 0.5, k, after)
             }
         })
         .collect()
+}
+
+/// A ruby base's width as sub_DDA1C measures it (the ruby centres on the pen after the base less half of it):
+/// with a fresh tag processor (jp_DCFF8's fields: +131 set, +136 / +140 = 0.5), so an ASCII run opened by tag
+/// 16 measures proportional at the run's x scale, with half the spacing, though Tsukihime draws it in fixed
+/// half cells and Chinese at the full spacing (a tag 26 run of Witch on the Holy Night keeps its half cells);
+/// an exfont run measures nothing (jp_DD0D8's tag 0xD). Switch, Witch on the Holy Night in Traditional
+/// Chinese: 「儘管傾盡智慧──」 over a 53-character Latin base 50 px right of the drawn base's centre.
+fn ruby_base_width(atlas: &FontAtlas, chars: &[char], lay: &Layout, st: &Style) -> f32 {
+    if english() {
+        let w: f32 = chars.iter().map(|&c| atlas.advance(c, lay.size) * lay.sx + lay.spacing).sum();
+        return w - lay.spacing;
+    }
+    let prop = prop_runs(chars, Pass::Base);
+    let ascii = |c: char| (' '..='~').contains(&c);
+    let (mut w, mut first, mut i) = (0.0, true, 0);
+    while i < chars.len() {
+        let c = chars[i];
+        let n = chars[i..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count();
+        if run_kind(c).is_some_and(|g| atlas.has_ex(g) && makes_run(g, n, Pass::Base)) {
+            i += n;
+            continue;
+        }
+        let k = lay.sx * st.ascii_scale();
+        let half = crate::assets::witch() && !prop[i];
+        w += match ascii(c) {
+            true if half => lay.size * lay.sx * 0.5,
+            true => atlas.advance(c, lay.size) * k,
+            false => lay.size * lay.sx,
+        };
+        if !std::mem::take(&mut first) {
+            w += if ascii(c) { lay.spacing * 0.5 } else { lay.spacing };
+        }
+        i += 1;
+    }
+    w
+}
+
+/// Whether the ruby text's ASCII runs take the run's x scale and spacing (`ruby_runs_scaled`): Tsukihime's
+/// sub_DD334 / sub_DD0D8 scale every run by 0.725 and the spacing by +128 (Switch: `<漢字|@_かんじ>` ruby
+/// "@_" at 0.725); Witch on the Holy Night's and the overseas tag processors skip it while the ruby flag
+/// sub_DDA1C sets is on (+126 / +130), so their runs keep the ruby writer's scale and spacing.
+fn ruby_runs_scaled() -> bool {
+    !crate::assets::witch() && !crate::assets::overseas()
 }
 
 /// The first character the runs after `runs[i]` print on the same line (`steps`'s `next`).
@@ -1236,8 +1471,12 @@ pub fn layout(
 ) -> (f32, f32, usize) {
     // the writer's style from the markup (`Run::Italic` / `Run::Wobble` / `Run::Plain`)
     let mut style = Style::default();
+    let start = out.len();
     // the slot's ruby mode (+100968, reset by jp_BDA9C): the ruby writer reads it at the draw, for every ruby
     let under = runs.iter().any(|r| matches!(r, Run::Ruby { under: true, .. }));
+    // the line starts (sub_BF0F8, `plan_lines`), by the index of each `push`
+    let plan = plan_lines(atlas, lay, runs, x);
+    let unit = std::cell::Cell::new(0usize);
     // `n` > 0: a run of n source chars `c` drawn as one stretched exfont glyph (`ex`) over n cells. `cell`:
     // the glyph's cell width and x scale when not the layout's (an ASCII glyph, `ascii_cell`), the glyph
     // centred in it
@@ -1249,16 +1488,45 @@ pub fn layout(
             None => (if ex.is_some() { lay.size } else { atlas.advance(c, lay.size) }) * lay.sx,
         };
         let width = n * (adv + lay.spacing) - lay.spacing;
-        // nn::font sizes a line in characters (sub_BD7EC): N = floor((W - g / 2) / (g + spacing)) + 1 for the
-        // slot width W and the glyph width g, i.e. a character fits while its cell starts at most W - g / 2
-        // from the left (28 full-width glyphs in the 464-unit message slot, 17 in the save note's 130 units);
-        // kinsoku chars never start a line, so they overhang the right edge
-        if *x + (n - 1.0) * (adv + lay.spacing) + lay.size * lay.sx / 2.0 > lay.right && !no_line_start(c) {
+        // the fixed-width writer's cell, and sub_DD334's pen moves around an exfont run (English: `english_text`)
+        let fixed = lay.size * lay.sx;
+        let shifts = ex.filter(|_| plan.is_some()).map(|e| run_shifts(e.1, lay, st));
+        let i = unit.replace(unit.get() + 1);
+        let wrap = match &plan {
+            Some(p) => p.starts.get(i).copied().unwrap_or(false),
+            // nn::font sizes a line in characters (sub_BD7EC): N = floor((W - g / 2) / (g + spacing)) + 1 for the
+            // slot width W and the glyph width g, i.e. a character fits while its cell starts at most W - g / 2
+            // from the left (28 full-width glyphs in the 464-unit message slot, 17 in the save note's 130
+            // units); kinsoku chars never start a line, so they overhang the right edge
+            None => *x + (n - 1.0) * (adv + lay.spacing) + lay.size * lay.sx / 2.0 > lay.right && !no_line_start(c),
+        };
+        // nn::font's own wrap (jp_145B78) at the writer's width limit (+60, set by sub_C5FB4): the slot width plus
+        // (+100952 + 2) / 1920 of the screen (+100952 = 3, sub_BCDB0) plus allowance + 1 cells; a glyph or exfont
+        // run whose right edge passes it starts a line unless it is the line's first. It shows when a break
+        // was dropped (Switch, Witch on the Holy Night: 「…となに――――――らりるれろ」 breaks before り)
+        // An exfont run is its glyph at the stretched x scale after tag 0xD has moved the pen on by `before`
+        // (the writer checks the glyph's fixed cell there); a run wrapped at the limit loses that move, so its
+        // glyph sits centred on the new line's first cell, reaching past the left edge (Switch: ten dashes
+        // after 25 kana are drawn from x 58 on the next line, the kana after them at 547).
+        let limit = lay.right - lay.left + 5.0 + (fixed + lay.spacing) * (kinsoku_rules().allow + 1) as f32;
+        let limited = !wrap
+            && plan.is_some()
+            && match shifts {
+                Some((before, _)) => *x + before + fixed - lay.left > limit,
+                None => *x > lay.left && *x + width - lay.left > limit,
+            };
+        if wrap || limited {
             *x = lay.left;
             *baseline += lay.line_height;
         }
+        // a run's glyph: centred on the cell at the pen (`run_quad` centres it over n cells from `gx`)
+        let pen = match shifts {
+            Some((before, _)) if !limited => *x + before,
+            _ => *x,
+        };
         let (gx, sx) = match cell {
             Some((w, k)) => (*x + (w - atlas.advance(c, lay.size) * k) / 2.0, k),
+            None if shifts.is_some() => (pen + (fixed - n * (lay.size + lay.spacing)) / 2.0, lay.sx),
             None => (*x, lay.sx),
         };
         out.push(PlacedChar {
@@ -1274,21 +1542,24 @@ pub fn layout(
             italic: st.italic,
             wobble: (st.wobble > 0).then(|| Wobble::new(st.wobble)),
             fill: st.fill,
+            shear: 0.0,
         });
         // the run is one character to the reveal
         *order += 1;
-        *x += width + after;
+        *x = match shifts {
+            Some((_, back)) => pen + fixed + back + after,
+            None => *x + width + after,
+        };
     };
     let push_char = |c: char, st: &Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
         push(c, None, None, lay.spacing, st, x, baseline, order, out)
     };
-    let text = |t: &str, pass: Pass, next: Option<char>, st: &Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
-        let chars: Vec<char> = t.chars().collect();
+    let text = |t: &str, pass: Pass, next: Option<char>, st: &mut Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
+        let chars = lone_dashes(t.chars().collect(), pass, |g| atlas.has_ex(g));
         if english() {
             let first = out.len();
-            english_text(atlas, lay, &chars, (x, baseline), order, out);
+            english_text(atlas, lay, &chars, pass, st, (x, baseline), order, out);
             for pc in &mut out[first..] {
-                pc.italic = st.italic;
                 pc.wobble = (st.wobble > 0).then(|| Wobble::new(st.wobble));
                 pc.fill = st.fill;
             }
@@ -1300,8 +1571,7 @@ pub fn layout(
             let c = chars[i];
             let n = chars[i..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count().min(255);
             match run_kind(c) {
-                // runs of dashes (any length) and of two or more boxes (sub_C1080)
-                Some(g) if atlas.has_ex(g) && (g == EX_DASH || n >= 2) => {
+                Some(g) if atlas.has_ex(g) && makes_run(g, n, pass) => {
                     push(c, Some((g, n as u8)), None, step[i + n - 1].2, st, x, baseline, order, out);
                     i += n;
                 }
@@ -1321,10 +1591,10 @@ pub fn layout(
                 x = lay.left;
                 baseline += lay.line_height;
             }
-            Run::Text(t) => text(t, Pass::Text, next, &style, &mut x, &mut baseline, &mut order, out),
+            Run::Text(t) => text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out),
             Run::Italic => {
                 style.italic = ITALIC_RATIO;
-                style.wide = true;
+                style.seen = crate::assets::witch() || crate::assets::overseas();
             }
             Run::Wobble(k) => style.wobble = *k,
             Run::Plain => {
@@ -1336,7 +1606,7 @@ pub fn layout(
             Run::Edge(_) | Run::Indent => {}
             Run::Bar { row, text: t } => {
                 let first = out.len();
-                text(t, Pass::Text, next, &style, &mut x, &mut baseline, &mut order, out);
+                text(t, Pass::Text, next, &mut style, &mut x, &mut baseline, &mut order, out);
                 if let Some(pc) = out.get_mut(first) {
                     let len = t.chars().count().min(usize::from(u8::MAX)) as u8;
                     pc.bar = Some(Bar { row: *row, len, top: pc.baseline - lay.ascent, cell: lay.size * lay.sx + lay.spacing });
@@ -1348,11 +1618,10 @@ pub fn layout(
                 let bw: f32 = bstep.iter().map(|s| s.0 + s.2).sum();
                 // the base's last character must fit (the line size in characters above)
                 let last = bstep.last().map_or(0.0, |s| s.0 + s.2);
-                if x + bw - last + lay.size * lay.sx / 2.0 > lay.right {
+                if plan.is_none() && x + bw - last + lay.size * lay.sx / 2.0 > lay.right {
                     x = lay.left;
                     baseline += lay.line_height;
                 }
-                let start_x = x;
                 let first = order;
                 // sub_C1080 lays the base out as the text around it (ASCII runs, dash runs)
                 if english() {
@@ -1360,7 +1629,7 @@ pub fn layout(
                         push_char(c, &style, &mut x, &mut baseline, &mut order, out);
                     }
                 } else {
-                    text(base, Pass::Base, next, &style, &mut x, &mut baseline, &mut order, out);
+                    text(base, Pass::Base, next, &mut style, &mut x, &mut baseline, &mut order, out);
                 }
                 // sub_DDA1C: the ruby writer at 0.52 of the text's scale and spacing, centred over the base (the
                 // spread flag +101008 is 0 in sub_A7790's slot init); nn::font string widths have no trailing
@@ -1372,44 +1641,298 @@ pub fn layout(
                 let table = if crate::assets::witch() { &RUBY_SCALE_WITCH } else { &RUBY_SCALE };
                 let rk = table.get(language()).copied().unwrap_or(table[0]);
                 let (rs, rsp) = (lay.size * rk, lay.spacing * rk);
-                let bw = bw - bstep.last().map_or(0.0, |s| s.2);
                 let rchars: Vec<char> = ruby.chars().collect();
                 let rstep = steps(atlas, &rchars, None, Pass::Ruby, rs, lay.sx, rsp, &style);
-                let rw: f32 = rstep.iter().map(|s| s.0 + s.2).sum::<f32>() - rstep.last().map_or(0.0, |s| s.2);
+                // an exfont run of the ruby text (sub_C1080's tag 13, as in the base): (its glyph, its length)
+                let ex_run = |i: usize| {
+                    let c = rchars[i];
+                    let n = rchars[i..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count().min(255);
+                    run_kind(c).filter(|&g| atlas.has_ex(g) && makes_run(g, n, Pass::Ruby)).map(|g| (g, n))
+                };
+                // the ruby's width: jp_DD0D8's tag 0xD skips an exfont run, so the string width leaves it out
+                let mut kept = Vec::new();
+                let mut i = 0;
+                while i < rchars.len() {
+                    match ex_run(i) {
+                        Some((_, m)) => i += m,
+                        None => {
+                            kept.push(rchars[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                let mstep = steps(atlas, &kept, None, Pass::Ruby, rs, lay.sx, rsp, &style);
+                let rw: f32 = mstep.iter().map(|s| s.0 + s.2).sum::<f32>() - mstep.last().map_or(0.0, |s| s.2);
                 let n = ruby.chars().count().max(1) as f32;
                 // mode 2 (`@_` anywhere in the slot's rubies): from the base's start plus half the writer's
                 // font width (jp_13BCF0: scale.x x the pair font's width, `pair_width`), else centred; an italic
                 // writer moves the ruby right by half its shear. The ruby writer's italic ratio is the text's
                 // over the ruby scale (jp_DDA1C), so the top of each ruby glyph moves right by the base's full
-                // shear (PrintGlyph's +48: ratio x scale.x x width), but it leans only as steeply as its base
-                // (Switch, the chant's ruby: 6.3 px right of a glyph sheared at the text's ratio, the same slope)
+                // shear (PrintGlyph's +48: ratio x scale.x x width) and leans over the message's shear height
+                // (`italic_quad`; Switch, the chant's ruby: 6.3 px right of a glyph sheared at the text's
+                // ratio, the same slope)
                 let half = pair_width() * lay.size / BASE_SIZE * lay.sx * 0.5;
-                let lean = style.italic * 2.0 * half * (1.0 - rk);
-                let mut rx = if under { start_x + half } else { start_x + (bw - rw) / 2.0 } + style.italic * half + lean;
+                // the ruby writer's ratio (+36): the overseas sub_DB650 sets it to 0.25 / n for a run's glyph
+                // and to 0.25 after it once `@i` was seen, the ruby writer having no fixed width
+                let mut rit = style.italic / rk;
+                // the base's start: the pen after it less its width as sub_DDA1C measures it
+                let bm = ruby_base_width(atlas, &bchars, lay, &style);
+                let from = x - bstep.last().map_or(0.0, |s| s.2) - bm;
+                let mut rx = if under { from + half } else { from + (bm - rw) / 2.0 } + style.italic * half;
                 let b = MSG_BASELINE.load(Ordering::Relaxed) as f32 + (1.0 - rk) * GLYPH_DROP;
                 let rb = baseline - b * lay.size / BASE_SIZE - lay.ruby_y;
                 let span = (order - first).max(1);
-                for (k, (&c, &(cell, gsx, after))) in rchars.iter().zip(&rstep).enumerate() {
-                    out.push(PlacedChar {
+                let mut k = 0;
+                while k < rchars.len() {
+                    let (c, (cell, gsx, _)) = (rchars[k], rstep[k]);
+                    let order = first + (k * span / n as usize).min(span - 1);
+                    let pc = PlacedChar {
                         c,
                         x: rx + (cell - atlas.advance(c, rs) * gsx) / 2.0,
                         baseline: rb,
                         size: rs,
-                        order: first + (k * span / n as usize).min(span - 1),
+                        order,
                         run: None,
                         stretch: 1.0,
                         sx: gsx,
                         bar: None,
-                        italic: style.italic,
+                        italic: rit,
                         wobble: (style.wobble > 0).then(|| Wobble::new(style.wobble)),
                         fill: style.fill,
-                    });
-                    rx += cell + after;
+                        shear: 0.0,
+                    };
+                    match ex_run(k) {
+                        Some((g, m)) => {
+                            let (before, adv, back) = ruby_run_shifts(m as u8, rs * lay.sx / BASE_SIZE, rsp, &style, rit);
+                            let pen = rx + before;
+                            let run = (m as u8, rsp);
+                            let free = crate::assets::overseas() && style.seen;
+                            let italic = if free { ITALIC_RATIO / m as f32 } else { rit };
+                            out.push(PlacedChar { c: g, x: pen - atlas.run_inset(g, run, rs), run: Some(run), sx: lay.sx, italic, ..pc });
+                            if free {
+                                rit = ITALIC_RATIO;
+                            }
+                            rx = pen + adv + back + rstep[k + m - 1].2;
+                            k += m;
+                        }
+                        None => {
+                            out.push(pc);
+                            rx += cell + rstep[k].2;
+                            k += 1;
+                        }
+                    }
                 }
             }
         }
     }
+    // a line start after the last character (the text's last line ending at its run's 0x11 tag)
+    if plan.is_some_and(|p| p.trailing) {
+        x = lay.left;
+        baseline += lay.line_height;
+    }
+    // the draw buffer's shear height at the message's draw: its last glyph's (a ruby's after the base)
+    if let Some(h) = out[start..].last().map(|pc| italic_height(pc.size)) {
+        for pc in &mut out[start..] {
+            pc.shear = h;
+        }
+    }
     (x, baseline, order)
+}
+
+/// Japanese and Chinese text's line starts for `layout`'s runs from pen x `x`: `starts[i]` when the `i`th glyph
+/// or exfont run `layout` pushes starts a line, `trailing` when a line starts after the last. sub_BF0F8's plain
+/// copy of the slot text (`kinsoku::breaks`): the base characters (ruby text left out) with sub_BDC2C's ASCII
+/// run tags (`run_tag`) around each run of printable ASCII, a run closed at every markup code, ruby and bar; an
+/// exfont run as its glyph repeated; a bar between its tags 0x16 (ber; zap 0x19) and 0x17, the QA bubble text
+/// (style 0x40, Tsukihime) after tag 0x18; line feeds. The first line runs from the pen to the slot's right
+/// edge. English text keeps nn::font's own breaking (`english_text`).
+struct LinePlan {
+    starts: Vec<bool>,
+    trailing: bool,
+}
+
+/// The tag sub_BDC2C opens an ASCII run with at `chars[i]`: 0x10, and in Witch on the Holy Night (jp_BDC2C /
+/// jp_C1080 for a ruby base) 0x1B for "!!!" (not in a base), 0x1A for two of "!?".
+fn run_tag(chars: &[char], i: usize, pass: Pass) -> char {
+    if !crate::assets::witch() {
+        return '\u{10}';
+    }
+    let at = |j: usize| chars.get(i + j).copied();
+    let mark = |j: usize| matches!(at(j), Some('!' | '?'));
+    if pass == Pass::Text && at(0) == Some('!') && at(1) == Some('!') && at(2) == Some('!') {
+        '\u{1b}'
+    } else if mark(0) && mark(1) {
+        '\u{1a}'
+    } else {
+        '\u{10}'
+    }
+}
+
+/// sub_DD334 (Witch on the Holy Night's jp_DD334, the overseas sub_DB650) around an exfont run of `n` in a
+/// fixed-width writer: tag 0xD stretches the x scale to k (W n + sp (n - 1)) / W (`run_quad`; W the pair font's
+/// scaled width, sp the spacing) and moves the pen by `before` so that the glyph nn::font centres in its cell
+/// covers the run; tag 6, after the glyph's cell, moves it by `after`. Italic (tag 0xE: the writer's +36 =
+/// 0.25 and, in Witch on the Holy Night and the overseas build, +132 / +136) changes both.
+fn run_shifts(n: u8, lay: &Layout, st: &Style) -> (f32, f32) {
+    let n = f32::from(n);
+    let s = lay.size * lay.sx / BASE_SIZE;
+    let w = pair_width() * s;
+    let sp = lay.spacing;
+    // +68: the stretched glyph's width and its spacings past the cell's
+    let wide = run_stretch() * (w * n + sp * (n - 1.0)) + sp * (n - 1.0) * s - w;
+    let flag = st.seen;
+    let before = ((2.0 * sp * s + wide) / 2.0 - sp * (n - 1.0) / 2.0 - 1.0) / (st.italic + 1.0) - if flag { 0.1 * wide } else { 0.0 };
+    let back = before + before - before / (st.italic + 1.0) + if flag { 0.3 * wide } else { 0.0 };
+    (before, back - sp * s)
+}
+
+/// sub_DD334's pen moves around an exfont run of `n` in the ruby text (the ruby writer at x scale `s`, spacing
+/// `sp`): sub_DDA1C clears the writer's fixed width and sets the ruby flag (+118; Witch on the Holy Night's
+/// +126, the overseas +130). Tag 0xD's move is a quarter of the fixed writer's over (italic + 1), less half the
+/// run's extra width D (0.4 D in Witch on the Holy Night and the overseas build, and 0.1 D more after `@i`,
+/// `Style::seen`); the stretched glyph advances by its own width; tag 6 moves the pen by a quarter of (that
+/// move + D, 0.7 D more after `@i`) less the scaled spacing. `italic` is the ruby writer's ratio at the run.
+/// Returns (tag 0xD's move, the glyph's advance, tag 6's move).
+fn ruby_run_shifts(n: u8, s: f32, sp: f32, st: &Style, italic: f32) -> (f32, f32, f32) {
+    let n = f32::from(n);
+    let w = pair_width() * s;
+    let adv = run_stretch() * (w * n + sp * (n - 1.0));
+    let wide = adv + sp * (n - 1.0) * s - w;
+    let later = crate::assets::overseas() || crate::assets::witch();
+    let flag = st.seen;
+    let fixed = ((2.0 * sp * s + wide) / 2.0 - sp * (n - 1.0) / 2.0 - 1.0) * 0.25 / (italic + 1.0);
+    let before = fixed - if later { 0.4 } else { 0.5 } * wide - if flag { 0.1 * wide } else { 0.0 };
+    let back = 0.25 * (before + wide + if flag { 0.7 * wide } else { 0.0 }) - sp * s;
+    (before, adv, back)
+}
+
+/// The x scale sub_DD334's tag 0xD gives the writer for an exfont run of `n` cells at `size` (before the
+/// layout's own x scale): the run's cells and spacings over the font width, at `run_stretch`.
+fn run_scale((n, spacing): (u8, f32), size: f32) -> f32 {
+    let n = f32::from(n);
+    let w = pair_width() * size / BASE_SIZE;
+    (w * n + spacing * (n - 1.0)) * size / BASE_SIZE / w * run_stretch()
+}
+
+/// tag 0xD's x scale factor: 0.965 in the Japanese build's sub_DD334, 0.98 in the others'
+fn run_stretch() -> f32 {
+    if crate::assets::overseas() || crate::assets::witch() { 0.98 } else { 0.965 }
+}
+
+/// The build's kinsoku lists and allowance.
+fn kinsoku_rules() -> &'static kinsoku::Rules {
+    if crate::assets::witch() { &kinsoku::WITCH } else { &kinsoku::TSUKIHIME }
+}
+
+fn plan_lines(atlas: &FontAtlas, lay: &Layout, runs: &[Run], x: f32) -> Option<LinePlan> {
+    plan_lines_with(|c| atlas.has_ex(c), |c| atlas.advance(c, lay.size), atlas.bubble, lay, runs, x)
+}
+
+/// `plan_lines` over the atlas's exfont glyphs (`has_ex`) and advances at the layout size (`advance`).
+fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32, bubble: bool, lay: &Layout, runs: &[Run], x: f32) -> Option<LinePlan> {
+    if english() {
+        return None;
+    }
+    let lb = LINE_BREAK.get()?;
+    let witch = crate::assets::witch();
+    let mut plain = String::new();
+    if bubble && !witch {
+        plain.push('\u{18}');
+    }
+    // each pushed unit's byte offsets in `plain`: its first and last copy (an exfont run's glyph repeated)
+    let mut offs = Vec::new();
+    let mut lasts = Vec::new();
+    let mut open = false;
+    let close = |plain: &mut String, open: &mut bool| {
+        if std::mem::take(open) {
+            plain.push('\u{11}');
+        }
+    };
+    let chars_of = |plain: &mut String, open: &mut bool, offs: &mut Vec<usize>, lasts: &mut Vec<usize>, t: &str, pass: Pass| {
+        let chars = lone_dashes(t.chars().collect(), pass, &has_ex);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let n = chars[i..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count().min(255);
+            let (g, n) = match run_kind(c) {
+                Some(g) if has_ex(g) && makes_run(g, n, pass) => (g, n),
+                _ => (c, 1),
+            };
+            if (' '..='~').contains(&g) {
+                if !*open {
+                    plain.push(run_tag(&chars, i, pass));
+                    *open = true;
+                }
+            } else if std::mem::take(open) {
+                plain.push('\u{11}');
+            }
+            offs.push(plain.len());
+            lasts.push(plain.len() + (n - 1) * g.len_utf8());
+            for _ in 0..n {
+                plain.push(g);
+            }
+            i += n;
+        }
+    };
+    for run in runs {
+        match run {
+            Run::Text(t) => chars_of(&mut plain, &mut open, &mut offs, &mut lasts, t, Pass::Text),
+            Run::Bar { text, .. } => {
+                close(&mut plain, &mut open);
+                plain.push('\u{16}');
+                chars_of(&mut plain, &mut open, &mut offs, &mut lasts, text, Pass::Text);
+                close(&mut plain, &mut open);
+                plain.push('\u{17}');
+            }
+            Run::Ruby { base, .. } => {
+                close(&mut plain, &mut open);
+                chars_of(&mut plain, &mut open, &mut offs, &mut lasts, base, Pass::Base);
+                close(&mut plain, &mut open);
+            }
+            Run::Newline => {
+                close(&mut plain, &mut open);
+                offs.push(plain.len());
+                lasts.push(plain.len());
+                plain.push('\n');
+            }
+            _ => close(&mut plain, &mut open),
+        }
+    }
+    close(&mut plain, &mut open);
+    // the line feed unit is no push of `layout`'s
+    let newline: Vec<bool> = {
+        let b = plain.as_bytes();
+        offs.iter().map(|&o| b.get(o) == Some(&b'\n')).collect()
+    };
+    // Witch on the Holy Night's proportional runs at the run's x scale (the plain copy carries no wide tag)
+    let prop = |c: char| advance(c) * lay.sx * 0.725;
+    let m = kinsoku::Measure {
+        cell: lay.size * lay.sx,
+        spacing: lay.spacing,
+        run_spacing: run_spacing(),
+        prop: witch.then_some(&prop as &dyn Fn(char) -> f32),
+    };
+    let breaks = kinsoku::breaks(lb, plain.as_bytes(), lay.right - x, lay.right - lay.left, &m, kinsoku_rules());
+    let mut starts = vec![false; offs.len()];
+    let mut trailing = false;
+    for b in breaks {
+        // sub_BF0F8 keeps a break only where its plain copy has a table entry: an exfont run has one at its
+        // first copy (the tag 0xD) and its last (the character), and sub_C5610 moves either before the 0xD, so
+        // the whole run starts the line; a break between them is dropped (Switch, Witch on the Holy Night:
+        // 「…思うけど―――」 keeps its run on the line, 「…てと――――――――。」 starts the next with it)
+        if let Some(i) = offs.iter().zip(&lasts).position(|(&o, &l)| o <= b && b <= l) {
+            if b == offs[i] || b == lasts[i] {
+                starts[i] = true;
+            }
+            continue;
+        }
+        match offs.iter().position(|&o| o >= b) {
+            Some(i) => starts[i] = true,
+            None => trailing = true,
+        }
+    }
+    let starts = starts.into_iter().zip(newline).filter(|&(_, nl)| !nl).map(|(s, _)| s).collect();
+    Some(LinePlan { starts, trailing })
 }
 
 /// English message text (the overseas build's +101009 = English, sub_A7790): no per-line character count
@@ -1417,16 +1940,17 @@ pub fn layout(
 /// the slot width (sub_C7240 / sub_145334: pen + spacing + kerning + advance > width; a line's first character
 /// always fits) and asks sub_148988 for the line's last character; sub_C471C breaks right after it, so a line
 /// keeps its trailing spaces. Glyphs advance by their own width plus the kerning before them and the spacing.
-fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], (x, baseline): (&mut f32, &mut f32), order: &mut usize, out: &mut Vec<PlacedChar>) {
-    // sub_C1080 turns runs of dashes and of two or more boxes into one stretched exfont glyph (tag 13) for
-    // English text too: units of (first char index, char count, exfont glyph)
+#[allow(clippy::too_many_arguments)]
+fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], pass: Pass, st: &mut Style, (x, baseline): (&mut f32, &mut f32), order: &mut usize, out: &mut Vec<PlacedChar>) {
+    // the parsers' exfont runs (tag 13, `makes_run`) for English text too: units of (first char index, char
+    // count, exfont glyph)
     let mut units: Vec<(usize, usize, Option<char>)> = Vec::new();
     let mut k = 0;
     while k < chars.len() {
         let c = chars[k];
         let n = chars[k..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count().min(255);
         match run_kind(c) {
-            Some(g) if atlas.has_ex(g) && (g == EX_DASH || n >= 2) => {
+            Some(g) if atlas.has_ex(g) && makes_run(g, n, pass) => {
                 units.push((k, n, Some(g)));
                 k += n;
             }
@@ -1436,18 +1960,35 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], (x, baseline): 
             }
         }
     }
-    // a unit's kerning (none next to a run) and width
-    let width = |prev: Option<char>, u: (usize, usize, Option<char>)| match u.2 {
-        Some(_) => (0.0, u.1 as f32 * (lay.size * lay.sx + lay.spacing) - lay.spacing),
+    // an exfont run of n at the italic ratio `italic`: the tag processor (sub_DB650; Witch on the Holy Night's
+    // jp_DD334) of a writer without fixed width (+56 = 0) centres nothing (+92 clear for English, so D = 0) and
+    // quarters both moves: tag 0xD moves the pen by v = (sp s - sp (n - 1) / 2 - 1) / 4 / (italic + 1), the
+    // stretched glyph advances by 0.98 (W n + sp (n - 1)) (W = 41 s) plus the spacing, and tag 6 moves it by
+    // (v + v - v / (italic' + 1)) / 4 - sp s. The overseas one, once `@i` was seen, draws the glyph at the
+    // ratio 0.25 / n (italic') and is at 0.25 after it, `@r` or not. Switch, English: the text after a
+    // two-dash or two-box run 0.5 px right of n (size + spacing) - spacing on. Returns (v, the glyph's
+    // advance, the pen's move after it, italic', the ratio after the run).
+    let run_moves = |n: usize, italic: f32| {
+        let (n, sp, s) = (n as f32, lay.spacing, lay.size * lay.sx / BASE_SIZE);
+        let v = (sp * s - sp * (n - 1.0) / 2.0 - 1.0) * 0.25 / (italic + 1.0);
+        let free = st.seen && crate::assets::overseas();
+        let it = if free { ITALIC_RATIO / n } else { italic };
+        let back = (v + v - v / (it + 1.0)) * 0.25 - sp * s;
+        (v, run_stretch() * (pair_width() * s * n + sp * (n - 1.0)), sp + back, it, if free { ITALIC_RATIO } else { italic })
+    };
+    // a unit's kerning (none next to a run), width and the spacing after it, at the italic ratio `italic`
+    let width = |prev: Option<char>, u: (usize, usize, Option<char>), italic: f32| match u.2 {
+        Some(_) => {
+            let (v, adv, after, ..) = run_moves(u.1, italic);
+            (0.0, v + adv, after)
+        }
         None => {
             let c = chars[u.0];
-            (atlas.kern(prev, c, lay.size) * lay.sx, atlas.advance(c, lay.size) * lay.sx)
+            (atlas.kern(prev, c, lay.size) * lay.sx, atlas.advance(c, lay.size) * lay.sx, lay.spacing)
         }
     };
     let next_prev = |u: (usize, usize, Option<char>)| if u.2.is_some() { None } else { Some(chars[u.0]) };
-    // the spacing after a unit: none after a run (Switch, Seurat bubble "■■■■ ■■■■■.": the space and the
-    // full stop follow the runs' n cells less the trailing spacing within a pixel)
-    let after = |u: (usize, usize, Option<char>)| if u.2.is_some() { 0.0 } else { lay.spacing };
+    let italic_after = |u: (usize, usize, Option<char>), italic: f32| if u.2.is_some() { run_moves(u.1, italic).4 } else { italic };
     let lb = LINE_BREAK.get();
     let mut i = 0;
     let mut prev: Option<char> = None;
@@ -1455,15 +1996,17 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], (x, baseline): 
         // the first unit past the width
         let mut px = *x;
         let mut kp = prev;
+        let mut italic = st.italic;
         let mut overflow = None;
         for (j, &u) in units.iter().enumerate().skip(i) {
-            let (kern, w) = width(kp, u);
+            let (kern, w, after) = width(kp, u, italic);
             if (j > i || *x > lay.left) && px + kern + w > lay.right {
                 overflow = Some(j);
                 break;
             }
-            px += kern + w + after(u);
+            px += kern + w + after;
             kp = next_prev(u);
+            italic = italic_after(u, italic);
         }
         let last = match overflow {
             None => units.len() - 1,
@@ -1484,16 +2027,20 @@ fn english_text(atlas: &FontAtlas, lay: &Layout, chars: &[char], (x, baseline): 
             continue;
         }
         for &u in &units[i..=last] {
-            let (kern, w) = width(prev, u);
+            let (kern, w, after) = width(prev, u, st.italic);
             *x += kern;
-            let (c, run) = match u.2 {
-                Some(g) => (g, Some((u.1 as u8, lay.spacing))),
-                None => (chars[u.0], None),
+            let (c, run, gx, italic) = match u.2 {
+                Some(g) => {
+                    let (v, _, _, it, _) = run_moves(u.1, st.italic);
+                    (g, Some((u.1 as u8, lay.spacing)), *x + v, it)
+                }
+                None => (chars[u.0], None, *x, st.italic),
             };
-            out.push(PlacedChar { c, x: *x, baseline: *baseline, size: lay.size, order: *order, run, stretch: 1.0, sx: lay.sx, bar: None, italic: 0.0, wobble: None, fill: 0 });
+            out.push(PlacedChar { c, x: gx, baseline: *baseline, size: lay.size, order: *order, run, stretch: 1.0, sx: lay.sx, bar: None, italic, wobble: None, fill: 0, shear: 0.0 });
             *order += 1;
-            *x += w + after(u);
+            *x += w + after;
             prev = next_prev(u);
+            st.italic = italic_after(u, st.italic);
         }
         i = last + 1;
         if i < units.len() {
@@ -1515,30 +2062,42 @@ pub fn rgb565(c: u16) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
-    use ab_glyph::{Font, FontRef};
-
-    /// Every drawn glyph of the CFF fonts outlines once `cff::normalize` has moved the data after their
-    /// endchar out of the way (needs switch_romfs and switch_romfs_en): the bubble text "Sometimes, ..." of
-    /// the overseas bad ends lost o / e / t / s, the English message font ö, ’, ”, — and the rest.
+    /// Witch on the Holy Night's breaks around dash runs (Switch, Astris with these lines in script_text.mrg):
+    /// a break on a run's first or last copy starts the line with the whole run, one between is dropped.
     #[test]
-    fn cff_glyphs_after_endchar_outline() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for (font, fixed) in [
-            ("switch_romfs/ja3/FOT-SeuratPro-M.otf", 65),
-            ("switch_romfs_en/en/HelveticaNeueLTGEO-55Roman.otf", 59),
-            ("switch_romfs_en/en2/DemosNextPro-Regular.otf", 18),
-            ("switch_romfs_en/en3/FOT-SeuratPro-M.otf", 18),
+    fn witch_dash_run_breaks() {
+        use super::*;
+        crate::assets::TEST_WITCH.set(true);
+        let nso = crate::assets::exe_tables(knife_core::exe::Build::Witch).unwrap();
+        let _ = LINE_BREAK.set(Arc::new(LineBreak::load(&nso).unwrap()));
+        let lay = Layout { line_height: 1.0, ..crate::game::WITCH_LAYOUT };
+        for (text, want) in [
+            ("あいうえおかきくけこさしすせそたちつてとなにぬ―――――。", vec!["あいうえおかきくけこさしすせそたちつてとなにぬ", "―――――。"]),
+            ("あいうえおかきくけこさしすせそたちつてと――――――――。", vec!["あいうえおかきくけこさしすせそたちつてと", "――――――――。"]),
+            ("あいうえおかきくけこさしすせそたちつてとなにぬねのは――らりるれろ", vec!["あいうえおかきくけこさしすせそたちつてとなにぬねのは", "――らりるれろ"]),
+            ("あいうえおかきくけこさしすせそたちつてとなにぬねの―――らりるれろ", vec!["あいうえおかきくけこさしすせそたちつてとなにぬねの―――らりるれろ"]),
+            ("つまり、なんていうか、口にするのもどうかと思うけど―――", vec!["つまり、なんていうか、口にするのもどうかと思うけど―――"]),
         ] {
-            let Ok(mut data) = std::fs::read(root.join(font)) else { continue };
-            assert_eq!(knife_core::format::cff::normalize(&mut data), fixed, "{font}");
-            let f = FontRef::try_from_slice(&data).unwrap();
-            for c in "Sometimes, it's not our hero öà’”—".chars() {
-                if f.glyph_id(c).0 != 0 && c != ' ' {
-                    assert!(f.outline(f.glyph_id(c)).is_some(), "{font}: {c}");
+            let runs = parse_markup(text);
+            let plan = plan_lines_with(|_| true, |_| lay.size, false, &lay, &runs, lay.left).unwrap();
+            // the pushed units: dash runs as one
+            let mut units: Vec<String> = Vec::new();
+            for c in text.chars() {
+                match units.last_mut() {
+                    Some(u) if c == '―' && u.ends_with('―') => u.push(c),
+                    _ => units.push(c.to_string()),
                 }
             }
-            // the glyphs are untouched otherwise: normalizing twice changes nothing
-            assert_eq!(knife_core::format::cff::normalize(&mut data), 0, "{font}");
+            let mut lines = vec![String::new()];
+            for (u, &start) in units.iter().zip(&plan.starts) {
+                if start {
+                    lines.push(String::new());
+                }
+                lines.last_mut().unwrap().push_str(u);
+            }
+            assert_eq!(lines, want, "{text}");
+            assert!(!plan.trailing, "{text}");
         }
     }
 }
+

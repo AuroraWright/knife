@@ -2,7 +2,8 @@
 """Drive and capture the Switch original running in Astris, and compare it with knife.
 
 Astris must have focus to take input (the commands activate it). Needs `tools/emu/dsu_server.py` running (Astris: Input = DSU Controller, 127.0.0.1:26760, slot 0) and the game
-window open. Captures are the game area of the window, scaled to 1920x1080.
+window open. Captures are the game area of the window, scaled to 1920x1080 (exact game pixels with Astris's Nearest
+scaling filter).
 EMU_GAME=en drives the overseas build (TSUKIHIME, knife on switch_romfs_en) and
 EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh) instead of the Japanese Tsukihime
 (the default, EMU_GAME=ja).
@@ -33,9 +34,11 @@ EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh) instead of the Japanese 
         The screen must be unlocked (clicks and the controller do not reach a locked session).
 """
 
+import functools
 import io
 import json
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -56,9 +59,11 @@ SAVE_ROOT = os.path.expanduser("~/Library/Containers/V380-Ori.Astris/Data/Librar
 # pt, knife's data). The Library lists the games by title, now all Japanese: 月姫 1.0.2 (the
 # Japanese build), 月姫 1.0.1 (the overseas build), then 魔法使いの夜.
 GAMES = {
-    # both Tsukihime builds title their window 月姫 -A piece of blue glass moon- – Version: X
+    # both Tsukihime builds title their window 月姫 -A piece of blue glass moon- (some windows add " – Version: X";
+    # without it either build matches: one game runs at a time and restart confirms which by its metadata)
     "ja": (0x01001DC01486A000, lambda t: t.startswith("月姫") and "1.0.1" not in t, (200, 114), "switch_romfs"),
-    "en": (0x010057A01E4D4000, lambda t: t.startswith("TSUKIHIME") or t.startswith("月姫") and "1.0.1" in t, (200, 210),
+    "en": (0x010057A01E4D4000, lambda t: t.startswith("TSUKIHIME") or t.startswith("月姫") and "Version" not in t
+           or t.startswith("月姫") and "1.0.1" in t, (200, 210),
            "switch_romfs_en"),
     "woh": (0x0100751018DBA000, lambda t: t.startswith(("WITCH ON THE HOLY NIGHT", "魔法使いの夜")), (200, 306),
             "switch_romfs_woh"),
@@ -132,7 +137,7 @@ def grab(win, path):
     subprocess.run(["screencapture", "-x", "-o", "-l", win[0], tmp], check=True)
     im = to_srgb(Image.open(tmp))
     os.remove(tmp)
-    im.crop(crop_box(win, im.size[0])).resize((1920, 1080), Image.LANCZOS).save(path)
+    im.crop(crop_box(win, im.size[0])).resize((1920, 1080), game_filter()).save(path)
 
 
 def to_srgb(im, icc=None):
@@ -145,6 +150,21 @@ def to_srgb(im, icc=None):
         return im
     src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
     return ImageCms.profileToProfile(im, src, ImageCms.createProfile("sRGB"), outputMode="RGB")
+
+
+@functools.cache
+def game_filter():
+    """Image.NEAREST when Astris scales the game with its Nearest filter (Settings > Graphics > Scaling filter):
+    each game pixel is then a block of window pixels and the block centres give the game's pixels exactly;
+    otherwise (Bilinear) Lanczos, which only undoes the window's scale."""
+    try:
+        out = subprocess.run(["defaults", "export", os.path.expanduser(
+            "~/Library/Containers/V380-Ori.Astris/Data/Library/Preferences/V380-Ori.Astris"), "-"],
+            capture_output=True, check=True).stdout
+        nearest = json.loads(plistlib.loads(out)["RyujinxOptions"]).get("scalingFilter") == "Nearest"
+    except (subprocess.CalledProcessError, KeyError, ValueError, plistlib.InvalidFileException):
+        nearest = False
+    return Image.NEAREST if nearest else Image.LANCZOS
 
 
 def crop_box(win, px_w):
@@ -190,9 +210,10 @@ def rec(name, keys, fps, until):
     subprocess.run(["screencapture", "-x", "-o", "-l", win[0], tmp], check=True)
     icc = Image.open(tmp).info.get("icc_profile")
     os.remove(tmp)
+    resample = game_filter()
     for f in sorted(os.listdir(raw)):
         im = to_srgb(Image.open(os.path.join(raw, f)), icc)
-        im.crop(crop_box(win, im.size[0])).resize((1920, 1080), Image.LANCZOS).save(
+        im.crop(crop_box(win, im.size[0])).resize((1920, 1080), resample).save(
             os.path.join(d, "emu_" + f[2:]), quality=92)
     shutil.rmtree(raw)
     print(d, "recorded")

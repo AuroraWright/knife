@@ -52,10 +52,11 @@ impl Image {
 pub enum Pixels {
     /// As stored; `true`: still to go through pre_alter (`Renderer::upload_altered`)
     Bntx(bntx::Texture, bool),
-    /// RGBA8; `Some(srgb)`: still to go through pre_alter, sampled through an sRGB view when `srgb`
-    Rgba(u32, u32, Vec<u8>, Option<bool>),
-    /// RGBA8 baked on the CPU (`Bake::apply`), sRGB-encoded like the altered texture it stands for
-    Baked(u32, u32, Vec<u8>),
+    /// RGBA8; `Some(srgb)`: still to go through pre_alter, sampled through an sRGB view when `srgb`; then a
+    /// language strip's (full height, top row)
+    Rgba(u32, u32, Vec<u8>, Option<bool>, Option<(u32, u32)>),
+    /// RGBA8 baked on the CPU (`Bake::apply`), sRGB-encoded like the altered texture it stands for; strip as above
+    Baked(u32, u32, Vec<u8>, Option<(u32, u32)>),
 }
 
 /// An image `Assets::prefetch` is reading on a worker thread: its name, language strip, and where the pixels
@@ -278,10 +279,10 @@ impl Assets {
 
     /// Hand the language's font metrics (`font_metrics`) to the text layout.
     fn apply_font_metrics(&self) {
-        let (msg, bubble) = self.font_metrics();
+        let (msg, bubble, glyph_baseline) = self.font_metrics();
         // Tsukihime's bubble font is in the message font list (`<folder>3`), whose line feed it shares
         let bubble_feed = if self.build == Build::Witch { bubble.line_feed } else { msg.line_feed };
-        crate::text::set_font_metrics(msg.line_feed, msg.ascent, msg.baseline, bubble.ascent, bubble_feed);
+        crate::text::set_font_metrics(msg.line_feed, msg.ascent, msg.baseline, bubble.ascent, bubble_feed, glyph_baseline);
     }
 
     /// jp_9A700: the languages the data declares.
@@ -604,38 +605,42 @@ impl Assets {
             return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?, !grade.raw));
         }
         let (w, mut h, mut px, srgb) = decode_image(&data)?;
+        let mut rows_of = None;
         if let Some((k, n)) = strip {
             let rows = h / n as u32;
-            let top = (h as usize * k / n) * w as usize * 4;
-            px = px[top..top + (rows * w) as usize * 4].to_vec();
+            let top = h as usize * k / n;
+            px = px[top * w as usize * 4..(top + rows as usize) * w as usize * 4].to_vec();
+            rows_of = Some((h, top as u32));
             h = rows;
         }
         if grade.cpu() {
             grade.apply(&mut px, srgb);
-            return Ok(Pixels::Baked(w, h, px));
+            return Ok(Pixels::Baked(w, h, px, rows_of));
         }
-        Ok(Pixels::Rgba(w, h, px, (!grade.raw).then_some(srgb)))
+        Ok(Pixels::Rgba(w, h, px, (!grade.raw).then_some(srgb), rows_of))
     }
 
     fn upload_pixels(&self, r: &Renderer, name: &str, pixels: Pixels) -> Result<Image> {
+        // sub_A3180's bake scale for the story images (sub_AAA40 / sub_B6A20, the save previews' too)
+        let k = 2.0 / 3.0;
         let tex = match pixels {
-            Pixels::Bntx(t, true) => upload_bntx(r, &t)?,
+            Pixels::Bntx(t, true) => upload_bntx(r, &t, k)?,
             Pixels::Bntx(t, false) => upload_bntx_raw(r, &t)?,
-            Pixels::Rgba(w, h, px, Some(srgb)) => r.upload_altered(w, h, Upload::Rgba8(&px), srgb, name),
-            Pixels::Rgba(w, h, px, None) => r.upload(w, h, Upload::Rgba8(&px), name),
-            Pixels::Baked(w, h, px) => r.upload_baked(w, h, &px, name),
+            Pixels::Rgba(w, h, px, Some(srgb), strip) => r.upload_altered(w, h, Upload::Rgba8(&px), srgb, k, strip, name),
+            Pixels::Rgba(w, h, px, None, _) => r.upload(w, h, Upload::Rgba8(&px), name),
+            Pixels::Baked(w, h, px, strip) => r.upload_baked(w, h, &px, k, strip, name),
         };
         let no_shake = self.image_info(name).is_some_and(|i| i.no_shake);
         let (width, height, center_x, center_y, level) = match self.image_info(name) {
             // Witch on the Holy Night's layer draw (sub_1A090 -> jp_B0460 / sub_16210 / jp_36520) sizes the quad by
-            // the altered texture, (u32)(size / 0.66667) px (jp_A3180) in the 1920x1080 space, a language-strip
+            // the altered texture, (u32)(size / (2 / 3)) px (jp_A3180, the f32 0x3F2AAAAB) in the 1920x1080 space, a language-strip
             // image's height over the strip count; the ImageInfo gives only the centre (+52 / +56) the position is
             // offset by. Its width / height can disagree (SOU_L_12_10_00_01_01: 228 x 384 units, texture 402 x 860).
-            // The save thumbnails (jp_89AD0) size their 1/6 copies by texture / 0.16667 in the 1280x720 thumbnail
+            // The save thumbnails (jp_89AD0) size their 1/6 copies by texture / (1 / 6) in the 1280x720 thumbnail
             // surface, 1.5 times that in the 1920 space the previews are laid out in.
             Some(i) if witch() => {
                 let n = self.strip(name).map_or(1, |(_, n)| n as u32);
-                let (k, m) = if name.starts_with(THUMB) { (0.16667, 1.5) } else { (0.66667, 1.0) };
+                let (k, m) = if name.starts_with(THUMB) { (1.0 / 6.0, 1.5) } else { (2.0 / 3.0, 1.0) };
                 let alt = |v: u32| (v as f32 / k) as u32 as f32 * m;
                 let w = alt(tex.width) / 3.0;
                 let h = alt(tex.height * n) / n as f32 * 362.0 / 1080.0;
@@ -674,7 +679,7 @@ impl Assets {
         let data = self.allui.read(i)?;
         let mut out = Vec::new();
         for t in bntx::parse(&data)? {
-            let tex = upload_bntx(r, &t)?;
+            let tex = upload_bntx(r, &t, 1.0)?;
             out.push((t.name.clone(), tex));
         }
         // the game picks atlas images by index (the object table, sub_9A940); the other languages' atlases
@@ -733,7 +738,8 @@ impl Assets {
         let load = || -> Result<TexRef> {
             let data = self.roots.archive("parts")?.read(index)?;
             let t = bntx::parse(&data)?.into_iter().next().context("empty BNTX")?;
-            upload_bntx(r, &t)
+            // sub_B5650 bakes them as story images (sub_B02A0 with a9 false)
+            upload_bntx(r, &t, 2.0 / 3.0)
         };
         load().map_err(|e| tracing::warn!("parts #{index}: {e:#}")).ok()
     }
@@ -824,8 +830,9 @@ impl Assets {
     /// (the language's three fonts sub_AB0F0 loads) and of the bubble font (`<folder>3`), each paired with the
     /// exfont: line feed / ascent / baseline position Japanese 50 / 41 / 41, English 53 / 43 / 40 (bubble ascent
     /// 41), Simplified Chinese 49 / 39 / 39, Traditional Chinese 47 / 39 / 37 (the exfont's); the Japanese ones
-    /// without font files.
-    fn font_metrics(&self) -> (sfnt::SetMetrics, sfnt::SetMetrics) {
+    /// without font files. Also the message set's own baseline position, its glyph cache cell's (Traditional
+    /// Chinese: SungASC's 43, not the pair's 37).
+    fn font_metrics(&self) -> (sfnt::SetMetrics, sfnt::SetMetrics, i32) {
         use knife_core::format::{bffnt, bfttf};
         let read = |p: PathBuf| std::fs::read(p).ok().map(|d| bfttf::decode(&d).unwrap_or(d));
         let set = |suffixes: &[&str]| {
@@ -843,7 +850,8 @@ impl Assets {
                 baseline: i32::from(f.baseline),
             });
         let ja = sfnt::SetMetrics { height: 50, ascent: 41, line_feed: 50, baseline: 41 };
-        let msg = set(&["", "2", "3"]).map_or(ja, |m| sfnt::pair_metrics(m, ex));
+        let own = set(&["", "2", "3"]);
+        let msg = own.map_or(ja, |m| sfnt::pair_metrics(m, ex));
         let bubble = match set(&["3"]) {
             Some(m) => sfnt::pair_metrics(m, ex),
             // Witch on the Holy Night's bubble variant is the shared system font (`Game::load_fonts`)
@@ -855,7 +863,7 @@ impl Assets {
                 .map_or(msg, |m| sfnt::pair_metrics(m, ex)),
             None => msg,
         };
-        (msg, bubble)
+        (msg, bubble, own.map_or(ja.baseline, |m| m.baseline))
     }
 
     /// The console shared fonts sub_AB0F0 asks for, in their order of priority (sub_C9F3C: nn::pl::GetSharedFont
@@ -979,16 +987,16 @@ impl Assets {
 }
 
 /// Upload a BNTX texture as a sprite texture (through pre_alter, `Renderer::upload_altered`; the exe builds every
-/// image slot with sub_A3180).
-pub fn upload_bntx(r: &Renderer, t: &bntx::Texture) -> Result<TexRef> {
+/// image slot with sub_A3180), baked at scale `k` (1 for the UI atlases).
+pub fn upload_bntx(r: &Renderer, t: &bntx::Texture, k: f32) -> Result<TexRef> {
     let (label, srgb) = (&t.name, t.format.is_srgb());
     Ok(match t.format {
-        TexFormat::Bc7Unorm | TexFormat::Bc7Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc7(&t.data), srgb, label),
-        TexFormat::Bc1Unorm | TexFormat::Bc1Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc1(&t.data), srgb, label),
-        TexFormat::Bc3Unorm | TexFormat::Bc3Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc3(&t.data), srgb, label),
+        TexFormat::Bc7Unorm | TexFormat::Bc7Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc7(&t.data), srgb, k, None, label),
+        TexFormat::Bc1Unorm | TexFormat::Bc1Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc1(&t.data), srgb, k, None, label),
+        TexFormat::Bc3Unorm | TexFormat::Bc3Srgb if r.bc_supported => r.upload_altered(t.width, t.height, Upload::Bc3(&t.data), srgb, k, None, label),
         _ => {
             let rgba = bntx_decode::to_rgba8(t)?;
-            r.upload_altered(t.width, t.height, Upload::Rgba8(&rgba), srgb, label)
+            r.upload_altered(t.width, t.height, Upload::Rgba8(&rgba), srgb, k, None, label)
         }
     })
 }

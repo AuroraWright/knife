@@ -126,55 +126,24 @@ fn fs_fill(i: VsOut) -> @location(0) vec4<f32> {
 // and light text on a dark ground stays as is (Switch: flowchart panel / chapter name / music list).
 @fragment
 fn fs_text(i: VsOut) -> @location(0) vec4<f32> {
-    var c = textureSample(tex0, samp, i.uv).r;
-    // hy.w = 1 (exfont sheet glyphs, scaled): the mean over the pixel's footprint, 4 x 4 taps
-    let dx = dpdx(i.uv);
-    let dy = dpdy(i.uv);
-    if i.hy.w > 0.5 {
-        var sum = 0.0;
-        for (var y = 0; y < 4; y++) {
-            for (var x = 0; x < 4; x++) {
-                let o = (vec2<f32>(f32(x), f32(y)) + 0.5) / 4.0 - 0.5;
-                sum += textureSampleLevel(tex0, samp, i.uv + dx * o.x + dy * o.y, 0.0).r;
-            }
-        }
-        c = sum / 16.0;
-    }
-    // hy.z = 1 (exfont glyphs with their own border, the inline glyph tags' edged set): half coverage is the
-    // border, drawn black, full coverage the fill in the vertex colour
+    // exfont glyphs too: plain bilinear at any scale (Switch, nearest-scaled captures: the edged dash at 45.6 px,
+    // a run stretched 2.4 x and a ruby's dash at 0.52 x pixel-exact)
+    let c = textureSample(tex0, samp, i.uv).r;
+    // hy.z = 1 (an edged glyph cache's glyphs, the cell the filled outline less half the outline alone, and
+    // exfont glyphs with their own border: the edged dash and box, the inline glyph tags' edged set):
+    // half coverage is the border, drawn opaque in the edge colour (0xRRGGBB in hx.x, black by default), full
+    // coverage the fill in the vertex colour. Switch, the edged dash over a 93 grey: rows 14 166 255 155 19 and
+    // a column of 64 28 13 30 65 at each end (the padded quad's half texel of the sheet's empty gap). nn::font's
+    // border program (font_BuildinShader, main.elf's embedded BNSH, fragment variant 2) only starts the fill at
+    // 0.54 (its c1[0x0]): below that it is all border, so a fill fringe under ~8% coverage stays edge colour
     if i.hy.z > 0.5 {
         let a = clamp(2.0 * c, 0.0, 1.0);
-        let f = clamp(2.0 * c - 1.0, 0.0, 1.0);
-        return vec4<f32>(i.color.rgb * f * i.color.a, a * i.color.a);
+        let f = select(0.0, clamp(2.0 * c - 1.0, 0.0, 1.0), c >= 0.54);
+        let e = u32(i.hx.x);
+        let edge = vec3<f32>(f32((e >> 16u) & 255u), f32((e >> 8u) & 255u), f32(e & 255u)) / 255.0;
+        return vec4<f32>((i.color.rgb * f + edge * (a - f)) * i.color.a, a * i.color.a);
     }
     return vec4<f32>(i.color.rgb * c * i.color.a, c * (2.0 - c) * i.color.a);
-}
-
-// Glyph coverage inside the uv rect hx (0 outside it, so neighbouring atlas cells never bleed in).
-fn rim_cov(i: VsOut, uv: vec2<f32>) -> f32 {
-    if any(uv < i.hx.xy) || any(uv > i.hx.zw) {
-        return 0.0;
-    }
-    return textureSampleLevel(tex0, samp, uv, 0.0).r;
-}
-
-// White glyph over a black rim of 8 taps (2 px orthogonal, 1.5 px diagonal) at hy.z each, composited per
-// pixel and output once, so the vertex alpha fades rim and fill together (sub_391A0's read fade: a faded line
-// is B + a (full - B)). hy.xy = uv per canvas pixel.
-@fragment
-fn fs_rim_text(i: VsOut) -> @location(0) vec4<f32> {
-    let c = rim_cov(i, i.uv);
-    var keep = 1.0;
-    let taps = array<vec2<f32>, 8>(vec2(-2.0, 0.0), vec2(2.0, 0.0), vec2(0.0, -2.0), vec2(0.0, 2.0),
-        vec2(-1.5, -1.5), vec2(1.5, -1.5), vec2(-1.5, 1.5), vec2(1.5, 1.5));
-    for (var k = 0; k < 8; k++) {
-        keep *= 1.0 - i.hy.z * rim_cov(i, i.uv - taps[k] * i.hy.xy);
-    }
-    let a = c + (1.0 - keep) * (1.0 - c);
-    // the rim's colour, 0xRRGGBB in hy.w
-    let e = u32(i.hy.w);
-    let edge = vec3<f32>(f32((e >> 16u) & 255u), f32((e >> 8u) & 255u), f32(e & 255u)) / 255.0;
-    return vec4<f32>((i.color.rgb * c + edge * (1.0 - keep) * (1.0 - c)) * i.color.a, a * i.color.a);
 }
 
 // Monochrome (grayscale) sprite.
@@ -288,11 +257,18 @@ fn fs_blur(i: VsOut) -> @location(0) vec4<f32> {
 }
 
 // pre_alter (shader 44) as sub_A3180 builds a sprite texture without a grade: pow(x, 1 / 2.2) on the sample
-// (an sRGB source decodes first), alpha kept; the sRGB target encodes the result.
+// (an sRGB source decodes first), alpha kept; the sRGB target encodes the result. hx.xy: the source's last
+// texel centre, where its sampling clamps (`Renderer::bake`).
 @fragment
 fn fs_alter(i: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex0, samp, i.uv);
+    let t = textureSample(tex0, samp, min(i.uv, i.hx.xy));
     return vec4<f32>(pow(t.rgb, vec3<f32>(1.0 / 2.2)), t.a);
+}
+
+// The bake's resampling alone, for texels the CPU already took through pre_alter (`upload_baked`).
+@fragment
+fn fs_alter_copy(i: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(tex0, samp, min(i.uv, i.hx.xy));
 }
 
 // The final blit (sub_D7BD0): shader noalpha_srgb raises the frame to 2.2 and the sRGB swapchain encodes it.

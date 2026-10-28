@@ -3748,11 +3748,10 @@ impl Ui {
                     x += font.kern(prev.replace(c), c, size);
                 }
                 let a = if p - shown > 1e-3 { ((p - i) / (p - shown)).clamp(0.0, 1.0) } else if i < p { 1.0 } else { 0.0 };
+                // the messages' edged font index 1 (sub_A7790 draws both)
                 if a > 0.0
-                    && let Some(q) = font.quad(r, c, size, x, y + crate::text::msg_ascent(crate::game::ASCENT * 0.74 / 0.76), [1.0, 1.0, 1.0, a])
+                    && let Some(mut q) = font.edged_quad(r, c, size, x, y + crate::text::msg_ascent(crate::game::ASCENT * 0.74 / 0.76), [1.0, 1.0, 1.0, a], 1)
                 {
-                    // the messages' dark rim (sub_A7790 draws both)
-                    let mut q = crate::text::FontAtlas::rim(q, crate::text::edge_rim(1, size), crate::text::RIM_ALPHA);
                     q.clip = Some(clip);
                     out.push(q);
                 }
@@ -6576,12 +6575,14 @@ impl Ui {
             self.sprite(out, "menu_btn_ja", rc, Some([24.0 + col * 240.0, 24.0 + i as f32 * 104.0, 224.0, 88.0]));
             add_copy(out, n..out.len(), self.obj_flash(o));
         }
-        // sub_4C370 (blend 30, additive): the line (flags 17, centred on x 66) at its x scale, then the light
+        // sub_4C370 (blend 30, additive): the line (flags 17, centred on x 66) at its x scale, then the light.
+        // The line's source rect is (16, 8)-(344, 32): it runs past the 224-wide image (clamped, clear), so the
+        // line itself ends at x 234 and sits on the image's row 28 at y 156
         let (sx, la, light, _) = self.sys_cur;
         let i = self.sys_tab as f32;
         if sx > 0.0 {
-            let w = 224.0 * sx;
-            self.sprite_c(out, "systemcursor_line", [198.0 - w / 2.0, 136.0 + i * 75.0, w, 56.0], Some([0.0, 0.0, 224.0, 56.0]), la, Blend::Add);
+            let w = 328.0 * sx;
+            self.sprite_c(out, "systemcursor_line", [198.0 - w / 2.0, 136.0 + i * 75.0, w, 24.0], Some([16.0, 8.0, 328.0, 24.0]), la, Blend::Add);
         }
         self.sprite_c(out, "systemcursor_light", [0.0, 32.0 + i * 75.0, 528.0, 240.0], None, light, Blend::Add);
     }
@@ -7358,11 +7359,13 @@ impl Ui {
                     // which sub_BDC2C lays the ruby out but keeps it hidden (+287, slot +101007 = !(a4 & 1)):
                     // Switch, the train page's note without the まえぶ over 前触
                     let shown = |pc: &&crate::text::PlacedChar| pc.baseline < top + 3.5 * lay.line_height && pc.size == lay.size;
+                    let mut batches = crate::text::Batches::default();
                     for pc in placed.iter().filter(shown) {
                         if let Some(q) = font.placed_quad(r, pc, 0.0, 0.0, [0.0, 0.0, 0.0, 1.0]) {
-                            out.push(q);
+                            batches.push(font.is_ex(pc), q);
                         }
                     }
+                    batches.flush(out);
                     // the note slot has no edge: the plain bar sheet
                     out.extend(placed.iter().filter(shown).filter_map(|pc| game.bar_quad(pc, None, [0.0, 0.0, 0.0, 1.0], false)));
                 }
