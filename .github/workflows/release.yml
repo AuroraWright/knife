@@ -279,6 +279,8 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          # Link the human readable changelog at the released commit
+          printf '\nChangelog: [CHANGELOG.md](%s/%s/blob/%s/CHANGELOG.md)\n' "${{ github.server_url }}" "${{ github.repository }}" "$RELEASE_COMMIT" >> $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
