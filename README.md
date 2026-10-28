@@ -69,6 +69,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | `-l`, `--language ja\|en\|zc\|zt` | the language, as the console language and the config's language buttons pick it (Tsukihime's overseas release and Witch on the Holy Night; by default the config's setting) |
 | `-s`, `--save-file PATH` | the save file (see below for the default) |
 | `-t`, `--text-websocket HOST:PORT` | serve the displayed text over WebSocket for text hookers (e.g. `127.0.0.1:6677`) |
+| `-f`, `--fullscreen` | start in fullscreen, as pressing F switches to |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
 | `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |
 

@@ -1,5 +1,10 @@
 # Changes
 
+## Unreleased
+
+- `-f` / `--fullscreen` (or `fullscreen = true` in `knife.ini`) starts the game in fullscreen, as pressing F
+  switches to.
+
 ## 0.9.8 (2026-10-28)
 
 - Text is drawn the way the Switch draws it: the glyphs are rendered by a port of the font rasteriser the game

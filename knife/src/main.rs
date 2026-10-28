@@ -75,6 +75,9 @@ struct Cli {
     /// Every connected client receives each message as plain text, and each choice's options one per line.
     #[arg(short, long, value_name = "HOST:PORT")]
     text_websocket: Option<String>,
+    /// Start in fullscreen, as pressing F switches to
+    #[arg(short, long)]
+    fullscreen: bool,
     /// Start in this scene (allscr name or index) instead of START_SCRIPT
     #[cfg_attr(feature = "debug", arg(long))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
@@ -183,6 +186,9 @@ impl Cli {
         Some(self.mod_assets_dir.clone().unwrap_or_else(|| default_dir(MOD_ASSETS_DIR_NAME))).filter(|dir| dir.is_dir())
     }
 }
+
+/// The fullscreen mode F and --fullscreen switch to: borderless on the window's current monitor.
+const FULLSCREEN: winit::window::Fullscreen = winit::window::Fullscreen::Borderless(None);
 
 const ASSETS_DIR_NAME: &str = "assets";
 const MOD_ASSETS_DIR_NAME: &str = "mod_assets";
@@ -310,6 +316,9 @@ impl App {
                 area_position.y + offset(area_size.height, outer.height),
             ));
             window.set_visible(true);
+        }
+        if self.cli.fullscreen {
+            window.set_fullscreen(Some(FULLSCREEN));
         }
         // a launch from a terminal does not always activate the app
         #[cfg(target_os = "macos")]
@@ -754,7 +763,7 @@ impl ApplicationHandler for App {
                     KeyCode::KeyF if pressed && !repeat => {
                         if let Some(w) = &self.window {
                             let fs = w.fullscreen().is_some();
-                            w.set_fullscreen((!fs).then_some(winit::window::Fullscreen::Borderless(None)));
+                            w.set_fullscreen((!fs).then_some(FULLSCREEN));
                         }
                     }
                     _ => {}
