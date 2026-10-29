@@ -8,10 +8,11 @@ pub fn varmul(a: i32, b: i32, shift: u32) -> i32 {
     }
     let neg = (a ^ b) < 0;
     let (a, b) = (a.unsigned_abs(), b.unsigned_abs());
-    let m = if a > 46339 || b > 46339 {
+    // the magnitudes compared signed (|i32::MIN| stays negative) and the 32-bit product shifted arithmetically
+    let m = if a as i32 > 46339 || b as i32 > 46339 {
         ((u64::from(a) * u64::from(b) + (1 << (shift - 1))) >> shift).min(0x7FFF_FFFF) as u32
     } else {
-        (a * b + (1 << (shift - 1))) >> shift
+        (a.wrapping_mul(b).wrapping_add(1 << (shift - 1)) as i32 >> shift) as u32
     };
     if neg { m.wrapping_neg() as i32 } else { m as i32 }
 }
@@ -26,10 +27,10 @@ pub fn vardiv(a: i32, b: i32, shift: u32) -> i32 {
     }
     let neg = (a ^ b) < 0;
     let (a, b) = (a.unsigned_abs(), b.unsigned_abs());
-    let m = if a >= 1 << (30 - shift) {
+    let m = if a as i32 >= 1 << (30 - shift) {
         (((u64::from(a) << shift) + u64::from(b >> 1)) / u64::from(b)).min(0x7FFF_FFFF) as u32
     } else {
-        (((a << shift) + (b >> 1)) as i32 / b as i32) as u32
+        ((a << shift).wrapping_add(b >> 1) as i32).wrapping_div(b as i32) as u32
     };
     if neg { m.wrapping_neg() as i32 } else { m as i32 }
 }
@@ -50,6 +51,44 @@ pub fn muldiv(a: i32, b: i32, c: i32) -> i32 {
         (a * b + (c >> 1)) / c
     };
     if neg { m.wrapping_neg() as i32 } else { m as i32 }
+}
+
+/// The square root of a 2.30 fraction, 2.30 (FracSqrt): one bit at a time, the last rounded; a negative input
+/// gives -0x7FFFFFFF.
+pub fn frac_sqrt(x: i32) -> i32 {
+    if x < 0 {
+        return -0x7FFF_FFFF;
+    }
+    if x == 0 {
+        return 0;
+    }
+    let x = x as u32;
+    let mut root: u32 = x & 0x4000_0000;
+    let mut rem = x - root;
+    let t = root | 0x1000_0000;
+    if rem >= t {
+        root |= 0x2000_0000;
+        rem -= t;
+    }
+    let mut bit = 0x0800_0000u32;
+    while bit >= 2 {
+        let t = root.wrapping_add(bit);
+        rem = rem.wrapping_mul(2);
+        if rem >= t {
+            root = root.wrapping_add(2 * bit);
+            rem = rem.wrapping_sub(t);
+        }
+        bit >>= 1;
+    }
+    rem = rem.wrapping_mul(2);
+    let t = root.wrapping_add(1);
+    if rem >= t {
+        root = root.wrapping_add(2);
+        rem = rem.wrapping_sub(t);
+    }
+    let (twice, four) = (rem.wrapping_mul(2), rem.wrapping_mul(4));
+    let (r, cmp) = if twice > root { (root + 1, twice.wrapping_sub(root).wrapping_mul(2).wrapping_sub(1)) } else { (root, four) };
+    (if cmp <= r { r } else { r + 1 }) as i32
 }
 
 /// A vector's length, roughly: the larger component plus a third of the smaller (norm).

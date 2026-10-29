@@ -5089,6 +5089,17 @@ impl Game {
         Some((left - lay.left, top + ASCENT - top1 - lay.line_height))
     }
 
+    /// A font of the language's list that load_ttf refuses (`tt::refused`: the SDK's stroke and compressed
+    /// formats): nn::font loads every font of the list (sub_CA500) without checking the engine's error, and such a
+    /// font stops the game (Switch, Astris: Times New Roman with head.glyphDataFormat 38485 as the message font
+    /// stopped it at boot).
+    fn refused_font(assets: &Assets) -> Option<std::path::PathBuf> {
+        ["", "2", "3"]
+            .into_iter()
+            .filter_map(|s| assets.font_path(s))
+            .find(|p| std::fs::read(p).is_ok_and(|d| knife_core::itype::tt::refused(&d)))
+    }
+
     /// sub_AB0F0: the message font of the game language (the first file of its folder) and the QA bubble font
     /// (of `<folder>3`), each with the exfont runs (exfont_nx01.bffnt).
     pub fn load_fonts(assets: &Assets, r: &Renderer) -> anyhow::Result<(FontAtlas, Option<FontAtlas>)> {
@@ -5103,6 +5114,9 @@ impl Game {
             }
             f
         };
+        if let Some(p) = Self::refused_font(assets) {
+            anyhow::bail!("{}: a font format the Switch's font engine refuses (load_ttf), which stops the game", p.display());
+        }
         let path = assets.font_path("").with_context(|| format!("no font in {}", assets.language_folder()))?;
         let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut font = with_exfont(FontAtlas::new(r, data)?);
@@ -5142,6 +5156,10 @@ impl Game {
                 tracing::warn!("language {word}: {e:#}");
                 return false;
             }
+        }
+        if let Some(p) = Self::refused_font(&self.assets) {
+            tracing::error!("{}: a font format the Switch's font engine refuses (load_ttf), which stops the game", p.display());
+            std::process::exit(1);
         }
         match Self::load_fonts(&self.assets, r) {
             Ok((font, bubble)) => {

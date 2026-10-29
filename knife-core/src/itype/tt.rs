@@ -104,6 +104,27 @@ impl Scale {
     }
 }
 
+/// Whether load_ttf refuses the font: a head without its magic number (error 403) or one of the SDK's own glyph
+/// formats (head.glyphDataFormat), its compressed and stroke fonts, which this build of it cannot draw: 0x200 to
+/// 0x2FF, 1538 to 1791, 38484 and 38485 (error 432), 0x400 to 0x5FF and 0x700 to 0x7FF (error 433). Fonts
+/// without a head are left to the rest of the loading.
+pub fn refused(data: &[u8]) -> bool {
+    let Some(tables) = u16_at(data, 4) else { return false };
+    let Some(head) = (0..usize::from(tables)).map(|i| 12 + 16 * i).find(|&r| data.get(r..r + 4) == Some(b"head")) else {
+        return false;
+    };
+    let head = u32_at(data, head + 8).map_or(usize::MAX, |o| o as usize);
+    match (u32_at(data, head.wrapping_add(12)), u16_at(data, head.wrapping_add(52))) {
+        (Some(magic), Some(format)) => {
+            magic != 0x5F0F_3CF5
+                || matches!(format & 0xFF00, 0x200 | 0x400 | 0x500 | 0x700)
+                || (1538..=1791).contains(&format)
+                || format & !1 == 0x9654
+        }
+        _ => true,
+    }
+}
+
 impl<'a> Font<'a> {
     pub fn new(data: &'a [u8]) -> Option<Font<'a>> {
         let tables = u16_at(data, 4)?;
@@ -115,6 +136,9 @@ impl<'a> Font<'a> {
                 .map(|o| o as usize)
         };
         let head = find(b"head")?;
+        if refused(data) {
+            return None;
+        }
         let hhea = find(b"hhea")?;
         let maxp = find(b"maxp")?;
         let vmtx = match (find(b"vhea"), find(b"vmtx")) {

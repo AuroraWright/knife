@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use knife_core::format::bffnt;
@@ -28,26 +28,53 @@ struct Glyph {
 }
 
 /// A face of the font list (TrueType or CFF) rasterized as nn::font's glyph caches do (`knife_core::itype`:
-/// hinted, scan converted, outlined and trimmed bit for bit), with its hinting state at the atlas's raster size.
+/// hinted, scan converted, outlined and trimmed bit for bit), with its hinting states at the atlas's raster size
+/// and at the base size its advances are taken at (one state when the two agree, as at 1080p).
 struct TtFace {
     data: Arc<Vec<u8>>,
-    hinter: Option<(u16, Hinter)>,
+    hinters: Mutex<Vec<(u16, Hinter)>>,
+    /// a TrueType glyph's advance at the base size, whole pixels (None: CFF, or the glyph will not load)
+    advances: Mutex<HashMap<char, Option<i16>>>,
 }
 
 impl TtFace {
     fn new(data: Arc<Vec<u8>>) -> Option<TtFace> {
         tt::Font::new(&data)?;
-        Some(TtFace { data, hinter: None })
+        Some(TtFace { data, hinters: Mutex::new(Vec::new()), advances: Mutex::new(HashMap::new()) })
+    }
+
+    /// The hinting state at `ppem`, made when missing (only the base size's is kept beside it).
+    fn hinter<'a>(hinters: &'a mut Vec<(u16, Hinter)>, font: &tt::Font, ppem: u16) -> &'a mut Hinter {
+        let i = match hinters.iter().position(|&(p, _)| p == ppem) {
+            Some(i) => i,
+            None => {
+                hinters.retain(|&(p, _)| p == BASE_PPEM);
+                hinters.push((ppem, Hinter::new(font, ppem)));
+                hinters.len() - 1
+            }
+        };
+        &mut hinters[i].1
     }
 
     /// `c`'s cache map at `ppem` with outline width `ow` (`cache_cell`); None for a glyph that will not load.
     fn map(&mut self, c: char, ppem: u16, ow: u16) -> Option<Graymap> {
         let font = tt::Font::new(&self.data)?;
-        if self.hinter.as_ref().is_none_or(|&(p, _)| p != ppem) {
-            self.hinter = Some((ppem, Hinter::new(&font, ppem)));
-        }
-        let (_, h) = self.hinter.as_mut()?;
-        h.cache_map(&font, font.glyph(c as u32), ow)
+        let hinters = self.hinters.get_mut().ok()?;
+        Self::hinter(hinters, &font, ppem).cache_map(&font, font.glyph(c as u32), ow)
+    }
+
+    /// A TrueType glyph's char width as FSS_get_advance gives it: the advance of its fitted outline at the base
+    /// size (its program may move the advance point: Times New Roman's o is 19 px where its metrics give 20),
+    /// to the nearest whole pixel. None for a CFF font or a glyph that will not load.
+    fn advance(&self, c: char) -> Option<i16> {
+        let mut advances = self.advances.lock().ok()?;
+        *advances.entry(c).or_insert_with(|| {
+            let font = tt::Font::new(&self.data).filter(|f| f.cff.is_none())?;
+            let mut hinters = self.hinters.lock().ok()?;
+            let e = Self::hinter(&mut hinters, &font, BASE_PPEM).glyph(&font, font.glyph(c as u32))?;
+            let n = e.points();
+            Some(((e.x[n + 1] - e.x[n]).wrapping_shl(10).wrapping_add(0x8000) as u32 >> 16) as i16)
+        })
     }
 }
 
@@ -137,6 +164,9 @@ static BUBBLE_ASCENT: AtomicUsize = AtomicUsize::new(41);
 
 /// The fonts' base size (the font manager's +124, from sub_AB0F0's init struct): glyph scale = size / 40.
 pub const BASE_SIZE: f32 = 40.0;
+
+/// The base size as a ppem.
+const BASE_PPEM: u16 = 40;
 /// The writer font's width (sub_13BCF0: scale.x x PairFont::GetWidth, the larger of its fonts'): the exfont's
 /// FINF width 41 against the ScalableFont's 40 (the base size), in every build. Switch: Witch on the Holy
 /// Night's `@_` rubies 22.65 px right of their bases' start, half of 41 at the 44.4 px glyphs; the Japanese
@@ -429,13 +459,18 @@ impl FontAtlas {
 
     /// A glyph's advance: nn::font caches a scalable font's glyphs at the base size with whole-pixel char
     /// widths and scales those (Switch, English lines: 3 / 7 / 9 px narrower than fractional advances over
-    /// 650 / 760 / 870 px, rounding at 40 px gives 2.5 / 5.7 / 6.3).
+    /// 650 / 760 / 870 px, rounding at 40 px gives 2.5 / 5.7 / 6.3). A TrueType glyph's width is its hinted
+    /// advance (`TtFace::advance`; Switch, Times New Roman as the message font: c e f k o v x y z sit in their
+    /// cells by the advances their programs set).
     /// An exfont glyph advances by its CWDH advance at size / 40.
     pub fn advance(&self, c: char, size: f32) -> f32 {
         if let Some(g) = self.ex.as_ref().and_then(|e| e.font.glyph(c)) {
             return f32::from(g.advance) * size / BASE_SIZE;
         }
         let c = self.shown(c);
+        if let Some(a) = self.tt.get(self.face_index(c)).and_then(Option::as_ref).and_then(|f| f.advance(c)) {
+            return f32::from(a) * size / BASE_SIZE;
+        }
         let font = self.face(c);
         let base = font.as_scaled(Self::px(font, BASE_SIZE)).h_advance(font.glyph_id(c));
         base.round() * size / BASE_SIZE

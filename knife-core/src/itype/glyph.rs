@@ -7,10 +7,14 @@ use super::effect;
 use super::raster::{self, Graymap, Outline};
 use super::rtgah::{self, Globals};
 use super::fixed::{vardiv, varmul};
+use super::fnt::Interp;
 use super::tt::{self, Composite, Element, Font, Scale};
 
 /// fsFlags while the SDK fills a glyph cache: autohinting on and forced over any glyph program.
 const FS_FLAGS: u32 = 0x2140_4000;
+
+/// The program do_hints runs for an autohinted glyph: `PUSHB[0] 11 AA[]`, the SDK's instruction that autohints.
+const AUTOHINT: [u8; 3] = [0xB0, 11, 0x7F];
 
 /// A script's reference characters: a stem letter, flat capitals, round capital, x-height letters, round small letter.
 type RefChars = (u32, &'static [u32], u32, &'static [u32], u32);
@@ -24,6 +28,8 @@ pub struct Hinter {
     /// fsFlags 0x1000000, set only while get_ref_lines measures: autohinting even a glyph with its own program
     forced: bool,
     ranges: [u32; 3],
+    /// a TrueType font's instruction interpreter at this size (fs_NewTransformation ran its font program)
+    interp: Option<Interp>,
 }
 
 impl Hinter {
@@ -35,16 +41,18 @@ impl Hinter {
         let g418 = if font.cff.is_some() { 7 } else { 0 };
         let g = Globals { ppem, fs_flags: FS_FLAGS, font_flags: 0, refs: [0; 72], g418, top: 0, bottom: 0, g416: 1 };
         let ranges = font.ranges();
-        let mut h = Hinter { scale, g, autohint: true, forced: true, ranges };
+        let interp = font.cff.is_none().then(|| Interp::new(font.data, scale, ppem));
+        let mut h = Hinter { scale, g, autohint: true, forced: true, ranges, interp };
         h.ref_lines(font);
         h.forced = false;
         h
     }
 
     /// A glyph's points ready for the scan converter (26.6, y up), hinted when the font allows; None for a
-    /// glyph that will not load.
+    /// glyph that will not load or whose program fails. A TrueType glyph is fitted whether or not the font may
+    /// be autohinted (its program runs instead).
     pub fn glyph(&mut self, font: &Font, gid: u16) -> Option<Element> {
-        self.outline(font, gid, self.autohint)
+        self.outline(font, gid, font.cff.is_none() || self.autohint)
     }
 
     /// A glyph as nn::font's glyph cache holds it (`cache_cell` of its raster at the hinter's size); None as
@@ -56,36 +64,63 @@ impl Hinter {
         Some(cache_cell(&raster::graymap(&o, ppem)?, ow))
     }
 
-    /// get_comp: a glyph is autohinted when the font allows it and the glyph has no program of its own (any glyph
-    /// while get_ref_lines forces it), else its program runs (fsFlags at a glyph cache fill: 0x400000).
+    /// fsg_GridFit and get_comp: a TrueType glyph is fitted (`hint`: fsFlags bit 2 clear) unless the control
+    /// value program, run first whenever another size or font was fitted last, set INSTCTRL's first bit; it is
+    /// autohinted when the font allows it and the glyph has no program of its own (any glyph while
+    /// get_ref_lines forces it), else its program runs (fsFlags at a glyph cache fill: 0x400000).
     /// A CFF glyph (cff_GridFit) has no program and only its origin is put on the grid before autohinting (the
     /// advance it may round after is not read here).
     fn outline(&mut self, font: &Font, gid: u16, hint: bool) -> Option<Element> {
-        let (mut e, code) = match &font.cff {
-            Some(c) => (c.load(gid, self.scale.ppem / i32::from(font.upem))?, &[][..]),
-            None => match font.load(gid) {
-                Some(l) => l,
-                None => return self.composite(font, gid, hint),
-            },
+        let (mut e, code, hint) = match &font.cff {
+            Some(c) => (c.load(gid, self.scale.ppem / i32::from(font.upem))?, &[][..], hint),
+            None => {
+                let hint = self.interp.as_mut()?.begin()? && hint;
+                match font.load(gid) {
+                    Some((e, code)) => (e, code, hint),
+                    None => return self.composite(font, gid, hint),
+                }
+            }
         };
         tt::scale(&mut e, &self.scale);
         let n = e.points();
         if font.cff.is_some() {
             e.x[n] = (e.x[n] + 32) & !63;
-        } else {
-            tt::round_phantoms(&mut e, &self.scale, font.upem, hint);
-        }
-        if hint && !e.sp.is_empty() {
-            if self.autohint && (self.forced || code.is_empty()) {
+            if hint && !e.sp.is_empty() && self.autohint {
                 let ch = font.inverse(gid);
                 let script = tt::which_script(ch, self.ranges);
-                self.g.g416 = u16::from(self.autohint);
+                self.g.g416 = 1;
                 rtgah::rtgah(&mut e, script, ch as i32, &mut self.g);
-            } else {
-                program(&mut e, code);
             }
+        } else {
+            tt::round_phantoms(&mut e, &self.scale, font.upem, hint);
+            let code = if !hint || e.sp.is_empty() {
+                &[][..]
+            } else if self.autohint && (self.forced || code.is_empty()) {
+                &AUTOHINT[..]
+            } else {
+                code
+            };
+            self.hints(font, gid, &mut e, code)?;
         }
         Some(e)
+    }
+
+    /// do_hints: the graphics state from the defaults, then the glyph's program over its points (none when
+    /// `code` is empty), AA[] autohinting it with rtgah; None when the program fails.
+    fn hints(&mut self, font: &Font, gid: u16, e: &mut Element, code: &[u8]) -> Option<()> {
+        let Hinter { interp, g, ranges, autohint, .. } = self;
+        let it = interp.as_mut()?;
+        it.reset();
+        if code.is_empty() {
+            return Some(());
+        }
+        let ch = font.inverse(gid);
+        let script = tt::which_script(ch, *ranges);
+        let mut aa = |e: &mut Element| {
+            g.g416 = u16::from(*autohint);
+            rtgah::rtgah(e, script, ch as i32, g);
+        };
+        it.glyph(e, code, Some(&mut aa)).ok()
     }
 
     /// get_comp for a composite glyph: its advance points from its own box and metrics, put on the grid as a
@@ -102,18 +137,19 @@ impl Hinter {
         let mut st = Assembly { ran: false, transform: false, metrics: [0, 1, 2, 3].map(|i| (p.x[i], p.y[i])), simple: 0 };
         let mut e = self.assemble(font, &c, IDENTITY, hint, &mut st, p)?;
         e.f.fill(0);
-        if hint && !e.sp.is_empty() {
-            if self.autohint && (self.forced || (!c.instructions && !st.ran)) {
-                to_font_units(&mut e, font.upem, self.scale.ppem);
-                let ch = font.inverse(gid);
-                let script = tt::which_script(ch, self.ranges);
-                self.g.g416 = u16::from(self.autohint);
-                rtgah::rtgah(&mut e, script, ch as i32, &mut self.g);
-            } else if c.instructions && !c.code.is_empty() {
-                to_font_units(&mut e, font.upem, self.scale.ppem);
-                program(&mut e, c.code);
-            }
+        let code = if !hint || e.sp.is_empty() {
+            &[][..]
+        } else if self.autohint && (self.forced || (!c.instructions && !st.ran)) {
+            &AUTOHINT[..]
+        } else if c.instructions {
+            c.code
+        } else {
+            &[][..]
+        };
+        if !code.is_empty() {
+            to_font_units(&mut e, font.upem, self.scale.ppem);
         }
+        self.hints(font, gid, &mut e, code)?;
         Some(e)
     }
 
@@ -143,10 +179,9 @@ impl Hinter {
                     let (mut e, code) = font.load(comp.gid)?;
                     tt::scale(&mut e, &self.scale);
                     tt::round_phantoms(&mut e, &self.scale, font.upem, hint);
-                    if hint && !code.is_empty() && !(self.forced && self.autohint) {
-                        program(&mut e, code);
-                        st.ran = true;
-                    }
+                    let run = hint && !code.is_empty() && !(self.forced && self.autohint);
+                    self.hints(font, comp.gid, &mut e, if run { code } else { &[] })?;
+                    st.ran |= run;
                     if st.transform {
                         transform(&mut e, cm);
                     }
@@ -178,13 +213,13 @@ impl Hinter {
             e.ox.clone_from(&e.x);
             e.oy.clone_from(&e.y);
             // a nested composite's own instructions, after its offset
-            if let Some(code) = code
-                && hint
-                && !code.is_empty()
-            {
-                to_font_units(&mut e, font.upem, self.scale.ppem);
-                program(&mut e, code);
-                st.ran = true;
+            if let Some(code) = code {
+                let run = hint && !code.is_empty();
+                if run {
+                    to_font_units(&mut e, font.upem, self.scale.ppem);
+                }
+                self.hints(font, comp.gid, &mut e, if run { code } else { &[] })?;
+                st.ran |= run;
             }
             if simple {
                 st.simple += 1;
@@ -491,18 +526,6 @@ fn to_font_units(e: &mut Element, upem: u16, ppem: i32) {
     for i in 0..=e.points() {
         e.oox[i] = varmul(e.x[i], k, 16);
         e.ooy[i] = varmul(e.y[i], k, 16);
-    }
-}
-
-/// Run a glyph's instructions as far as they are IUP[y] / IUP[x], the only ones in the supported fonts' glyph
-/// programs (TsukuGo's 402: `IUP[y] IUP[x]`, which with nothing touched leave the scaled points as they are).
-fn program(e: &mut Element, code: &[u8]) {
-    for &op in code {
-        match op {
-            0x30 => tt::iup(e, false),
-            0x31 => tt::iup(e, true),
-            _ => return,
-        }
     }
 }
 

@@ -5,6 +5,7 @@
 pub mod cff;
 pub mod effect;
 pub mod fixed;
+pub mod fnt;
 pub mod glyph;
 pub mod raster;
 pub mod rtgah;
