@@ -32,6 +32,8 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         let flags = data[p];
         p += 1;
         let arg = (flags >> 2) as usize;
+        // sub_B5310 counts the window in words: a ring reference takes 1, the other operations their arg + 1
+        clear -= if flags & 3 == 2 { 1 } else { arg as i32 + 1 };
         match flags & 3 {
             0 => {
                 for _ in 0..=arg {
@@ -69,7 +71,6 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
                 }
             }
         }
-        clear -= 1;
     }
     out.truncate(out_len);
     Ok(out)
