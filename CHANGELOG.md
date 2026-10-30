@@ -1,5 +1,28 @@
 # Changes
 
+## 0.9.10 (unreleased)
+
+- The Japanese release follows the Switch's update 1.0.3, which brings it close to the overseas release:
+  the system menu's new blur, choices laid out and touched as in 1.0.3, the save list's X to delete a save,
+  the endings gallery and CG groups, and the config's new radio and toggle art. Extract the game with
+  update 1.0.3 applied; data from 1.0.2 still plays.
+- `--tsukimates` applies the code changes of the [Tsukihimates](https://github.com/Tsukihimates/Tsukihime-Translation)
+  English patch (Japanese release, with their romfs as the mod assets folder), so their text breaks and
+  places lines as their patched game does.
+- Fan translations display as on the Switch: form feeds, control codes in the text, accented letters
+  built from parts in TrueType fonts, and the fonts' character maps and fallback glyph.
+- TrueType fonts are hinted by a port of the game's own interpreter, so their letters match the Switch's
+  pixel for pixel.
+- English lines break over the whole message, so an italic word at the edge of the box moves to the next
+  line whole.
+- OpenType fonts kern letter pairs as the Switch does, and text edges land on the Switch's sub-pixels.
+- Text that fills the game's glyph cache draws as it does on the Switch.
+- Story images decode exactly as on the Switch (some JPEG pixels were a level off).
+- Witch on the Holy Night: rubies sit 2.4 px higher, as on the Switch, and docked mode shows the HD
+  textures at their own size instead of scaled-up SD ones.
+- Some script commands in a few scenes of each game read garbled arguments; they now read the right ones.
+- Pressing down through the Japanese config's system tab no longer crashes.
+
 ## 0.9.9 (2026-10-28)
 
 - `-f` / `--fullscreen` (or `fullscreen = true` in `knife.ini`) starts the game in fullscreen.
