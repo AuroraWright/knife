@@ -31,6 +31,8 @@ pub struct Font {
     /// the glyph sheet (one BNTX texture, single channel coverage), stored bottom-up: decoded, its rows run
     /// from the bottom, so cell (0, 0) is in the bottom-left corner and the glyphs are upside down
     pub sheet: bntx::Texture,
+    /// FINF's alternate glyph (+6), which nn::font draws for a character no font of the pair has
+    pub alt: Option<Glyph>,
     /// (code point, glyph)
     pub glyphs: Vec<(u32, Glyph)>,
 }
@@ -84,20 +86,17 @@ impl Font {
             cwdh = u32_at(d, cwdh + 4)? as usize;
         }
 
-        let mut glyphs = Vec::new();
-        let mut put = |code: u32, index: usize| {
-            if index == 0xffff {
-                return;
-            }
+        let at = |index: usize| {
             let (col, row) = (index as u32 % cols, index as u32 / cols);
             let (left, width, advance) = widths.get(index).copied().unwrap_or((0, cell_w, cell_w));
-            glyphs.push((code, Glyph {
-                x: col * (cell_w as u32 + 1) + 1,
-                y: row * (cell_h as u32 + 1) + 1,
-                left,
-                width,
-                advance,
-            }));
+            Glyph { x: col * (cell_w as u32 + 1) + 1, y: row * (cell_h as u32 + 1) + 1, left, width, advance }
+        };
+        let alt = Some(u16_at(d, f + 6)? as usize).filter(|&i| i != 0xffff).map(at);
+        let mut glyphs = Vec::new();
+        let mut put = |code: u32, index: usize| {
+            if index != 0xffff {
+                glyphs.push((code, at(index)));
+            }
         };
         // CMAP blocks: first code, last code, method (0 direct, 1 table, 2 scan), next block
         while cmap != 0 {
@@ -124,6 +123,6 @@ impl Font {
             }
             cmap = u32_at(d, cmap + 12)? as usize;
         }
-        Ok(Self { height, ascent, width, line_feed, cell_w, cell_h, baseline, sheet, glyphs })
+        Ok(Self { height, ascent, width, line_feed, cell_w, cell_h, baseline, sheet, alt, glyphs })
     }
 }

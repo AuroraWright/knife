@@ -181,8 +181,17 @@ impl<'a> Font<'a> {
             .map(|o| c + o as usize)
     }
 
-    /// The Unicode cmap the SDK picks (FSS_set_cmap 3,1 else 3,10).
+    /// The Unicode cmap the SDK picks: ScalableFontEngine::SetFont sets 3,10 (FSS_set_cmap) and only when that
+    /// fails 3,1 (Switch: the French fan patch's FOT-Seurat maps U+2000B in its 3,10 map alone, and draws it).
     fn unicode(&self) -> Option<usize> {
+        self.subtable(3, 10).or_else(|| self.subtable(3, 1))
+    }
+
+    /// The Unicode cmap which_script takes a glyph's character from: 3,1, else 3,10 (sdk 0x18C220 sets them in
+    /// that order around inverse_map_char). Switch, the French FOT-Seurat: U+2000B, which only its 3,10 map has,
+    /// is no character of its 3,1 map, so the glyph gets the script of the font's OS/2 ranges, not CJK's
+    /// (its top bar 0.6 px higher than as CJK).
+    fn script_map(&self) -> Option<usize> {
         self.subtable(3, 1).or_else(|| self.subtable(3, 10))
     }
 
@@ -229,7 +238,7 @@ impl<'a> Font<'a> {
     /// groups' last characters with the glyph) whose glyphs hold it. 0xFFFF when none, and for glyph 0 (the SDK
     /// takes only glyphs past the font's first).
     pub fn inverse(&self, gid: u16) -> u32 {
-        let found = self.unicode().and_then(|t| {
+        let found = self.script_map().and_then(|t| {
             if gid == 0 {
                 return None;
             }
