@@ -618,12 +618,13 @@ pub struct Ui {
 }
 
 /// The shared system fonts as one atlas (sub_CAA50's set): the first font, the rest filling in its missing glyphs.
-pub(crate) fn shared_font_atlas(r: &Renderer, fonts: Vec<Vec<u8>>) -> Option<FontAtlas> {
+pub(crate) fn shared_font_atlas(fonts: Vec<Vec<u8>>) -> Option<FontAtlas> {
     let mut fonts = fonts.into_iter();
-    let mut atlas = FontAtlas::new(r, fonts.next()?).map_err(|e| tracing::warn!("system font: {e:#}")).ok()?;
+    let mut atlas = FontAtlas::new(fonts.next()?).map_err(|e| tracing::warn!("system font: {e:#}")).ok()?;
     for d in fonts {
         atlas.add_fallback(d).unwrap_or_else(|e| tracing::warn!("system font fallback: {e:#}"));
     }
+    atlas.set_otf_kerning([false; 3]);
     Some(atlas)
 }
 
@@ -2228,18 +2229,21 @@ impl Ui {
     /// sub_CAA50 builds from the shared fonts sub_C9F3C fetches). Switch (save list "SCENE プロローグ", flags
     /// 0x183040): the 0x80000 / 0x200000 font index (+55436) does not change it. The shared fonts are the
     /// language's (`Assets::shared_font_names`); falls back to the UI font (TsukuGo) when the assets dir has none.
-    fn sys_font(game: &Game, r: &Renderer) -> Option<FontAtlas> {
-        shared_font_atlas(r, game.assets.shared_fonts()).or_else(|| Self::ui_font(game, r, "2"))
+    fn sys_font(game: &Game) -> Option<FontAtlas> {
+        shared_font_atlas(game.assets.shared_fonts()).or_else(|| Self::ui_font(game, "2"))
     }
 
     /// A font of the language's folders (`Assets::font_path`).
-    fn ui_font(game: &Game, r: &Renderer, suffix: &str) -> Option<FontAtlas> {
+    fn ui_font(game: &Game, suffix: &str) -> Option<FontAtlas> {
         let path = game.assets.font_path(suffix).or_else(|| {
             tracing::warn!("no font in {}{suffix}", game.assets.language_folder());
             None
         })?;
         let data = std::fs::read(&path).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok()?;
-        FontAtlas::new(r, data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok()
+        let mut atlas = FontAtlas::new(data).map_err(|e| tracing::warn!("{}: {e:#}", path.display())).ok()?;
+        // in the shared fonts' place, sub_CAA50's set: no OTF kerning table
+        atlas.set_otf_kerning([false; 3]);
+        Some(atlas)
     }
 
     /// Help text of the focused object (object tables: system menu 0x591438, config 0x46B370):
@@ -2308,7 +2312,7 @@ impl Ui {
         }
         let Some(text) = self.sysmes.get(id).cloned().filter(|t| !t.is_empty()) else { return };
         if self.font_sys.is_none() {
-            self.font_sys = Self::sys_font(game, r);
+            self.font_sys = Self::sys_font(game);
         }
         let Some(font) = self.font_sys.as_mut() else { return };
         // text slot 2 (sub_AE110): 0.325 x 0.37 of the 60 px glyph, a7 = 0 (spacing 4 px); the balloon is the
@@ -5921,7 +5925,7 @@ impl Ui {
         // slot 65 (flags 0x301000: the shared system font) at 0.42 x 0.42 of the 60 px glyph, 4 px spacing
         const SIZE: [f32; 2] = [60.0 * 0.42, 60.0 * 0.42];
         if self.font_sys.is_none() {
-            self.font_sys = Self::sys_font(game, r);
+            self.font_sys = Self::sys_font(game);
         }
         let Some(font) = self.font_sys.as_mut() else { return };
         let base = (490.0 + c.off) * 2.0 + SYS_ASCENT * gs() * SIZE[1];
@@ -6540,7 +6544,7 @@ impl Ui {
         // aligned, top origin)
         if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
             if self.font_sys.is_none() {
-                self.font_sys = Self::sys_font(game, r);
+                self.font_sys = Self::sys_font(game);
             }
             if let Some(font) = self.font_sys.as_mut() {
                 const SIZE: [f32; 2] = [60.0 * 0.36, 60.0 * 0.36];
@@ -7315,7 +7319,7 @@ impl Ui {
                     // -3 + 4; sub_4F240 places them at (274.667, y + 79.644)
                     if let Some(sc) = scene.filter(|s| !s.trim().is_empty()) {
                         if self.font_sys.is_none() {
-                            self.font_sys = Self::sys_font(game, r);
+                            self.font_sys = Self::sys_font(game);
                         }
                         if let Some(font) = self.font_sys.as_mut() {
                             const SIZE: [f32; 2] = [60.0 * 0.35, 60.0 * 0.35];
@@ -7354,7 +7358,7 @@ impl Ui {
                     let mut placed = Vec::new();
                     let font = game.font_mut();
                     let top = 259.259 * H / 448.0 + lay.ascent;
-                    crate::text::layout(font, &lay, &runs, lay.left, top, 0, &mut placed);
+                    crate::text::layout(font, &lay, &runs, lay.left, top, 0.0, 0, &mut placed);
                     // colour 0 (black); sub_A8330(38, 4): the writer shows 4 lines. Flag 0x2000 is style bit 1, for
                     // which sub_BDC2C lays the ruby out but keeps it hidden (+287, slot +101007 = !(a4 & 1)):
                     // Switch, the train page's note without the まえぶ over 前触
@@ -7611,7 +7615,7 @@ impl Ui {
                 // The text slots draw in the shared system font (`sys_font`).
                 let list_row = if self.gal_side || matches!(cur, Some(Action::MusicCtl(_) | Action::MusicVol)) { None } else { Some(self.music_row) };
                 if self.font_sys.is_none() {
-                    self.font_sys = Self::sys_font(game, r);
+                    self.font_sys = Self::sys_font(game);
                 }
                 let n = crate::gallery_table::MUSIC.len();
                 let n0 = out.len();

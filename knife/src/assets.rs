@@ -821,16 +821,28 @@ impl Assets {
         self.roots.mods.as_ref().and_then(|m| first(m.join(&rel))).or_else(|| first(self.roots.base.join(&rel)))
     }
 
+    /// Which places of the language's font list have an OTF kerning table (`FontAtlas::set_otf_kerning`): the
+    /// first by its file's type, the other two by `<folder>2`'s.
+    pub fn otf_kerning(&self) -> [bool; 3] {
+        let otf = |suffix: &str| {
+            self.font_path(suffix).and_then(|p| p.extension().map(|e| e.to_ascii_lowercase())).is_some_and(|e| e == "otf" || e == "bfotf")
+        };
+        let rest = otf("2");
+        [otf(""), rest, rest]
+    }
+
     /// A game data file (`Roots::path`): the mod folder's when it has one.
     pub fn path(&self, rel: impl AsRef<Path>) -> PathBuf {
         self.roots.path(rel)
     }
 
     /// The pair font metrics at the 40 px base size (sub_CAE88, `sfnt::pair_metrics`) of the message font set
-    /// (the language's three fonts sub_AB0F0 loads) and of the bubble font (`<folder>3`), each paired with the
-    /// exfont: line feed / ascent / baseline position Japanese 50 / 41 / 41, English 53 / 43 / 40 (bubble ascent
-    /// 41), Simplified Chinese 49 / 39 / 39, Traditional Chinese 47 / 39 / 37 (the exfont's); the Japanese ones
-    /// without font files. Also the message set's own baseline position, its glyph cache cell's (Traditional
+    /// (the language's three fonts sub_AB0F0 loads) and of the bubble variant's list (`<folder>3`, then the
+    /// other two: `Game::load_fonts`), each paired with the exfont: line feed / ascent / baseline position
+    /// Japanese 50 / 41 / 41, English 53 / 43 / 40 (bubble ascent 41: FOT-Seurat ties DemosNext's bbox and
+    /// comes first), Simplified Chinese 49 / 39 / 39, Traditional Chinese 47 / 39 / 37 (the exfont's); the
+    /// Japanese ones without font files. Switch, French fan fonts: the bubble lines take TsukuMin's taller bbox
+    /// record (ascent 47), 7 px lower than FOT-Seurat's own. Also the message set's own baseline position, its glyph cache cell's (Traditional
     /// Chinese: SungASC's 43, not the pair's 37).
     fn font_metrics(&self) -> (sfnt::SetMetrics, sfnt::SetMetrics, i32) {
         use knife_core::format::{bffnt, bfttf};
@@ -852,7 +864,7 @@ impl Assets {
         let ja = sfnt::SetMetrics { height: 50, ascent: 41, line_feed: 50, baseline: 41 };
         let own = set(&["", "2", "3"]);
         let msg = own.map_or(ja, |m| sfnt::pair_metrics(m, ex));
-        let bubble = match set(&["3"]) {
+        let bubble = match set(&["3", "", "2"]) {
             Some(m) => sfnt::pair_metrics(m, ex),
             // Witch on the Holy Night's bubble variant is the shared system font (`Game::load_fonts`)
             None if self.build == Build::Witch => self

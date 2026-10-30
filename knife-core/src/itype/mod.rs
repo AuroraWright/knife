@@ -7,6 +7,7 @@ pub mod effect;
 pub mod fixed;
 pub mod fnt;
 pub mod glyph;
+pub mod kern;
 pub mod raster;
 pub mod rtgah;
 pub mod tt;

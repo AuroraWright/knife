@@ -932,18 +932,18 @@ impl Ui {
         let (sys, free) = (flags & 0x100000 != 0, flags & 0x10000 != 0);
         let px = [60.0 * size[0], 60.0 * size[1]];
         let base = y * H / 448.0 + ascent(sys, px[1]);
-        let Some(font) = self.wfont(game, r, sys) else { return };
+        let Some(font) = self.wfont(game, sys) else { return };
         let w = font.measure_slot_as(s, px, spacing, free);
         let x = x * W / 640.0 - [0.0, w / 2.0, w][usize::from(align.min(2))];
         font.draw_str_slot_as(r, out, s, px, spacing, [x, base], color, free);
     }
 
-    fn wfont<'a>(&'a mut self, game: &'a mut Game, r: &Renderer, sys: bool) -> Option<&'a mut crate::text::FontAtlas> {
+    fn wfont<'a>(&'a mut self, game: &'a mut Game, sys: bool) -> Option<&'a mut crate::text::FontAtlas> {
         if !sys {
             return Some(game.font_mut());
         }
         if self.font_sys.is_none() {
-            self.font_sys = Self::sys_font(game, r);
+            self.font_sys = Self::sys_font(game);
         }
         self.font_sys.as_mut()
     }

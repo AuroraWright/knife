@@ -193,7 +193,7 @@ impl Game {
         };
         let top = y * UY + lay.ascent;
         let mut placed = Vec::new();
-        text::layout(font, &lay, &runs, lay.left, top, 0, &mut placed);
+        text::layout(font, &lay, &runs, lay.left, top, 0.0, 0, &mut placed);
         let line = |c: &text::PlacedChar| ((c.baseline - top) / lay.line_height).round() as i32;
         let lines = placed.iter().filter(|c| c.size == lay.size).map(line).max().map_or(0, |n| n + 1);
         let rows = placed.iter().map(line).collect();
@@ -212,12 +212,14 @@ impl Game {
             _ => &mut self.font,
         };
         let mut out = Vec::new();
+        // the bars keep the float alpha (`text::slot_alpha`)
+        let glyph_a = text::slot_alpha(alpha);
         for pc in &shown {
             let [cr, cg, cb] = text::fill_rgb(pc, [1.0; 3]);
             if edge {
-                out.extend(font.rimmed_quad_edge(r, pc, 1, [cr, cg, cb], rim, alpha));
+                out.extend(font.rimmed_quad_edge(r, pc, 1, [cr, cg, cb], rim, glyph_a));
             } else {
-                out.extend(font.placed_quad(r, pc, 0.0, 0.0, [cr, cg, cb, alpha]));
+                out.extend(font.placed_quad(r, pc, 0.0, 0.0, [cr, cg, cb, glyph_a]));
             }
         }
         out.extend(shown.iter().filter_map(|pc| self.bar_quad(pc, None, [1.0, 1.0, 1.0, alpha], edge)));

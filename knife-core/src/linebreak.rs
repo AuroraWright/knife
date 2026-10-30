@@ -171,4 +171,12 @@ mod tests {
         // a small kana (CJ, taken as NS) cannot start a line
         assert_eq!(line(&lb, "日本ょ語", 2), "日本ょ");
     }
+
+    #[test]
+    fn line_feed_and_form_feed_are_mandatory_breaks() {
+        let lb = breaker();
+        assert_eq!(lb.class('\n'), BK);
+        assert_eq!(lb.class('\u{c}'), BK);
+        assert_eq!(line(&lb, "ab\u{c}cd ef", 7), "ab\u{c}");
+    }
 }

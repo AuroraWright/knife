@@ -215,28 +215,45 @@ impl Text<'_> {
     }
 
     /// The first character past the width from `start` (`Measure`), stopping at a line feed.
+    /// The measuring tag processor (sub_DD0D8; Witch on the Holy Night's jp_DD0D8) keeps one save of the
+    /// writer: a run tag saves the cell fraction and spacing fraction and halves both (the spacing by
+    /// `run_spacing`), 0x11 restores them, so a raw 0x10 before a run leaves the text after it at half
+    /// cells; 0x05 / 0x07 / 0x08 drop the character after them, and 0x0D and 0x03 the text up to their 0x06 /
+    /// 0x04.
     fn overflow(&self, start: usize, end: usize, width: f32, m: &Measure) -> Option<usize> {
-        let (mut x, mut half, mut prop, mut first) = (0.0f32, false, false, true);
+        let (mut x, mut first) = (0.0f32, true);
+        // (cell fraction, spacing fraction, proportional) and its save
+        let mut pen = (1.0f32, 1.0f32, false);
+        let mut save = pen;
         let mut p = start;
         while p < end {
             let q = p;
             let c = self.get(&mut p);
             match c[0] {
-                0x11 => (half, prop) = (false, false),
-                b if self.tag(b) => (half, prop) = (true, b != 0x1A),
+                0x11 => pen = (save.0, save.1, false),
+                b if self.tag(b) => {
+                    save = pen;
+                    pen = (save.0 * 0.5, save.1 * m.run_spacing, b != 0x1A);
+                }
                 0x0A => return None,
+                0x05 | 0x07 | 0x08 => {
+                    self.get(&mut p);
+                }
+                0x0D | 0x03 => {
+                    let stop = if c[0] == 0x0D { 0x06 } else { 0x04 };
+                    while p < end && self.get(&mut p)[0] != stop {}
+                }
                 1..=0x1F => {}
                 _ => {
-                    let w = match (half, prop, m.prop) {
+                    let w = match (pen.0 < 1.0, pen.2, m.prop) {
                         (true, true, Some(f)) => f(std::str::from_utf8(&c[..strlen(&c)]).ok().and_then(|s| s.chars().next()).unwrap_or(' ')),
-                        (true, ..) => m.cell * 0.5,
-                        _ => m.cell,
+                        _ => m.cell * pen.0,
                     };
                     if !first && x + w > width {
                         return Some(q);
                     }
                     first = false;
-                    x += w + m.spacing * if half { m.run_spacing } else { 1.0 };
+                    x += w + m.spacing * pen.1;
                 }
             }
         }
@@ -245,7 +262,11 @@ impl Text<'_> {
 
     /// sub_148988: the line's last character (a byte offset), or `end` when the rest fits.
     fn last_on_line(&self, lb: &LineBreak, start: usize, end: usize, width: f32, m: &Measure) -> usize {
-        let Some(over) = self.overflow(start, end, width, m) else { return end };
+        // with the rest in the width the line still ends at a mandatory break (UAX #14 class BK: a line feed,
+        // a tag 12)
+        let Some(over) = self.overflow(start, end, width, m) else {
+            return self.t[start..end].iter().position(|&b| b == 0x0A || b == 0x0C).map_or(end, |i| start + i);
+        };
         let s = std::str::from_utf8(&self.t[start..end]).unwrap_or_default();
         let offs: Vec<usize> = s.char_indices().map(|(i, _)| start + i).collect();
         let chars: Vec<char> = s.chars().collect();
@@ -508,13 +529,34 @@ impl Text<'_> {
     }
 }
 
+/// The least room sub_BF0F8 lets a line go on with after a tag 12: 20 / 1920 of the screen width (English text,
+/// whose N is -1, also needs `ROOM_MIN_ENGLISH`), in px at 1920.
+pub const ROOM_MIN: f32 = 20.0;
+/// 120 / 1920 of the screen width (Witch on the Holy Night's jp_BF0F8: 140)
+pub const ROOM_MIN_ENGLISH: f32 = 120.0;
+pub const ROOM_MIN_ENGLISH_WITCH: f32 = 140.0;
+
+/// sub_BF0F8's lines.
+pub struct Breaks {
+    /// the byte offsets where a new line starts
+    pub starts: Vec<usize>,
+    /// how many of the text's tags 12 sub_BF0F8 turned into line breaks: each one makes the first tag 12 left
+    /// in the slot's tagged text a 31, which draws nothing
+    pub cut: usize,
+}
+
 /// The byte offsets of `text` (sub_BF0F8's plain copy) where sub_BF0F8 starts a new line: the first line
-/// `first` px wide (a page message that goes on after the one before), the others `width`.
-pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, m: &Measure, r: &Rules) -> Vec<usize> {
+/// `first` px wide, the others `width`. `base` is the slot's x for tag 12 (+101032) less its own (+512): when
+/// the breaker ends a line at a tag 12 (0x0C, `@x` or the character), the line goes on from there over the room
+/// the base leaves in the slot (the whole width from a base at or past its right edge, the tag's x then the
+/// slot's own), 20 px more before a character of the HANG list (Tsukihime), with as many characters as that
+/// room takes; with less than `ROOM_MIN` the line breaks at the tag instead.
+pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, base: f32, m: &Measure, r: &Rules) -> Breaks {
     let t = Text { t: text, r };
     let end = text.len();
     let full = per_line(width, m);
     let mut out = Vec::new();
+    let mut cut = 0;
     let (mut start, mut w, mut n) = (0, first, per_line(first, m));
     while start < end {
         let mut brk = t.last_on_line(lb, start, end, w, m);
@@ -536,9 +578,26 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, m: &Measure, 
             brk = q;
         }
         match t.at(brk) {
-            0x0C | 0x0A => {
+            0x0C => {
+                let mut room = width - if base >= width { 0.0 } else { base.max(0.0) };
+                let mut q = brk + 1;
+                if !r.witch && in_list(r.hang, &t.get(&mut q)) {
+                    room += ROOM_MIN;
+                }
+                if room < ROOM_MIN {
+                    out.push(brk);
+                    cut += 1;
+                    w = width;
+                } else {
+                    (w, n) = (room, per_line(room, m));
+                }
                 start = brk + 1;
-                (w, n) = (width, full);
+                continue;
+            }
+            // the count stays the line's
+            0x0A => {
+                start = brk + 1;
+                w = width;
                 continue;
             }
             _ => {}
@@ -570,7 +629,7 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, m: &Measure, 
         start = nl.unwrap_or_else(|| brk + char_len(t.at(brk)));
         (w, n) = (width, full);
     }
-    out
+    Breaks { starts: out, cut }
 }
 
 #[cfg(test)]
@@ -579,6 +638,11 @@ mod tests {
     use crate::exe::Nso;
 
     fn lines(s: &str) -> Vec<String> {
+        lines_at(s, 0.0).0
+    }
+
+    /// `lines` in a slot whose tag 12 base is `base` px from its x, with the count of tags 12 made line breaks
+    fn lines_at(s: &str, base: f32) -> (Vec<String>, usize) {
         let lb = LineBreak::load(&Nso::from_bundle(include_bytes!("../../knife/data/exe_tables_overseas.bin")).unwrap()).unwrap();
         // the message slot: 464 units (1392 px) of 45.6 px cells and 4 px spacing
         let m = Measure { cell: 45.6, spacing: 4.0, run_spacing: 0.5, prop: None };
@@ -596,14 +660,31 @@ mod tests {
         if run {
             t.push('\u{11}');
         }
-        let b = breaks(&lb, t.as_bytes(), 1392.0, 1392.0, &m, &TSUKIHIME);
+        let b = breaks(&lb, t.as_bytes(), 1392.0, 1392.0, base, &m, &TSUKIHIME);
         let mut out = Vec::new();
         let mut from = 0;
-        for p in b.into_iter().chain([t.len()]) {
+        for p in b.starts.into_iter().chain([t.len()]) {
             out.push(t[from..p].chars().filter(|&c| c >= ' ').collect::<String>());
             from = p;
         }
-        out
+        (out, b.cut)
+    }
+
+    #[test]
+    fn tag_12_and_line_feeds() {
+        let kana = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをんアイウエオカキクケコサシスセソタチツ";
+        let kana: Vec<char> = kana.chars().collect();
+        let k = |a: usize, b: usize| kana[a..b].iter().collect::<String>();
+        // a line ends at a line feed even when the rest fits, and the lines after it break
+        assert_eq!(lines(&format!("あ\n{}", k(0, 60))), vec![format!("あ{}", k(0, 28)), k(28, 56), k(56, 60)]);
+        // with 1.2 px of room after the base the line breaks at the tag, which draws nothing
+        assert_eq!(lines_at(&format!("{}\u{c}{}", k(0, 3), k(3, 6)), 1390.8), (vec![k(0, 3), k(3, 6)], 1));
+        // 20 px more before a character of the HANG list: on from the base, where it hangs alone (N 0)
+        assert_eq!(lines_at(&format!("{}\u{c}。{}", k(0, 3), k(3, 6)), 1390.8), (vec![format!("{}。", k(0, 3)), k(3, 6)], 0));
+        // 392 px of room: N 8 (sub_C471C fills the line to it past the 7 cells in the width), on from the base
+        assert_eq!(lines_at(&format!("\u{c}{}", k(0, 10)), 1000.0), (vec![k(0, 8), k(8, 10)], 0));
+        // a base past the slot's right edge: the whole width
+        assert_eq!(lines_at(&format!("{}\u{c}{}", k(0, 20), k(20, 50)), 1400.0), (vec![format!("{}{}", k(0, 20), k(20, 48)), k(48, 50)], 0));
     }
 
     #[test]

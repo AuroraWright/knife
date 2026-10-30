@@ -96,8 +96,10 @@ pub struct Page {
     extras: Vec<i32>,
     pen: (f32, f32),
     order: usize,
-    /// where the last message's layout started (pen, order): MSAD lays the grown message out again from here
+    /// where the last message's layout started (pen, order) and its slot's base x for tag 12: MSAD lays the grown
+    /// message out again from here
     last_start: ((f32, f32), usize),
+    last_base: f32,
     revealed: f32,
     visible: bool,
     /// window alpha (off_AE0558): towards 1 while shown, 128 ms either way (sub_38D40, speed 16.667/128 per
@@ -114,6 +116,9 @@ pub struct Page {
     /// per message: first index into `chars`, whether its text ends in @k, how far its read fade has gone
     /// (0..1) and that fade's length in frames (stage word 870 + i: the text speed * 1.2 while it was current)
     msgs: Vec<(usize, bool, f32, f32)>,
+    /// the message drawn a line above line 0 (`Game::show_message`): its first index into `chars` and how far
+    /// down line 0 is; the next message moves it there
+    lifted: Option<(usize, f32)>,
     /// SELD options listed after the page's messages (history entries of type 12, shown in the backlog)
     choice_texts: Vec<String>,
     /// their F(847 + index), as `extras`
@@ -507,6 +512,10 @@ pub struct Game {
     font: FontAtlas,
     /// ja3 FOT-Seurat: the message text while the window is a bubble (see `msg_font`)
     font_bubble: Option<FontAtlas>,
+    /// the message glyph cache's font order (`text::GlyphCache`)
+    glyphs: text::GlyphCache,
+    /// the registrations of the messages laid out since the page last drew, by message (`text::GlyphCache::first_print`)
+    glyph_regs: Vec<(usize, Vec<text::Registration>)>,
     pub settings: Settings,
     /// jp_48AC0's BGM ducking (Witch on the Holy Night): the level of 256 (dword_3CD650), the level the BGM
     /// volume was last set for (dword_3CD648), the 60 Hz step's time and sub_FF70's BGM curve level
@@ -923,6 +932,8 @@ impl Game {
             sound: Sound::new(),
             font,
             font_bubble: None,
+            glyphs: text::GlyphCache::default(),
+            glyph_regs: Vec::new(),
             settings: Settings::default(),
             duck: 256,
             duck_set: 256,
@@ -1203,6 +1214,13 @@ impl Game {
             self.skip = false;
             self.skip_blocked = true;
         }
+    }
+
+    /// The character spacing the page's pen keeps after the last message's last glyph (`text::trailing_gap`:
+    /// half after a Japanese ASCII run's, none after an English exfont run), which the slot's end cursor lacks
+    /// (Switch, a bubble line ending in ASCII "d": its click icon a unit right of the full spacing's).
+    fn pen_gap(&self, lay: &Layout) -> f32 {
+        self.page.texts.last().map_or(0.0, |t| text::trailing_gap(&text::parse_markup(&self.resolve_text(t)), lay.spacing))
     }
 
     fn resolve_text(&self, s: &str) -> String {
@@ -4864,6 +4882,7 @@ impl Game {
         self.page.texts.clear();
         self.page.msgs.clear();
         self.page.zs.clear();
+        self.page.lifted = None;
         self.page.order = 0;
         self.page.revealed = 0.0;
         let (lay, top) = self.text_layout();
@@ -5119,15 +5138,29 @@ impl Game {
         }
         let path = assets.font_path("").with_context(|| format!("no font in {}", assets.language_folder()))?;
         let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let mut font = with_exfont(FontAtlas::new(r, data)?);
+        let mut font = with_exfont(FontAtlas::new(data)?);
         // the rest of the font list (sub_CA500): `<folder>2`, `<folder>3`
-        for suffix in ["2", "3"] {
+        for (suffix, lang) in [("2", 1), ("3", 2)] {
             if let Some(d) = assets.font_path(suffix).and_then(|p| std::fs::read(p).ok()) {
-                font.add_fallback(d).unwrap_or_else(|e| tracing::warn!("font {suffix}: {e:#}"));
+                font.add_font(d, lang).unwrap_or_else(|e| tracing::warn!("font {suffix}: {e:#}"));
             }
         }
+        font.set_otf_kerning(assets.otf_kerning());
+        // the bubble variant takes a glyph from `<folder>3`, else from the message list's other fonts in order
+        // (Switch, French fan fonts: FOT-Seurat's missing space and U+3000 blank, ⼀ ⼝ from TsukuMin, ～ – ⋯
+        // from TsukuGo)
+        let bubble_list = |mut f: FontAtlas| {
+            f.set_first_lang(2);
+            for (suffix, lang) in [("", 0), ("2", 1)] {
+                if let Some(d) = assets.font_path(suffix).and_then(|p| std::fs::read(p).ok()) {
+                    f.add_font(d, lang).unwrap_or_else(|e| tracing::warn!("font {suffix}: {e:#}"));
+                }
+            }
+            f.set_otf_kerning(assets.otf_kerning());
+            f
+        };
         let bubble = match assets.font_path("3").map(|p| std::fs::read(&p).with_context(|| format!("reading {}", p.display()))) {
-            Some(Ok(d)) => FontAtlas::new(r, d).map(with_exfont).map_err(|e| tracing::warn!("bubble font: {e:#}")).ok(),
+            Some(Ok(d)) => FontAtlas::new(d).map(bubble_list).map(with_exfont).map_err(|e| tracing::warn!("bubble font: {e:#}")).ok(),
             Some(Err(e)) => {
                 tracing::warn!("bubble font: {e:#}");
                 None
@@ -5135,7 +5168,7 @@ impl Game {
             // Witch on the Holy Night loads one font per language (sub_85A90: the folder's file and the
             // exfont); its bubble text (flag 0x100000: slot +101793, font variant 3 in jp_C406C) draws in the
             // shared system font (Switch: the TeaTime bubbles and the save list's header in gothic)
-            None if assets.build == Build::Witch => crate::ui::shared_font_atlas(r, assets.shared_fonts()).map(with_exfont),
+            None if assets.build == Build::Witch => crate::ui::shared_font_atlas(assets.shared_fonts()).map(with_exfont),
             None => {
                 tracing::warn!("no bubble font");
                 None
@@ -5165,6 +5198,7 @@ impl Game {
             Ok((font, bubble)) => {
                 self.font = font;
                 self.font_bubble = bubble;
+                self.glyphs.clear();
             }
             Err(e) => tracing::warn!("fonts: {e:#}"),
         }
@@ -5289,10 +5323,21 @@ impl Game {
 
     /// Lay out a message (`text` as the script has it: `$` references resolve in the game language, and the
     /// page keeps it unresolved, as the exe's history records do) at the page pen.
+    /// A raw ruby the tag processor can't take (`text::Run::RubyAt` without a base) stops the game: sub_DDA1C reads
+    /// a base pointer the slot never set (address 0) or an earlier text's, or case 1 / 3 scans on past the text
+    /// (Switch, Astris: a 0x03 with no 0x01 before it crashed the game in a fresh slot and froze it in another).
+    fn check_rubies(runs: &[text::Run], shown: &str) {
+        if runs.iter().any(|r| matches!(r, text::Run::RubyAt { base: None, .. })) {
+            tracing::error!("{shown:?}: a raw ruby tag (0x03 with no 0x01 base before it, or an unclosed 0x01 / 0x03) that stops the game");
+            std::process::exit(1);
+        }
+    }
+
     fn show_message(&mut self, text: &str, wait: bool) {
         self.slot_flip = false;
         let shown = self.resolve_text(text);
         let runs = text::parse_markup(&shown);
+        Self::check_rubies(&runs, &shown);
         self.page.visible = true;
         let i = self.page.msgs.len();
         self.z_cur = if self.relaying {
@@ -5305,6 +5350,18 @@ impl Game {
         } else {
             None
         };
+        // sub_391A0 lays the page's earlier messages out from their history slots (at 768), where a line above
+        // line 0 is line 0 (the line index clamped): a message drawn there while it was the current one moves
+        // down (Switch: `@x` text alone on a page at the screen's top, on line 0 once the next one shows)
+        if let Some((first, dy)) = self.page.lifted.take() {
+            for pc in self.page.chars.iter_mut().skip(first) {
+                pc.baseline += dy;
+                if let Some(bar) = &mut pc.bar {
+                    bar.top += dy;
+                }
+            }
+            self.page.pen.1 += dy;
+        }
         // lay out on a scratch copy; restart the page if it overflows
         let (lay, top) = self.text_layout();
         // sub_391A0: in page mode message i of the page starts F(847 + i) lines further down (over 32 counts as
@@ -5318,47 +5375,74 @@ impl Game {
             v if v >= 1 => v,
             _ => 0,
         };
-        let start = if self.page.chars.is_empty() {
-            (lay.left, top + extra.max(0) as f32 * lay.line_height)
+        // `@x` or a 0x0C (sub_391A0 / jp_391A0: the slot's tagged text has tag 12, sub_A88B0 -> sub_C0DB0): the
+        // message starts at the left a line up (sub_A80D0), and the tag moves the cursor to the slot's base x
+        // (sub_A8190): the end cursor of the message before (+101024) + 2 units (0 before the page's first, so
+        // short of the left edge, which makes it 0 and sub_C3710 the slot's x)
+        let indent = runs.iter().any(|r| matches!(r, text::Run::Indent));
+        // Tsukihime's line up from line 0 reads the line table's entry -1, the quake's frame count dword_AFECC8
+        // (an int, read as a float about 0): the line's box top at the screen's top (Switch: a page's first
+        // message with a 0x0C at y 19 of 1080, 157 px above line 0's). Witch on the Holy Night stays on line 0.
+        // A bubble keeps its own origin.
+        let bubble = self.window_type().is_some_and(|t| self.is_bubble(t));
+        let up = |y: f32| match y - lay.line_height {
+            v if v < top - 0.5 && !witch && !bubble => lay.ascent,
+            v => v.max(top),
+        };
+        let (start, mut base) = if self.page.chars.is_empty() {
+            let y = top + extra.max(0) as f32 * lay.line_height;
+            if indent && !witch { ((lay.left, up(y)), lay.left) } else { ((lay.left, y), lay.left) }
         } else {
             let y = (self.page.pen.1 + lay.line_height * (1 + extra) as f32 + PARAGRAPH_GAP).max(top);
-            if runs.iter().any(|r| matches!(r, text::Run::Indent)) {
-                // `@x` (sub_391A0 / jp_391A0: the slot's text has tag 12, sub_A88B0): the slot's base x
-                // (sub_A8190) is the end cursor of the message before (+101024) + 2 units, on that message's
-                // last line (Tsukihime: line - 1; Witch on the Holy Night: line - 1 while F(847 + i) is 0, else
-                // its own line). From the box's right edge on it starts the line after at the left (Tsukihime:
-                // its own line; Witch on the Holy Night: the line after it). Switch: 1_0's 「数分後。」 and the
-                // message after it on one line.
-                let gap = self.page.texts.last().map_or(0.0, |t| text::trailing_gap(&text::parse_markup(&self.resolve_text(t)), lay.spacing));
-                let x = self.page.pen.0 - gap + 2.0 * UX;
+            if indent {
+                // on the message before's last line (Tsukihime: line - 1; Witch on the Holy Night: line - 1 while
+                // F(847 + i) is 0, else its own line). From the box's right edge on the base is the slot's x on
+                // the line after (Tsukihime: its own line; Witch on the Holy Night: the line after it). Switch:
+                // 1_0's 「数分後。」 and the message after it on one line.
+                let x = self.page.pen.0 - self.pen_gap(&lay) + 2.0 * UX;
+                // sub_AB9A0 reads the cursor the click icon does, which for English text is half a glyph cell
+                // further (overseas sub_C5FB4, jp_C5FB4). Switch: an English line's xyz 31 px after its x.
+                let x = if (witch || self.assets.build == Build::Overseas) && text::english() { x + lay.size * 0.5 } else { x };
                 if x >= lay.right {
-                    (lay.left, if witch { y + lay.line_height } else { y })
-                } else if !witch || f == 0 {
-                    (x, (y - lay.line_height).max(top))
+                    ((lay.left, if witch { y + lay.line_height } else { y }), lay.left)
                 } else {
-                    (x, y)
+                    // below the left edge base 0 (the slot's x); a NaN cursor passes as it is (jp_391A0)
+                    let x = if x < lay.left { lay.left } else { x };
+                    if !witch || f == 0 { ((lay.left, up(y)), x) } else { ((lay.left, y), x) }
                 }
             } else {
-                (lay.left, y)
+                ((lay.left, y), lay.left)
             }
         };
         let mut placed = Vec::new();
         let mut from = (start, self.page.order);
         let order0 = self.page.order;
-        let (x, b, order) = text::layout(self.msg_font(), &lay, &runs, start.0, start.1, order0, &mut placed);
+        let mut first = self.page.chars.len();
+        let font = self.glyph_start(&runs, false);
+        let (x, b, order) = text::layout_from(self.msg_font(), &lay, &runs, start.0, start.1, base, order0, &mut placed, font);
         self.msg_pc = self.pc.saturating_sub(1);
+        let mut lifted = start.1 < top - 0.5;
         if b > BOTTOM_LIMIT && !self.page.chars.is_empty() && !self.relaying {
             self.clear_page(true);
             placed.clear();
-            from = ((lay.left, top), 0);
-            let (x, b, order) = text::layout(self.msg_font(), &lay, &runs, lay.left, top, 0, &mut placed);
+            let y = if indent && !witch && !bubble { lay.ascent } else { top };
+            lifted = y < top - 0.5;
+            first = 0;
+            base = lay.left;
+            from = ((lay.left, y), 0);
+            let font = self.glyph_start(&runs, false);
+            let (x, b, order) = text::layout_from(self.msg_font(), &lay, &runs, lay.left, y, base, 0, &mut placed, font);
             self.page.pen = (x, b);
             self.page.order = order;
         } else {
             self.page.pen = (x, b);
             self.page.order = order;
         }
+        if lifted {
+            self.page.lifted = Some((first, top - lay.ascent));
+        }
         self.page.last_start = from;
+        self.page.last_base = base;
         // the page's earlier messages are drawn whole from their ring entries (sub_391A0 at 768 / jp_391A0 at 800),
         // only the new message's slot types out (a rewound message restored at head 0 included)
         self.page.revealed = self.page.revealed.max(from.1 as f32);
@@ -5370,6 +5454,7 @@ impl Game {
         let extra = self.var(&format!("F{}", 847 + self.page.texts.len()));
         self.page.extras.push(extra);
         self.page.texts.push(text.to_string());
+        self.blank_glyphs(lay.size);
         if wait {
             self.page.waiting = true;
             self.wait = Wait::Click;
@@ -5388,11 +5473,14 @@ impl Game {
         let text = format!("{base}{add}");
         let shown = self.resolve_text(&text);
         let runs = text::parse_markup(&shown);
+        Self::check_rubies(&runs, &shown);
         let (lay, _) = self.text_layout();
         let ((x0, y0), order0) = self.page.last_start;
         let old = self.page.chars.split_off(first.min(self.page.chars.len()));
         let mut placed = Vec::new();
-        let (x, b, order) = text::layout(self.msg_font(), &lay, &runs, x0, y0, order0, &mut placed);
+        let base = self.page.last_base;
+        let font = self.glyph_start(&runs, true);
+        let (x, b, order) = text::layout_from(self.msg_font(), &lay, &runs, x0, y0, base, order0, &mut placed, font);
         self.arm_wobbles(&mut placed, &old);
         self.page.pen = (x, b);
         self.page.order = order;
@@ -5401,12 +5489,45 @@ impl Game {
             m.1 = shown.trim_end().ends_with("@k");
         }
         *self.page.texts.last_mut().unwrap() = text;
+        self.blank_glyphs(lay.size);
         self.page.visible = true;
         if wait {
             self.page.waiting = true;
             self.wait = Wait::Click;
             self.auto_timer = 0.0;
         }
+    }
+
+    /// The page's texts as their slots print them.
+    fn page_runs(&self) -> Vec<Vec<text::Run>> {
+        self.page.texts.iter().map(|t| text::parse_markup(&self.resolve_text(t))).collect()
+    }
+
+    /// The font order a text added to the page (`runs`; in place of the page's last when `replace`) starts
+    /// drawing in (`text::GlyphCache`).
+    fn glyph_start(&mut self, runs: &[text::Run], replace: bool) -> text::FontOrder {
+        let mut page = self.page_runs();
+        if replace {
+            page.pop();
+        }
+        let mut texts: Vec<&[text::Run]> = page.iter().map(Vec::as_slice).collect();
+        texts.push(runs);
+        let mut glyphs = std::mem::take(&mut self.glyphs);
+        let start = glyphs.starts(self.msg_font(), &texts, true).pop();
+        let regs = glyphs.first_print(self.msg_font(), runs);
+        self.glyphs = glyphs;
+        self.glyph_regs.push((texts.len() - 1, regs));
+        start.unwrap_or_default()
+    }
+
+    /// Mark the page's glyphs the glyph cache draws as the space glyph (`text::GlyphCache::blank`).
+    fn blank_glyphs(&mut self, size: f32) {
+        let page = self.page_runs();
+        let texts: Vec<&[text::Run]> = page.iter().map(Vec::as_slice).collect();
+        let firsts: Vec<usize> = self.page.msgs.iter().map(|m| m.0).collect();
+        let (mut glyphs, mut chars) = (std::mem::take(&mut self.glyphs), std::mem::take(&mut self.page.chars));
+        glyphs.blank(self.msg_font(), &texts, &mut chars, &firsts, size, true);
+        (self.glyphs, self.page.chars) = (glyphs, chars);
     }
 
     /// jp_BDC2C's glyph records for a message's new layout: each wobbling glyph draws its phases and rates
@@ -5451,15 +5572,21 @@ impl Game {
             Some(f) if bubble => f,
             _ => &mut self.font,
         };
+        let page: Vec<_> = texts.iter().map(|t| text::parse_markup(&resolve_refs(&self.assets, t))).collect();
+        let entries: Vec<&[text::Run]> = page.iter().map(Vec::as_slice).collect();
+        // the entries' slots print in turn every frame (`text::GlyphCache`)
+        let mut glyphs = self.glyphs.clone();
+        let starts = glyphs.starts(font, &entries, false);
         let mut placed = Vec::new();
         let (mut pen_y, mut order) = (None, 0);
         // the end cursor of the entry before (`text::trailing_gap`)
         let mut end_x = None;
+        let english_cursor = matches!(self.assets.build, Build::Overseas | Build::Witch) && text::english();
         // each entry's first glyph and edge colour (its own slot's)
         let mut edges = Vec::new();
         for (i, t) in texts.iter().enumerate() {
             edges.push((placed.len(), text::text_edge(t)));
-            let runs = text::parse_markup(&resolve_refs(&self.assets, t));
+            let runs = &page[i];
             // sub_28470: entry i starts a line pitch below the last one (the first at the top line), then
             // F(847 + i) of its record more lines down when 1..32, or (that - 64) lines when over 32, not above
             // the top line (a choice's first option: the blank line its first SELR asked for)
@@ -5470,26 +5597,32 @@ impl Game {
                 v if v > 32 => (y + (v - 64) as f32 * lay.line_height).max(top),
                 _ => y,
             };
-            // `@x` (sub_A88B0): the end cursor of the entry before + 2 units, a line up while F(847 + i) is below
-            // 32; from the box's right edge on the line after at the left
-            let (x, y) = match end_x {
+            // `@x` or a 0x0C (sub_A88B0): the entry starts at the left and the tag moves the cursor to the base x,
+            // the end cursor of the entry before + 2 units (that cursor 0 before the first: no move; for English
+            // text half a glyph cell further, as the click icon's), a line up while F(847 + i) is below 32; from
+            // the box's right edge on the left of the line after
+            let (y, base) = match end_x {
                 Some(e) if runs.iter().any(|r| matches!(r, text::Run::Indent)) => {
-                    let x: f32 = e + 2.0 * UX;
+                    let x: f32 = e + 2.0 * UX + if english_cursor { lay.size * 0.5 } else { 0.0 };
                     if x >= lay.right {
-                        (lay.left, y + lay.line_height)
+                        (y + lay.line_height, lay.left)
                     } else if extra < 32 {
-                        (x, y - lay.line_height)
+                        (y - lay.line_height, x)
                     } else {
-                        (x, y)
+                        (y, x)
                     }
                 }
-                _ => (lay.left, y),
+                _ => (y, lay.left),
             };
-            let (px, b, o) = text::layout(font, &lay, &runs, x, y, order, &mut placed);
-            end_x = Some(px - text::trailing_gap(&runs, lay.spacing));
+            let (px, b, o) = text::layout_from(font, &lay, runs, lay.left, y, base, order, &mut placed, starts[i]);
+            end_x = Some(px - text::trailing_gap(runs, lay.spacing));
             pen_y = Some(b);
             order = o;
         }
+        let firsts: Vec<usize> = edges.iter().map(|e| e.0).collect();
+        glyphs.blank(font, &entries, &mut placed, &firsts, lay.size, false);
+        let regs = glyphs.registrations(font, &entries, false);
+        font.register(r, &regs, true);
         let mut out = Vec::new();
         // each entry is its own draw buffer (`text::Batches`)
         let mut batches = text::Batches::default();
@@ -5637,8 +5770,17 @@ impl Game {
                 })
                 .collect();
             // (an `@z` message in the shared font too, `Game::z_cur`)
+            let regs = std::mem::take(&mut self.glyph_regs);
             let (font_main, font_bubble) = (&mut self.font, &mut self.font_bubble);
             let zs = &self.page.zs;
+            // the messages laid out since the last draw register their glyphs first, in the cache they draw from
+            for (i, regs) in &regs {
+                let font = match font_bubble.as_mut() {
+                    Some(f) if bubble_font || zs.get(*i).copied().flatten().is_some() => f,
+                    _ => &mut *font_main,
+                };
+                font.register(r, regs, edge || slot_edges.get(*i).is_some_and(|e| e.1));
+            }
             let msgs = &self.page.msgs;
             let cur = msgs.last().map_or(usize::MAX, |m| m.0);
             let fades: Vec<f32> = (0..msgs.len())
@@ -5676,7 +5818,9 @@ impl Game {
                 if vis <= 0.0 || self.rewinding {
                     continue;
                 }
-                let alpha = vis * text_a * fade;
+                // the slot's alpha (sub_AB710: fade x the content factor) as the print's byte, the composite's
+                // factor after it
+                let alpha = if text_a > 0.0 { vis * text::slot_alpha(fade * layer) * layer } else { 0.0 };
                 // a fill code's colour (jp_C3C24's node colour) in place of the slot's
                 let rgb = text::fill_rgb(pc, rgb);
                 let font = match font_bubble.as_mut() {
@@ -5720,15 +5864,16 @@ impl Game {
                     (54, 105, (39.0, 39.0), 1.0, (2.0, 3.5))
                 };
                 // The pen is the slot's nn::font cursor (slot +101024, sub_AB8E0): its line box top, and no
-                // character spacing after the last glyph (TextWriter adds it before each glyph but the first),
-                // truncated to whole 640x448 units.
+                // character spacing after the last glyph (TextWriter adds it before each glyph but the first;
+                // `pen_gap`), truncated to whole 640x448 units.
                 let (lay, _) = self.text_layout();
                 let (px, py) = self.page.pen;
-                let px = if px > lay.left { px - lay.spacing } else { px };
+                let px = if px > lay.left { px - self.pen_gap(&lay) } else { px };
                 // The overseas text slot (sub_C5FB4, English text: slot +101009) stores the writer's cursor
                 // plus half the glyph cell (slot +776, the 41.04 px em) as the cursor
                 let px = if self.assets.build == Build::Overseas && text::english() { px + lay.size * 0.5 } else { px };
-                let (ux, uy) = ((px / UX).trunc(), ((py - lay.ascent) / UY).trunc());
+                // (int) as fcvtzs: a NaN cursor (an English raw 0x12) 0, an infinite one saturated
+                let (ux, uy) = ((px / UX) as i32 as f32, ((py - lay.ascent) / UY) as i32 as f32);
                 let (sx, sy) = shift.unwrap_or((0.0, 0.0));
                 let (x, y) = ((ux + dx) * UX + sx, (uy + dy) * UY + sy);
                 // one animation frame per 2 ticks of a counter that runs only while an icon draws (sub_B0190's
@@ -5814,11 +5959,12 @@ impl Game {
         let (slot, (fw, fh), row_gap) = if page_icon { (53, (60.0, 45.0), 50.0) } else { (52, (45.0, 45.0), 56.0) };
         let (lay, _) = self.text_layout();
         let (px, py) = self.page.pen;
-        let px = if px > lay.left { px - lay.spacing } else { px };
+        let px = if px > lay.left { px - self.pen_gap(&lay) } else { px };
         // the cursor jp_C5FB4 stores for English text is half a glyph cell (slot +776) further, as in the
         // overseas Tsukihime
         let px = if text::english() { px + lay.size * 0.5 } else { px };
-        let (ux, uy) = ((px / UX).trunc(), ((py - lay.ascent) / UY).trunc());
+        // (int) as fcvtzs (jp_AB8E0), as Tsukihime's
+        let (ux, uy) = ((px / UX) as i32 as f32, ((py - lay.ascent) / UY) as i32 as f32);
         let (sx, sy) = shift.unwrap_or((0.0, 0.0));
         let (x, y) = ((ux + 2.0) * UX + sx, (uy + 6.5) * UY + sy);
         self.icon_ticks = (self.icon_ticks + (self.frame_ms * 0.06).min(2.0)) % 120.0;

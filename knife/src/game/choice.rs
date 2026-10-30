@@ -274,7 +274,7 @@ impl Game {
             for o in &c.opts {
                 let mut placed = Vec::new();
                 let runs = text::parse_markup(&self.resolve_text(&o.text));
-                text::layout(&self.font, &lay, &runs, 0.0, 0.0, 0, &mut placed);
+                text::layout(&self.font, &lay, &runs, 0.0, 0.0, 0.0, 0, &mut placed);
                 let mut rows: Vec<(f32, f32)> = Vec::new();
                 for p in &placed {
                     let end = p.x + p.width();
@@ -302,7 +302,7 @@ impl Game {
                 let mut placed = Vec::new();
                 let runs = text::parse_markup(&self.resolve_text(&o.text));
                 let base = c.top + i as f32 * lay.line_height;
-                text::layout(&self.font, &lay, &runs, lay.left, base, 0, &mut placed);
+                text::layout(&self.font, &lay, &runs, lay.left, base, 0.0, 0, &mut placed);
                 placed
             })
             .collect();
@@ -793,7 +793,7 @@ impl Game {
                         vis = 1.0;
                     }
                     if vis > 0.0 {
-                        Self::rimmed_glyph(&mut self.font, r, out, p, vis * page_alpha);
+                        Self::rimmed_glyph(&mut self.font, r, out, p, vis * text::slot_alpha(page_alpha));
                     }
                 }
                 // sub_A8CB0(20 + n, n == cursor) sets the slot's +100964, the blend state its glyphs draw with
@@ -969,7 +969,7 @@ impl Game {
             }
         }
         for p in &glyphs {
-            Self::rimmed_glyph(&mut self.font, r, out, p, a);
+            Self::rimmed_glyph(&mut self.font, r, out, p, text::slot_alpha(a));
         }
     }
 }

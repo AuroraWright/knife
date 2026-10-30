@@ -413,6 +413,8 @@ pub struct Renderer {
     scale: f32,
     /// The scale follows the window (`set_follow_window`)
     follow_window: bool,
+    /// frames presented (`frame`)
+    frames: u64,
 }
 
 pub enum Upload<'a> {
@@ -616,6 +618,7 @@ impl Renderer {
             hidden: false,
             scale: 1.0,
             follow_window: false,
+            frames: 0,
         })
     }
 
@@ -639,6 +642,11 @@ impl Renderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The frames presented so far: the frame being built.
+    pub fn frame(&self) -> u64 {
+        self.frames
     }
 
     /// The pixel size of a canvas target of `w` x `h` units.
@@ -1248,6 +1256,7 @@ impl Renderer {
 
     /// Scale `canvas` into the window (letterboxed) through the output curve, then submit and present.
     pub fn present(&mut self, mut encoder: wgpu::CommandEncoder, canvas: &RenderTarget) {
+        self.frames += 1;
         if self.hidden {
             self.queue.submit([encoder.finish()]);
             return;
