@@ -207,8 +207,20 @@ pub enum FontOrder {
 }
 
 impl FontOrder {
-    /// The tag that sets an order.
+    /// The tag that sets the order the writer draws in (Witch on the Holy Night's tag processor has no case
+    /// 0x18).
     fn of_tag(c: char) -> Option<FontOrder> {
+        match c {
+            '\u{18}' if crate::assets::witch() => None,
+            c => Self::registered_by(c),
+        }
+    }
+
+    /// The tag that sorts a print's glyphs into the string registered in an order (sub_C445C, Witch on the Holy
+    /// Night's jp_C445C too: 20, 21 and 24). Witch on the Holy Night never registers the bubble string and draws
+    /// it in the order before, so its glyphs not already in the cache draw nothing (Switch,
+    /// `X18あいう\x18えおか`: えおか blank, the click icon after their room).
+    fn registered_by(c: char) -> Option<FontOrder> {
         match c {
             '\u{14}' => Some(FontOrder::Gothic),
             '\u{15}' => Some(FontOrder::List),
@@ -1308,10 +1320,16 @@ pub struct Bar {
     pub row: u8,
     /// characters in the run
     pub len: u8,
-    /// the line top at the first character
+    /// the writer's cursor y at the first character: the line top less the glyph cache's drop (`GLYPH_DROP`:
+    /// the cursor is the font's baseline position above the baseline, the glyphs' ink a cache pixel lower;
+    /// Switch, a bar 1.14 px below the line top at 45.6 px glyphs)
     pub top: f32,
     /// a cell's width: glyph size + character spacing (+776 + +100912)
     pub cell: f32,
+    /// the pen x and line top of a raw 0x16 / 0x19 later in the text, from the first character's pen x and
+    /// `top`: the tag processor stores the bar's position at every one (sub_E01C4 cases 0x16 / 0x19, +132 /
+    /// +136), and the bar draws at the last
+    pub moved: Option<(f32, f32)>,
 }
 
 impl Bar {
@@ -1319,10 +1337,12 @@ impl Bar {
     /// row count - 1 + `row` of the sheet, count cells from the left; `x` is the first character's pen x.
     pub fn rects(&self, x: f32, size: f32, count: u8) -> ([f32; 4], [f32; 4]) {
         const CELL: f32 = 68.0;
+        let (dx, dy) = self.moved.unwrap_or_default();
+        let (x, top) = (x + dx, self.top + dy);
         let (sw, sh) = (1428.0, 1972.0);
         let n = f32::from(count.clamp(1, self.len));
         let v0 = CELL * (n + f32::from(self.row) - 1.0) / sh;
-        ([x + size / 4.0, self.top + size / 4.0, n * self.cell, size], [0.0, v0, n * CELL / sw, v0 + CELL / sh])
+        ([x + size / 4.0, top + size / 4.0, n * self.cell, size], [0.0, v0, n * CELL / sw, v0 + CELL / sh])
     }
 }
 
@@ -1674,7 +1694,9 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                 }
                 runs.push(Run::Control(c));
             }
-            '[' => {
+            // Witch on the Holy Night has neither bracket tag (no inline glyph names or bar tags in its exe):
+            // `[ber03]` is text (Switch)
+            '[' if !crate::assets::witch() => {
                 let mut tag = String::new();
                 let mut closed = false;
                 while let Some(&d) = it.peek() {
@@ -2149,6 +2171,8 @@ pub fn layout_from(
             _ => *x + width + after,
         };
     };
+    // the writer's cursor y on a line (`Bar::top`)
+    let cursor_y = |baseline: f32| baseline - lay.ascent + GLYPH_DROP * lay.size / BASE_SIZE;
     let push_char = |c: char, st: &Style, x: &mut f32, baseline: &mut f32, order: &mut usize, out: &mut Vec<PlacedChar>| {
         push(c, None, None, lay.spacing, None, st, x, baseline, order, out)
     };
@@ -2240,6 +2264,19 @@ pub fn layout_from(
             }
             Run::Control('\u{b}' | '\u{f}') => style.italic = 0.0,
             Run::Font(f) => style.font = *f,
+            // a raw 0x16 (and outside Witch on the Holy Night, whose processor has no case 0x19, 0x19) moves a bar
+            // earlier in the text to the writer's cursor, which ends at the last glyph (the pen less its
+            // spacing; Switch, `あいう[ber03]えお\x16かき`: the bar at お's end + W / 4); with no bar tag before it
+            // nothing draws there
+            Run::Control(c @ ('\u{16}' | '\u{19}')) => {
+                let cursor = x - trailing_gap(&runs[..ri], lay.spacing);
+                if (*c == '\u{16}' || !crate::assets::witch())
+                    && let Some(pc) = out[start..].iter_mut().rev().find(|pc| pc.bar.is_some())
+                    && let Some(bar) = &mut pc.bar
+                {
+                    bar.moved = Some((cursor - pc.x, cursor_y(baseline) - bar.top));
+                }
+            }
             Run::Control(c) => {
                 if let Some(f) = FontOrder::of_tag(*c) {
                     style.font = f;
@@ -2287,7 +2324,7 @@ pub fn layout_from(
                 text(t, Pass::Text, next, None, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow);
                 if let Some(pc) = out.get_mut(first) {
                     let len = t.chars().count().min(usize::from(u8::MAX)) as u8;
-                    pc.bar = Some(Bar { row: *row, len, top: pc.baseline - lay.ascent, cell: lay.size * lay.sx + lay.spacing });
+                    pc.bar = Some(Bar { row: *row, len, top: cursor_y(pc.baseline), cell: lay.size * lay.sx + lay.spacing, moved: None });
                 }
             }
             // a lone 0x03 stops the game (`Game::show_message`)
@@ -2947,7 +2984,13 @@ fn run_stretch() -> f32 {
 
 /// The build's kinsoku lists and allowance.
 fn kinsoku_rules() -> &'static kinsoku::Rules {
-    if crate::assets::witch() { &kinsoku::WITCH } else { &kinsoku::TSUKIHIME }
+    if crate::assets::witch() {
+        &kinsoku::WITCH
+    } else if crate::assets::overseas() {
+        &kinsoku::OVERSEAS
+    } else {
+        &kinsoku::TSUKIHIME
+    }
 }
 
 fn plan_lines(atlas: &FontAtlas, lay: &Layout, runs: &[Run], x: f32, base: f32, order: FontOrder) -> Option<LinePlan> {
@@ -3025,11 +3068,16 @@ impl GlyphCache {
         let mut text: [Vec<char>; 3] = Default::default();
         let mut ruby: [Vec<char>; 3] = Default::default();
         let mut state = if atlas.bubble { 2 } else { 0 };
-        // tags 5 / 7 / 8 / 13 take the character after them
-        let mut skip = false;
-        let push = |to: &mut Vec<char>, t: &str, skip: &mut bool| {
+        // tags 5 / 7 / 8 / 13 take what follows them in sub_BDC2C's text: before an ASCII character outside a run
+        // that is the run's tag 0x10, after a run's last its 0x11 (Switch, `J2\x10\x05Z\x11`: Z drawn)
+        let (mut skip, mut open) = (false, false);
+        let eng = english();
+        let push = |to: &mut Vec<char>, t: &str, skip: &mut bool, open: &mut bool| {
             for c in t.chars() {
-                if std::mem::take(skip) {
+                let ascii = !eng && in_run(c, Pass::Text);
+                let tag = ascii != *open;
+                *open = ascii;
+                if std::mem::take(skip) && !tag {
                     continue;
                 }
                 if c >= ' ' {
@@ -3039,27 +3087,34 @@ impl GlyphCache {
         };
         for r in runs {
             match r {
-                Run::Text(t) | Run::Bar { text: t, .. } => push(&mut text[state], t, &mut skip),
+                Run::Text(t) | Run::Bar { text: t, .. } => push(&mut text[state], t, &mut skip, &mut open),
                 Run::Ruby { base, ruby: rt, .. } => {
-                    push(&mut text[state], base, &mut skip);
-                    push(&mut ruby[state], rt, &mut skip);
+                    push(&mut text[state], base, &mut skip, &mut open);
+                    push(&mut ruby[state], rt, &mut skip, &mut open);
                 }
-                Run::RubyAt { ruby: rt, .. } => push(&mut ruby[state], rt, &mut skip),
+                Run::RubyAt { ruby: rt, .. } => push(&mut ruby[state], rt, &mut skip, &mut open),
                 Run::Font(f) => state = match f {
                     FontOrder::Gothic => 1,
                     FontOrder::Bubble => 2,
                     _ => 0,
                 },
-                Run::Control(c) => match c {
-                    '\u{5}' | '\u{7}' | '\u{8}' | '\u{d}' => skip = true,
-                    c => match FontOrder::of_tag(*c) {
-                        Some(FontOrder::Gothic) => state = 1,
-                        Some(FontOrder::Bubble) => state = 2,
-                        Some(_) => state = 0,
-                        None => {}
-                    },
-                },
-                _ => {}
+                Run::Control(c) => {
+                    // sub_BDC2C closes a run before a raw byte: a pending tag takes that 0x11, else the byte
+                    let closed = std::mem::take(&mut open);
+                    if std::mem::take(&mut skip) && !closed {
+                        continue;
+                    }
+                    match c {
+                        '\u{5}' | '\u{7}' | '\u{8}' | '\u{d}' => skip = true,
+                        c => match FontOrder::registered_by(*c) {
+                            Some(FontOrder::Gothic) => state = 1,
+                            Some(FontOrder::Bubble) => state = 2,
+                            Some(_) => state = 0,
+                            None => {}
+                        },
+                    }
+                }
+                _ => open = false,
             }
         }
         let (mut regs, mut seq) = (HashSet::new(), Vec::new());
@@ -3073,8 +3128,12 @@ impl GlyphCache {
             }
         };
         let ruby_order = |o: FontOrder| if v1 { FontOrder::Gothic } else { o };
+        // Witch on the Holy Night's jp_C406C / jp_C5FB4 register the plain and gothic strings only: the text
+        // after a 0x18 is never registered
+        let states: &[(usize, FontOrder)] =
+            if crate::assets::witch() { &[(1, FontOrder::Gothic)] } else { &[(1, FontOrder::Gothic), (2, FontOrder::Bubble)] };
         add(false, &text[0], order);
-        for (k, o) in [(1, FontOrder::Gothic), (2, FontOrder::Bubble)] {
+        for &(k, o) in states {
             if !text[k].is_empty() {
                 add(false, &text[k], o);
                 order = FontOrder::List;
@@ -3084,7 +3143,7 @@ impl GlyphCache {
             order = ruby_order(order);
             add(true, &ruby[0], order);
         }
-        for (k, o) in [(1, FontOrder::Gothic), (2, FontOrder::Bubble)] {
+        for &(k, o) in states {
             if !ruby[k].is_empty() {
                 add(true, &ruby[k], ruby_order(o));
                 order = FontOrder::List;

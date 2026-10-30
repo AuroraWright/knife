@@ -6,12 +6,12 @@
 //! character count (full-width characters 1, half-width ones a half, rounded up) is held to the slot's N, and
 //! sub_C471C applies the kinsoku lists and gives the next line's start. This is a byte-level port: the exe
 //! packs two half-width characters into one 4-byte buffer and steps back over 2-byte characters by bytes.
-//! The overseas build's jp_BF0F8 runs the same loop with the same lists; its rest count also skips tags 26 / 27
-//! and turns -1 when the rest ends inside an ASCII run, which its jp_BDC2C (tags 16 / 17 only, the last run
-//! closed) never gives. Witch on the Holy Night's (`WITCH`) differs: its own lists, the run tags 0x1A / 0x1B
-//! too (jp_BDC2C: 0x1B opens a run starting "!!!", 0x1A one starting with two of "!?", 0x10 the others), its
-//! own count of half-width characters, a line ending inside a run counting N, a plainer cut back to N - 2, and
-//! sub_C471C never ending a line on two packed ASCII characters.
+//! The overseas build's jp_BF0F8 (`OVERSEAS`) runs the same loop with the same lists; its counts also skip tags
+//! 26 / 27 and turn -1 when the text ends inside an ASCII run, which only raw tags in the text give (its
+//! jp_BDC2C writes tags 16 / 17 only and closes the last run). Witch on the Holy Night's (`WITCH`) differs: its
+//! own lists, the run tags 0x1A / 0x1B too (jp_BDC2C: 0x1B opens a run starting "!!!", 0x1A one starting with
+//! two of "!?", 0x10 the others), its own count of half-width characters, a line ending inside a run counting
+//! N, a plainer cut back to N - 2, and sub_C471C never ending a line on two packed ASCII characters.
 
 use crate::linebreak::LineBreak;
 
@@ -26,6 +26,9 @@ pub struct Rules {
     /// +67788, how far a line's count may run past N for its last characters: sub_BD474(slot, 1) on every text
     /// but a new slot's first (jp_BC694 zeroes it when sub_A7790 makes the slot)
     pub allow: i32,
+    /// the overseas build's jp_BF0F8 and jp_DD0D8: run tags 0x1A / 0x1B too, a rest count of -1 for a rest ending
+    /// inside a run, and 0x03 / 0x04 a ruby flag instead of a skip
+    pub overseas: bool,
     pub witch: bool,
 }
 
@@ -35,8 +38,12 @@ pub const TSUKIHIME: Rules = Rules {
     no_end: "・「『（【“‘",
     hang: ".,-!?:;！？⁉⁈‼⁇．，。、：；」』）】》”’ー～ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ々…―─—Œœ",
     allow: 1,
+    overseas: false,
     witch: false,
 };
+
+/// The overseas build: Tsukihime's lists with its own loop (`Rules::overseas`)
+pub const OVERSEAS: Rules = Rules { overseas: true, ..TSUKIHIME };
 
 /// Witch on the Holy Night: unk_250081 / unk_238644 / unk_2292B4
 pub const WITCH: Rules = Rules {
@@ -44,6 +51,7 @@ pub const WITCH: Rules = Rules {
     no_end: "・「『（【“‘",
     hang: ".,-!?:;！？．，。、：；」』）】》”’ー～ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ々…怒格魔余殺场―─—Œœ",
     allow: 1,
+    overseas: false,
     witch: true,
 };
 
@@ -127,6 +135,9 @@ type Pen = (f32, f32, bool);
 struct Writer {
     pen: Pen,
     save: Pen,
+    /// the overseas and Witch on the Holy Night processors' ruby flag (jp_DD0D8 +130, Witch on the Holy Night's
+    /// +126: set by 0x03, cleared by 0x04), which holds the run tags and 0x11 off; the processor's, like the save
+    ruby: bool,
     last: Option<usize>,
 }
 
@@ -136,9 +147,10 @@ struct Text<'a> {
 }
 
 impl Text<'_> {
-    /// An ASCII run tag: 0x10 / 0x11, Witch on the Holy Night's 0x1A / 0x1B too (mask 0xC030000)
+    /// An ASCII run tag: 0x10 / 0x11, the overseas build's and Witch on the Holy Night's 0x1A / 0x1B too (mask
+    /// 0xC030000)
     fn tag(&self, b: u8) -> bool {
-        b & 0xFE == 0x10 || self.r.witch && b & 0xFE == 0x1A
+        b & 0xFE == 0x10 || (self.r.witch || self.r.overseas) && b & 0xFE == 0x1A
     }
 
     fn at(&self, p: usize) -> u8 {
@@ -167,11 +179,12 @@ impl Text<'_> {
         if self.r.witch {
             return self.count_witch(from, to);
         }
-        let (mut full, mut half) = (0, 0);
+        let (mut full, mut half, mut open) = (0, 0, false);
         let mut p = from;
         while p < to {
             let c = self.get(&mut p);
             if self.tag(c[0]) {
+                open = c[0] != 0x11;
                 continue;
             }
             if c[0] == 0 {
@@ -185,6 +198,10 @@ impl Text<'_> {
             } else {
                 half += 1;
             }
+        }
+        // the overseas jp_BF0F8: -1 for a rest ending inside a run (a raw 0x10 with no 0x11 after it)
+        if open && self.r.overseas {
+            return -1;
         }
         if half != 0 { full + (half + 1) / 2 } else { full }
     }
@@ -225,19 +242,38 @@ impl Text<'_> {
         if open { -1 } else { full }
     }
 
-    /// The measuring tag processor (sub_DD0D8; Witch on the Holy Night's jp_DD0D8) on one character `c` read
-    /// at `*p`: a run tag saves the pen in the processor's one save and halves the cell and spacing fractions
-    /// (the spacing by `run_spacing`), 0x11 restores the save, so a raw 0x10 before a run leaves the text after
-    /// it at half cells; 0x05 / 0x07 / 0x08 drop the character after them, and 0x0D and 0x03 the text up to
-    /// their 0x06 / 0x04. False for a character that draws.
+    /// The measuring tag processor (sub_DD0D8, 1.0.3 sub_DFF68; the overseas build's and Witch on the Holy
+    /// Night's jp_DD0D8) on one character `c` read at `*p`: a run tag saves the pen in the processor's one save
+    /// and halves the cell and spacing fractions (the spacing by `run_spacing`), 0x11 restores the save, so a raw
+    /// 0x10 before a run leaves the text after it at half cells; 0x05 saves the cell (+72 = writer +32) and
+    /// drops the character after it, as 0x07 / 0x08 do; 0x0D skips the text up to its 0x06, and 0x03 up to its
+    /// 0x04 in the Japanese build, while the overseas build's and Witch on the Holy Night's 0x03 / 0x04 set and
+    /// clear a ruby flag that holds the run tags and 0x11 off and measure the ruby as text. False for a character
+    /// that draws.
     fn process(&self, c: &Buf, p: &mut usize, end: usize, w: &mut Writer, m: &Measure) -> bool {
+        let flag = self.r.overseas || self.r.witch;
         match c[0] {
-            0x11 => w.pen = (w.save.0, w.save.1, false),
-            b if self.tag(b) => {
-                w.save = w.pen;
-                w.pen = (w.pen.0 * 0.5, w.pen.1 * m.run_spacing, b != 0x1A);
+            0x03 if flag => w.ruby = true,
+            0x04 if flag => w.ruby = false,
+            // the proportional width (writer +56) changes under the ruby flag too
+            0x11 => {
+                if !w.ruby {
+                    (w.pen.0, w.pen.1) = (w.save.0, w.save.1);
+                }
+                w.pen.2 = false;
             }
-            0x05 | 0x07 | 0x08 => {
+            b if self.tag(b) => {
+                if !w.ruby {
+                    w.save = w.pen;
+                    (w.pen.0, w.pen.1) = (w.pen.0 * 0.5, w.pen.1 * m.run_spacing);
+                }
+                w.pen.2 = b != 0x1A;
+            }
+            0x05 => {
+                w.save.0 = w.pen.0;
+                self.get(p);
+            }
+            0x07 | 0x08 => {
                 self.get(p);
             }
             0x0D | 0x03 => {
@@ -289,7 +325,7 @@ impl Text<'_> {
             first = false;
             x += cw + m.spacing * pen.1;
         };
-        w.save = copy.save;
+        (w.save, w.ruby) = (copy.save, copy.ruby);
         over
     }
 
@@ -591,11 +627,21 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, base: f32, m:
     let mut out = Vec::new();
     let mut cut = 0;
     let (mut start, mut w, mut n) = (0, first, per_line(first, m));
-    let mut writer = Writer { pen: (1.0, 1.0, false), save: (1.0, 1.0, false), last: None };
+    let mut writer = Writer { pen: (1.0, 1.0, false), save: (1.0, 1.0, false), ruby: false, last: None };
     while start < end {
         let mut brk = t.last_on_line(lb, start, end, w, m, &mut writer);
         if brk >= end {
-            break;
+            // the rest in the width still ends its line by the count: past N it is cut as a line running past
+            // the width would be (Switch, the Japanese build: `\x10` and 35 あ, which fit at half cells, break
+            // after 27; `P2` 5 あ `\x10` 30 い `\x11` 3 う after 21 い)
+            let c = t.count(start, end);
+            if c < 0 || c <= n {
+                break;
+            }
+            brk = end - 1;
+            while brk > start && t.at(brk) & 0xC0 == 0x80 {
+                brk -= 1;
+            }
         }
         // a line never ends inside a run of a pair glyph: on to the run's end
         loop {
@@ -704,6 +750,35 @@ mod tests {
             from = p;
         }
         (out, b.cut)
+    }
+
+    #[test]
+    fn count_holds_text_in_the_width() {
+        // Switch (the Japanese build, 1.0.3): text that fits at half cells after a raw 0x10 still ends its line
+        // by the count (full-width characters, half-width ones a half each)
+        let a = |n: usize| "あ".repeat(n);
+        let cases = [
+            (format!("\u{10}{}", a(35)), vec![27, 8]),
+            (format!("P0{}\u{10}{}", a(5), a(30)), vec![28, 9]),
+            (format!("あ\u{10}{}", a(34)), vec![27, 8]),
+            (format!("P2{}\u{10}{}\u{11}{}", a(5), "い".repeat(30), "う".repeat(3)), vec![28, 12]),
+            (format!("J2\u{10}\u{5}Z\u{11}{}", a(40)), vec![28, 15]),
+            (format!("J0{}\u{10}{}", a(20), "い".repeat(40)), vec![28, 28, 6]),
+        ];
+        for (s, want) in cases {
+            assert_eq!(lines(&s).iter().map(|l| l.chars().count()).collect::<Vec<_>>(), want, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn tag_5_saves_the_cell() {
+        // sub_DFF68 case 5: +72 = writer +32, so the 0x11 after it restores the run's half cell (10 kana of 20 px
+        // in 200 px, not 5 of 40)
+        let text = format!("\u{10}\u{5}Z\u{11}{}", "あ".repeat(12));
+        let t = Text { t: text.as_bytes(), r: &TSUKIHIME };
+        let m = Measure { cell: 40.0, spacing: 0.0, run_spacing: 0.5, prop: None };
+        let mut w = Writer { pen: (1.0, 1.0, false), save: (1.0, 1.0, false), ruby: false, last: None };
+        assert_eq!(t.overflow(0, text.len(), 200.0, &m, &mut w), Some(4 + 3 * 10));
     }
 
     #[test]

@@ -5352,9 +5352,18 @@ impl Game {
     /// A raw ruby the tag processor can't take (`text::Run::RubyAt` without a base) stops the game: sub_DDA1C reads
     /// a base pointer the slot never set (address 0) or an earlier text's, or case 1 / 3 scans on past the text
     /// (Switch, Astris: a 0x03 with no 0x01 before it crashed the game in a fresh slot and froze it in another).
+    /// Witch on the Holy Night's tag 20 (a raw 0x14 or `@g`, which its scripts never use) stops the game too:
+    /// jp_DD334 case 0x14 calls jp_CB74C(0), which swaps fonts 0 and 1 in every face's order (case 0x15's order is
+    /// the plain one; Switch, Astris 2026-10-30: a message with a raw 0x14 closed the game as it showed, one with
+    /// 0x15 or 0x18 drew as text).
     fn check_rubies(runs: &[text::Run], shown: &str) {
         if runs.iter().any(|r| matches!(r, text::Run::RubyAt { base: None, .. })) {
             tracing::error!("{shown:?}: a raw ruby tag (0x03 with no 0x01 base before it, or an unclosed 0x01 / 0x03) that stops the game");
+            std::process::exit(1);
+        }
+        let gothic = |r: &text::Run| matches!(r, text::Run::Control('\u{14}') | text::Run::Font(text::FontOrder::Gothic));
+        if crate::assets::witch() && runs.iter().any(gothic) {
+            tracing::error!("{shown:?}: a tag 20 (0x14 or `@g`) that stops Witch on the Holy Night");
             std::process::exit(1);
         }
     }
