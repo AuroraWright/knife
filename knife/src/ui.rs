@@ -4443,6 +4443,7 @@ impl Ui {
                     rows.push(row(&[Ctl::Radio(k, true)]));
                     rows.push(row(&[Ctl::Radio(k, false)]));
                 }
+                // (the overseas language buttons; the Japanese build has none)
                 for k in 0..4 {
                     rows.push(row(&[Ctl::Lang(k)]));
                 }
@@ -4461,6 +4462,7 @@ impl Ui {
             }
             _ => {}
         }
+        rows.retain(|r| !r.is_empty());
         rows
     }
 
