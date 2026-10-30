@@ -135,13 +135,17 @@ fn fs_text(i: VsOut) -> @location(0) vec4<f32> {
     // coverage the fill in the vertex colour. Switch, the edged dash over a 93 grey: rows 14 166 255 155 19 and
     // a column of 64 28 13 30 65 at each end (the padded quad's half texel of the sheet's empty gap). nn::font's
     // border program (font_BuildinShader, main.elf's embedded BNSH, fragment variant 2) only starts the fill at
-    // 0.54 (its c1[0x0]): below that it is all border, so a fill fringe under ~8% coverage stays edge colour
+    // 0.54 (its c1[0x0]): below that it is all border, so a fill fringe under ~8% coverage stays edge colour.
+    // Its border alpha is 2c unclamped (0.5..0.54 coverage up to 1.08 x the vertex alpha), the target clamping
+    // only the output: invisible at full alpha, a faded line's thin border a little darker (Switch, read lines
+    // at 99 / 255: border pixels within 0.1 / 255 of it)
     if i.hy.z > 0.5 {
-        let a = clamp(2.0 * c, 0.0, 1.0);
+        let a = select(2.0 * c, 1.0, c >= 0.54);
         let f = select(0.0, clamp(2.0 * c - 1.0, 0.0, 1.0), c >= 0.54);
         let e = u32(i.hx.x);
         let edge = vec3<f32>(f32((e >> 16u) & 255u), f32((e >> 8u) & 255u), f32(e & 255u)) / 255.0;
-        return vec4<f32>((i.color.rgb * f + edge * (a - f)) * i.color.a, a * i.color.a);
+        let alpha = min(a * i.color.a, 1.0);
+        return vec4<f32>((i.color.rgb * f + edge * (1.0 - f)) * alpha, alpha);
     }
     return vec4<f32>(i.color.rgb * c * i.color.a, c * (2.0 - c) * i.color.a);
 }

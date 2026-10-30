@@ -962,7 +962,14 @@ impl Renderer {
         for q in quads {
             let start = verts.len() as u32;
             let mk = |p: [f32; 4]| Vertex {
-                pos: [p[0] / uw * 2.0 - 1.0, 1.0 - p[1] / uh * 2.0],
+                // nn::font's text vertex program (font_BuildinShader) takes the corner through its ortho matrix
+                // (2 / w, -2 / h, translation -1 / 1), each product rounded before the translation: the corners
+                // snap to the Switch's sub-pixels
+                pos: if q.shade == Shade::Text {
+                    [p[0] * (2.0 / uw) - 1.0, p[1] * (-2.0 / uh) + 1.0]
+                } else {
+                    [p[0] / uw * 2.0 - 1.0, 1.0 - p[1] / uh * 2.0]
+                },
                 uv: [p[2], p[3]],
                 color: q.color,
                 haze: q.haze,
