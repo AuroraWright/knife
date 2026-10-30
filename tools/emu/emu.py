@@ -32,6 +32,13 @@ EMU_GAME=woh Witch on the Holy Night (switch_romfs_woh) instead of the Japanese 
         stop the game (Emulation > Stop), install SAVE as the live save (both Ryujinx save dirs) while it is
         stopped, and start it again (double-click in the game list); ~40 s.
         The screen must be unlocked (clicks and the controller do not reach a locked session).
+    emu.py base
+        the running game's main module: its host address in Astris and its guest address (the game's code runs
+        natively, so guest RAM is Astris's memory; tools/emu/gm.c reads it)
+    emu.py mem OFF LEN
+        hex dump of the running game's main module at OFF (IDA's offsets of switch_exefs*/uncompressed_main)
+    emu.py gm find HEX [MAX] | read ADDR LEN | write ADDR HEX | regions
+        tools/emu/gm on Astris's memory (host addresses)
 """
 
 import functools
@@ -41,6 +48,7 @@ import os
 import plistlib
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -70,6 +78,8 @@ GAMES = {
 }
 # the Library's rows (window-relative pt); the order changes, see restart
 LIBRARY_ROWS = [(200, 114), (200, 210), (200, 306)]
+# each game's executables (uncompressed_main: the NSO the module is loaded from)
+EXEFS = {"ja": "switch_exefs", "en": "switch_exefs_eng", "woh": "switch_exefs_woh"}
 GAMES_ROOT = os.path.join(os.path.dirname(SAVE_ROOT), "..", "..", "games")
 GAME = os.environ.get("EMU_GAME", "ja")
 if GAME not in GAMES:
@@ -498,6 +508,68 @@ def compare(name):
     print(out, n, "rows")
 
 
+GM = os.path.join(OUT, "gm")
+
+
+def gm(*args):
+    """tools/emu/gm's output (bytes), built and signed with the debugger entitlement on first use."""
+    if not os.path.exists(GM):
+        os.makedirs(OUT, exist_ok=True)
+        here = os.path.join(ROOT, "tools", "emu")
+        subprocess.run(["clang", "-O2", "-o", GM, os.path.join(here, "gm.c")], check=True)
+        subprocess.run(["codesign", "--force", "--sign", "-", "--entitlements", os.path.join(here, "gm.entitlements"),
+                        GM], check=True)
+    r = subprocess.run([GM] + [str(v) for v in args], capture_output=True)
+    if r.returncode:
+        raise SystemExit(f"gm {args[0]}: {r.stderr.decode().strip()}")
+    return r.stdout
+
+
+@functools.cache
+def main_nso():
+    """The game's main NSO and its segments as (file offset, module offset, size)."""
+    d = open(os.path.join(ROOT, EXEFS[GAME], "uncompressed_main"), "rb").read()
+    return d, [struct.unpack_from("<III", d, 0x10 + 0x10 * i) for i in range(3)]
+
+
+def module_base():
+    """The main module's host address: found by 32 bytes of its code (the base moves between launches)."""
+    d, segs = main_nso()
+    f, m, _ = segs[0]
+    hits = gm("find", d[f + 0x1000:f + 0x1020].hex(), 2).split()
+    if len(hits) != 1:
+        raise SystemExit(f"main module: {len(hits)} matches (is {GAME} running?)")
+    return int(hits[0], 16) - m - 0x1000
+
+
+def guest_base(host):
+    """The main module's guest address: a relative relocation's slot holds the guest base plus its addend."""
+    d, segs = main_nso()
+    tf, tm, _ = segs[0]
+
+    def at(off, n):
+        for f, m, size in segs:
+            if m <= off and off + n <= m + size:
+                return d[f + off - m:f + off - m + n]
+        raise ValueError(f"{off:#x} not in the image")
+
+    mod0 = struct.unpack_from("<I", d, tf + 4)[0]
+    dyn = mod0 + struct.unpack("<i", at(mod0 + 4, 4))[0]
+    tags = {}
+    while True:
+        tag, val = struct.unpack("<qQ", at(dyn, 16))
+        if tag == 0:
+            break
+        tags.setdefault(tag, val)
+        dyn += 16
+    rela, size = tags[7], tags[8]  # DT_RELA, DT_RELASZ
+    for i in range(0, size, 24):
+        off, info, addend = struct.unpack("<QQq", at(rela + i, 24))
+        if info & 0xFFFFFFFF == 1027:  # R_AARCH64_RELATIVE
+            return struct.unpack("<Q", gm("read", host + off, 8))[0] - addend
+    raise SystemExit("main has no relative relocation")
+
+
 def main():
     a = sys.argv[1:]
     if not a:
@@ -528,6 +600,16 @@ def main():
         touch([(float(a[0]), float(a[1])), (float(a[2]), float(a[3]))], float(a[4]) if len(a) > 4 else 300)
     elif op == "restart":
         restart(a[0] if a else None)
+    elif op == "base":
+        host = module_base()
+        print(f"{GAME} main: host {host:#x}, guest {guest_base(host):#x}")
+    elif op == "mem":
+        off, n = int(a[0], 0), int(a[1], 0)
+        data = gm("read", module_base() + off, n)
+        for i in range(0, len(data), 16):
+            print(f"{off + i:08x}  {data[i:i + 16].hex(' ')}")
+    elif op == "gm":
+        sys.stdout.buffer.write(gm(*a))
     else:
         raise SystemExit(__doc__)
 
