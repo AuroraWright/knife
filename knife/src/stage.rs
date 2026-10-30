@@ -1218,6 +1218,11 @@ impl Stage {
             if let Some((m, b)) = s.stbr {
                 (l.stbr, l.blend) = (m, b);
             }
+            // sub_3D1A0 (overseas too; not 1.0.2 or Witch on the Holy Night): the drawn blend is the stage's, but
+            // noalpha (8) while the stage's alpha target (+0x24) is below 1 is drawn as none
+            if l.stbr == 8 && !crate::assets::witch() {
+                l.blend = if l.alpha.to < 1.0 { Blend::Alpha } else { Blend::Ps(knife_render::PsOp::NoAlpha) };
+            }
             l.prio = s.prio.unwrap_or(l.prio);
             l.rot2 = s.rot2.unwrap_or(l.rot2);
             l.absolute = s.absolute.unwrap_or(l.absolute);
@@ -1903,8 +1908,10 @@ fn band_draw(out: &mut Vec<Draw>, mut quad: Quad, clip: ClipRect, band: Vec<Quad
     rect.soft = quad.soft.take();
     rect.blend = Blend::Opaque;
     out.push(Draw::Mask { quad: rect, clear: true });
-    // the default shader through blend state 4: a straight copy
-    let blend = std::mem::replace(&mut quad.blend, Blend::Opaque);
+    // draw mode 27 (1.0.3 0x37894, overseas 0x38660, Witch on the Holy Night 0x1961C): the default shader through
+    // blend state 0 (colour SrcAlpha / 1 - SrcAlpha, alpha One / One), so the cleared target keeps (rgb a, a) and
+    // the composite takes the alpha again (1.0.2: mode 40, blend state 4, a straight copy)
+    let blend = std::mem::replace(&mut quad.blend, Blend::Over);
     quad.color[3] = 1.0;
     out.push(Draw::Pixel { quad, clear: true });
     out.extend(band.into_iter().map(|quad| Draw::Pixel { quad, clear: false }));

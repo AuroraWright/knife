@@ -171,8 +171,8 @@ pub const PAGE_AT: usize = 8;
 
 /// Tsukihime: a 0x3E7000-byte image: 6144 bytes of system data at 0 (5952 used; sub_4EC60 writes, sub_4EA30
 /// loads), then 140 records of 0x7200 bytes (0x7140 used) at 6144 + 0x7200 n. A record is a copy of the save
-/// snapshot word_F17FF0: u16 1010, u16 1 (non-zero = slot in use), i32 count of choice-ring entries, the
-/// 15016-byte page-ring entry being saved (sub_5A910 layout), the first 0x3688 bytes of the previous choice-ring
+/// snapshot word_F17FF0: u16 1030 (1.0.2 and the overseas build 1010; `record_magic`), u16 1 (non-zero = slot in
+/// use), i32 count of choice-ring entries, the 15016-byte page-ring entry being saved (sub_5A910 layout), the first 0x3688 bytes of the previous choice-ring
 /// entry, and the date at +0x7138. Records 0..99 are the save list, 100..138 the auto save ring (newest at
 /// 100), 139 the quick save.
 pub static JAPANESE: Layout = Layout {
@@ -528,7 +528,7 @@ pub fn record(page: &[u8], prev: Option<&[u8]>, ts: u64) -> Vec<u8> {
     let l = lay();
     let prev_at = PAGE_AT + l.page_size;
     let mut r = vec![0u8; l.rec_size];
-    r[0..2].copy_from_slice(&l.magic.to_le_bytes());
+    r[0..2].copy_from_slice(&record_magic().to_le_bytes());
     r[2..4].copy_from_slice(&1u16.to_le_bytes());
     r[PAGE_AT..PAGE_AT + l.page_size].copy_from_slice(page);
     if let Some(p) = prev {
@@ -541,10 +541,20 @@ pub fn record(page: &[u8], prev: Option<&[u8]>, ts: u64) -> Vec<u8> {
     r
 }
 
-/// The page entry of a record in use (the build's magic: 1010, Witch on the Holy Night 1000).
+/// The magic a record is written with: 1030 in the Japanese 1.0.3 update (sub_B9020; sub_83260 resets the game
+/// for any other snapshot), 1010 in 1.0.2 and the overseas build, 1000 in Witch on the Holy Night.
+pub fn record_magic() -> u16 {
+    if !crate::assets::witch() && !crate::assets::overseas() { JAPANESE_103_MAGIC } else { lay().magic }
+}
+
+const JAPANESE_103_MAGIC: u16 = 1030;
+
+/// The page entry of a record in use (`record_magic`; the Japanese build also takes the 1010 records knife
+/// wrote for 1.0.2).
 pub fn page_of(rec: &[u8]) -> Option<&[u8]> {
     let l = lay();
-    (get_u16(rec, 0) == l.magic && get_u16(rec, 2) != 0).then(|| &rec[PAGE_AT..PAGE_AT + l.page_size])
+    let m = get_u16(rec, 0);
+    ((m == record_magic() || m == l.magic) && get_u16(rec, 2) != 0).then(|| &rec[PAGE_AT..PAGE_AT + l.page_size])
 }
 
 /// The previous rewind-ring entry of a record as a full page entry, as a load puts it back (sub_82330): the

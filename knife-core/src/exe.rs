@@ -1,5 +1,6 @@
-//! Data tables compiled into the game executable (`exefs/main`), for the Japanese build `f4b3318d561e0345` and the
-//! overseas build `d10d239aade1d526` (knife1_overseas: English and Chinese text beside the Japanese).
+//! Data tables compiled into the game executable (`exefs/main`), for the Japanese build `94b27916ceab9306` (the
+//! 1.0.3 update) and the overseas build `d10d239aade1d526` (knife1_overseas: English and Chinese text beside the
+//! Japanese).
 //!
 //! knife does not read the executable: `kdu exe-tables` copies the address ranges of `Layout::bundled` out of the
 //! uncompressed NSO into a zlib-compressed bundle (`knife/data/exe_tables.bin`, `exe_tables_overseas.bin`) that is
@@ -56,25 +57,28 @@ pub struct Layout {
 pub const LINE_BREAK_RANGES: usize = 1986;
 pub const LINE_BREAK_CLASSES: usize = 30;
 
+/// The Japanese 1.0.3 update: 1.0.2's 14713 images and then the 31 the overseas build added (IMG2638, IMG0570_09_09,
+/// IMG2638_01_01, IMG6000..IMG6026, IMG5030, at the overseas sizes but with no language strips), the overseas
+/// motion key 19964 and masks 7454 / 23594 (not its keys 5814..5834), the other tables as 1.0.2's.
 pub const JAPANESE: Layout = Layout {
     build: Build::Japanese,
-    build_id: [0xf4, 0xb3, 0x31, 0x8d, 0x56, 0x03, 0x1e, 0x45],
-    image_names: 0x5e02a4,
-    image_info: 0x46f830,
-    image_count: 14713,
-    haze: 0x352bd4,
+    build_id: [0x94, 0xb2, 0x79, 0x16, 0xce, 0xab, 0x93, 0x06],
+    image_names: 0x5E4ABC,
+    image_info: 0x473790,
+    image_count: 14744,
+    haze: 0x3568D0,
     haze_count: 557,
-    scene_ids: 0x350D58,
+    scene_ids: 0x3549FC,
     scene_count: 549,
-    motion_keys: 0x65CE18,
-    motion_ends: 0x3B1940,
-    motion_lens: 0x399F40,
-    motion_masks: 0x36AB38,
+    motion_keys: 0x661A10,
+    motion_ends: 0x3B5640,
+    motion_lens: 0x39DC40,
+    motion_masks: 0x36E838,
     motion_key_count: 0x118E1,
     motion_count: 0xBD * 128,
     motion_mask_count: 0x5E81,
-    line_break_classes: 0x3D0DCA,
-    line_break_pairs: 0x3D3AE4,
+    line_break_classes: 0x3D4B2A,
+    line_break_pairs: 0x3D7844,
 };
 
 /// The overseas build: 31 more images (IMG2638, IMG0570_09_09, IMG2638_01_01, IMG6000..IMG6026, IMG5030; the
@@ -295,7 +299,8 @@ pub struct ImageInfo {
     /// Overseas +67 bit 1 (sub_77330 there): the texture stacks one copy per game language (sub_9A700 strips,
     /// top to bottom in language order); a layer draws strip `language` (sub_374F0 / sub_375D0, sub_34440 and
     /// the save preview sub_89AD0 divide the height by the strip count). The Japanese build has no such images
-    /// (its +67 bit 1, which no image sets, is the HD art flag that the overseas build moved to bit 2). Witch on
+    /// (1.0.2's +67 bit 1, which no image sets, was the HD art flag; 1.0.3 tests bit 2 for it, sub_77C00, and bit 1
+    /// as the overseas build does, sub_77C30). Witch on
     /// the Holy Night tests the same bit (jp_77330, 84 images such as the IMG0000 logo; jp_9A700 = SYSMES_TEXT's
     /// four languages).
     pub language_strips: bool,
@@ -346,7 +351,7 @@ impl ExeTables {
                 level: nso.u16(rec + 70).map_or(0, |v| v as i16),
                 no_shake: nso.bytes(rec + 65, 1).is_some_and(|b| b[0] & 2 != 0),
                 own_blend: nso.bytes(rec + 65, 1).is_some_and(|b| b[0] & 1 != 0),
-                language_strips: matches!(l.build, Build::Overseas | Build::Witch) && nso.bytes(rec + 67, 1).is_some_and(|b| b[0] & 2 != 0),
+                language_strips: nso.bytes(rec + 67, 1).is_some_and(|b| b[0] & 2 != 0),
             });
         }
         let scene_ids = (0..l.scene_count)
@@ -373,12 +378,12 @@ impl ExeTables {
 mod tests {
     use super::*;
 
-    /// The bundled ranges read back as the executable's own bytes (needs `switch_exefs/uncompressed_main`,
+    /// The bundled ranges read back as the executable's own bytes (needs `switch_exefs_103/uncompressed_main`,
     /// `switch_exefs_eng/uncompressed_main`, `switch_exefs_woh/uncompressed_main`).
     #[test]
     fn bundle_matches_executable() {
         let builds: [(&str, &[u8]); 3] = [
-            ("switch_exefs", include_bytes!("../../knife/data/exe_tables.bin")),
+            ("switch_exefs_103", include_bytes!("../../knife/data/exe_tables.bin")),
             ("switch_exefs_eng", include_bytes!("../../knife/data/exe_tables_overseas.bin")),
             ("switch_exefs_woh", include_bytes!("../../knife/data/exe_tables_witch.bin")),
         ];

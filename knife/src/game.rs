@@ -438,8 +438,8 @@ struct BacklogPage {
     extras: Vec<i32>,
     first: Option<u64>,
     last: Option<u64>,
-    /// the overseas sub_28470 draws entries of bubble windows (their F1105 >= 3, sub_39F40) with text flag
-    /// 0x800000, the bubble font (the Japanese build passes 0)
+    /// sub_28470 draws entries of bubble windows (their F1105 >= 3, sub_39F40) with text flag 0x800000, the
+    /// bubble font (1.0.2 passed 0)
     bubble: bool,
 }
 
@@ -752,6 +752,8 @@ pub struct Game {
     /// overseas off_3516E0: the seek loop ended last frame (sub_41E80), so this frame runs its after-loop work
     /// (sub_7DDA0) instead of the dispatch
     seek_defer: bool,
+    /// byte_B03B94: a seek started; the commit as it ends builds every image layer with its grade
+    seek_regrade: bool,
     /// byte_146E648: a ZL rewind restored a message; until the next ring push, the message / MSAD / ATSV
     /// paths do not refresh the save point
     ring_restored: bool,
@@ -778,12 +780,12 @@ pub struct Game {
     /// the shown message's voice and speaker (sub_6E0D0: page entry +13752 / +13756, off_AE0590)
     msg_voice: Option<String>,
     speaker: i16,
-    /// System menu over the game (sub_2E000 / sub_3BBA0): the scene is captured once, gaussian-blurred
-    /// (sub_A0A90: sigma 2.25 taps of 1.75 px; overseas sub_9EC50 at half size) and crossfaded in at this
-    /// alpha; None when no menu is up.
+    /// System menu over the game (sub_2E000 / sub_3BBA0): the scene is captured once, gaussian-blurred at half
+    /// size (sub_A29C0, overseas sub_9EC50; 1.0.2's sub_A0A90 took four full-size passes of sigma 2.25 taps
+    /// 1.75 px apart) and crossfaded in at this alpha; None when no menu is up.
     pub menu_blur: Option<f32>,
     menu_rt: Option<RenderTarget>,
-    /// overseas sub_9EC50's half-size buffers ("filter Defocus" off_351DB0 and its pass target)
+    /// sub_A29C0's half-size buffers ("filter Defocus" off_351DB0 and its pass target)
     menu_half: Option<[RenderTarget; 2]>,
     /// Witch on the Holy Night's sub_7FDB0 buffers: the capture at a quarter of the screen ("backbuffer
     /// Defocus" off_632A78 drawn at 0.25) and its pass target
@@ -1039,6 +1041,7 @@ impl Game {
             seek_node: false,
             seek_ended: false,
             seek_defer: false,
+            seek_regrade: false,
             ring_restored: false,
             ring_reuse: false,
             last_voice: None,
@@ -1687,6 +1690,13 @@ impl Game {
             self.seek_pass_end(r);
         }
         self.prefetch_images(r);
+        // byte_B03B94, set as the seek started: the stage present after it (sub_3D1A0, 1.0.2 sub_3C970) takes every
+        // layer as changed (render +0x242 = 0), so each image is built again with the grade the stage holds
+        // (sub_3F510 -> STEC / SNX), shown or not, and the byte is cleared
+        if self.seek_ended && std::mem::take(&mut self.seek_regrade) {
+            self.regrade_all();
+            self.stage_dirty = true;
+        }
         // sub_802C0: a stage an STCH / SCH2 changed with no FADS after it is presented as the dispatch returns
         // (sub_5D3A0(0, 0): sub_2E1B0(0, 0) ends any transition)
         if std::mem::take(&mut self.stage_dirty) && !self.seek_node {
@@ -1696,12 +1706,9 @@ impl Game {
                 self.wait = Wait::None;
             }
         }
+        // sub_41540 (AE56B8 = 1): sub_41760 runs the seek's tail (sub_819D0) the next frame instead of the dispatch
         if std::mem::take(&mut self.seek_ended) {
-            if self.assets.build == knife_core::exe::Build::Overseas {
-                self.seek_defer = true;
-            } else {
-                self.seek_finish(r);
-            }
+            self.seek_defer = true;
         }
         // sub_391A0 (the message layer's draw) clears the page (sub_53AB0(1)) in page mode while F823 == 0: the
         // scripts zero it right after a page's last click wait, so the text goes then, not at the next message
@@ -1836,11 +1843,12 @@ impl Game {
         if crate::assets::witch() {
             self.stage.rule_soft = soft_width(c.int_or(4, 64) as f32);
         }
-        // sub_4B4C0: no rule clears the mask even in the seek; a rule loads outside it (Witch on the Holy Night's
-        // jp_60610 also not under the fast skip, AE0670, or skip mode, AE0660 bit 1)
+        // sub_4B4C0: no rule clears the mask even in the seek; a rule loads outside it and outside the fast skip
+        // (AE0670) and skip mode (AE0660 bit 1) (sub_61050, overseas and Witch on the Holy Night's jp_60610;
+        // 1.0.2 only outside the seek)
         if rule < 1 {
             self.fads_rule = -1;
-        } else if !self.seek_node && !(crate::assets::witch() && (self.skip || self.skip_mode)) {
+        } else if !self.seek_node && !self.skip && !self.skip_mode {
             self.fads_rule = rule - 1;
         }
         if mode == 1 || dur <= 0.0 || self.skip {
@@ -1948,13 +1956,10 @@ impl Game {
         }
     }
 
-    /// The overseas seek loop (sub_802C0) steps more after each pass's script_dispatch and sub_3FBD0(10): the
-    /// queued SE commands count down 64 frames (sub_65E50(64)) and every layer's motion runs on 60 frames
-    /// (sub_97B80(layer, 60.0) for layers 0..39).
+    /// The seek loop (sub_80F00; 1.0.2's sub_802C0 did not) steps more after each pass's script_dispatch and
+    /// sub_3FBD0(10): the queued SE commands count down 64 frames (sub_668A0(64)) and every layer's motion runs on
+    /// 60 frames (sub_99080(layer, 60.0) for layers 0..39).
     fn seek_pass_end(&mut self, r: &Renderer) {
-        if self.assets.build != knife_core::exe::Build::Overseas {
-            return;
-        }
         self.tick_se_delayed(64.0 * 1000.0 / 60.0);
         for li in 0..self.stage.layers.len() {
             let cur = self.motion_cur(li);
@@ -2107,8 +2112,9 @@ impl Game {
         // sub_814C0: back to the newest earlier entry of a page's first message (type 0, F823 <= 1 when it was
         // recorded) taken outside a story movie / the staff roll (the entries between are undone on the way),
         // or the ring's oldest entry when there is none
-        // (Witch on the Holy Night's jp_814C0 also passes over entries whose command, copied up to its `;` (256
-        // bytes at most), holds `@e`: a page's first message that ends the page)
+        // (1.0.3's sub_823A0, overseas 0x7e730 and Witch on the Holy Night's jp_814C0, not 1.0.2, also pass
+        // over entries whose command, copied up to its `;` (256 bytes at most), holds `@e`: a page's first
+        // message that ends the page)
         let cur = self.history.len() - 1;
         let target = self.rewind_target(cur).unwrap_or(0);
         self.rewind_to(r, target, Back::Rewind);
@@ -2123,7 +2129,7 @@ impl Game {
                 continue;
             }
             let (scene, pc) = (h.data.scene, h.data.pc);
-            if self.assets.build == Build::Witch && self.ends_page(scene, pc) {
+            if self.ends_page(scene, pc) {
                 continue;
             }
             return Some(i);
@@ -2131,7 +2137,7 @@ impl Game {
         None
     }
 
-    /// The command at `pc` of scene `scene` holds `@e` within the 256 bytes jp_814C0 copies of it.
+    /// The command at `pc` of scene `scene` holds `@e` within the 256 bytes sub_823A0 / jp_814C0 copy of it.
     fn ends_page(&mut self, scene: usize, pc: usize) -> bool {
         let script = if scene == self.scene_index { Some(self.script.clone()) } else { self.assets.scene(scene) };
         script.and_then(|s| s.commands.get(pc).map(|c| format!("_{}({})", c.name, c.args.join(",")))).is_some_and(|t| {
@@ -2405,10 +2411,8 @@ impl Game {
     pub fn next_scene(&mut self) {
         self.seek_node = true;
         self.seek_clear_wait();
-        // overseas: sub_2F1D0 marks the screen wobble's phase as wrapped (word_AFEB94), so it stops wobbling
-        if self.assets.build == knife_core::exe::Build::Overseas {
-            self.ghost.wrapped = true;
-        }
+        // sub_2E3C0 (byte_B03B94; overseas sub_2F1D0, Witch on the Holy Night sub_105A0)
+        self.seek_regrade = true;
         // sub_802C0: sub_5EF10(0) stops the BGM and every SE channel at once, keeping their words
         self.seek_audio = Some(SoundState {
             bgm: self.sound.bgm_state(),
@@ -3129,6 +3133,11 @@ impl Game {
                 if self.seek_node || self.rewinding {
                     self.fads = None;
                     self.fads_start(r, c);
+                    // in the seek script_dispatch then returns (0x80c98, overseas too; 1.0.2 and Witch on the Holy
+                    // Night go on)
+                    if self.seek_node && !crate::assets::witch() {
+                        self.dispatch_return = true;
+                    }
                     return;
                 }
                 match self.fads {
@@ -3265,19 +3274,21 @@ impl Game {
             }
             // SPRC (sub_B6B50) releases render targets, which wgpu owns here
             "SPRC" => {}
-            // XSTP (0x78054): F36 = 1, then sub_3F600(1, 1, 36, ..), the staff roll task; XRSM (sub_3F9B0(1, 1))
-            // ends it next frame. During a next-scene seek the init does not run (dword_AFF010) and kind 1 lacks
-            // flag 8, so the task keeps running past the seek without off_AE0650 or the mode save; its end still
-            // puts back what the previous task start kept.
+            // XSTP (0x7fef0; overseas 0x766b0, Witch on the Holy Night 0x5ed94): a next-scene seek ends with its
+            // sound (sub_5E220, AE0568 = 0, sub_3FA60(0) clearing dword_B04010), then F36 = 1 and sub_3FE50(1, 1,
+            // 36, ..), the staff roll task, and script_dispatch returns; XRSM (sub_3F9B0(1, 1)) ends it next frame.
+            // (1.0.2's 0x78054 went on seeking, where the init did not run.)
             "XSTP" => {
+                if self.seek_node {
+                    self.end_seek(true);
+                }
                 self.end_staff_task();
                 self.set_var("F36", 1);
                 self.staff_task = true;
-                if !self.seek_node {
-                    // sub_40B70 also turns the fast skip off (off_AE0670 = 0)
-                    self.speed = 1;
-                    self.begin_mode_task();
-                }
+                // sub_40B70 also turns the fast skip off (off_AE0670 = 0)
+                self.speed = 1;
+                self.begin_mode_task();
+                self.dispatch_return = true;
             }
             "XRSM" => self.end_staff_task(),
             // XSKR(n, label) (Witch on the Holy Night, 0x57db0): the label a held button skips the staff roll to;
@@ -3338,12 +3349,13 @@ impl Game {
                     return;
                 }
                 let word = if n >= 1 { ((n - 1) & 0xffff | b << 12) as i16 } else { -1 };
-                // Witch on the Holy Night's STTR (0x5ae0c) runs only outside the seek and AE0670, and sets the
-                // wipe edge from its fourth argument (64 by default)
+                // STTR (0x7bb9c; overseas, Witch on the Holy Night 0x5ae0c; 1.0.2 always) runs only outside the seek
+                // and the fast skip (AE0670); Witch on the Holy Night's sets the wipe edge from its fourth argument
+                // (64 by default)
+                if self.seek_node || self.skip {
+                    return;
+                }
                 if crate::assets::witch() {
-                    if self.seek_node || self.skip {
-                        return;
-                    }
                     self.stage.rule_soft = soft_width(c.int_or(3, 64) as f32);
                 }
                 if let Some(l) = self.stage.get(li) {
@@ -3609,7 +3621,14 @@ impl Game {
                 if let Some(n) = c.arg(0) {
                     // Witch on the Holy Night's handler (0x57c90) keeps no voice progress
                     if self.assets.build != Build::Witch {
-                        self.note_voice(n);
+                        self.note_voice_row(n);
+                        // 0x78efc (overseas sub_436C0): during a next-scene seek the dispatch returns after the row
+                        // words, without the G073 bit or the voice (1.0.2 went on)
+                        if self.seek_node {
+                            self.dispatch_return = true;
+                            return;
+                        }
+                        self.note_voice_heard(n);
                     }
                     self.pending_voice = Some(n.to_string());
                     // VPLY leaves the voice for the next message start (AE04C8, played by sub_6E0D0); VPL2
@@ -3776,10 +3795,12 @@ impl Game {
             // (sub_40ED0 top state 1, from the next frame) unless the next-scene seek runs (off_AE0568; a skip does
             // not stop it), and the dispatch goes on to the next wait. In a gallery flowchart replay (sub_50F0)
             // RDAS does nothing. The seek loop does not step the banner (sub_3C970 runs once a frame after
-            // sub_40ED0), so knife only waits for it outside the seek.
+            // sub_40ED0), so knife only waits for it outside the seek. sub_42490 (overseas too; not 1.0.2) leaves
+            // the auto skip off in the Q&A corner (scene index 495..519).
             "RDAS" => {
                 if let Some(n) = c.int(0).filter(|&n| (0..0x240).contains(&n))
                     && self.settings.auto_skip_read
+                    && (crate::assets::witch() || !(495..=519).contains(&self.scene_index))
                     && !self.flow_replay
                     && !self.skip_all
                     && get_bit(&self.endings, n as usize)
@@ -3793,7 +3814,8 @@ impl Game {
                     }
                 }
             }
-            "NOP_" | "WTSV" => {}
+            // _DMMY: what the 1.0.3 scripts left where they dropped a command; the dispatcher's default goes on
+            "NOP_" | "WTSV" | "DMMY" => {}
             other => self.warn_once(other),
         }
     }
@@ -4795,14 +4817,12 @@ impl Game {
         self.settings.char_mute >> voice_row(n) & 1 == 0
     }
 
-    /// Voice progress (script_dispatch VPLY): the speaker (sub_2360, by the name's first three letters) gets
-    /// its bit in G073, and its config voice row (sub_29300) the voice for the test button (G031 + 2 row, low
-    /// / high half of the sub_23C0 id) and bit 4 of its progress word, which shows the row.
-    fn note_voice(&mut self, name: &str) {
+    /// Voice progress (script_dispatch VPLY): the speaker's (sub_2390, by the name's first three letters) config
+    /// voice row (sub_297D0) gets the voice for the test button (G031 + 2 row, low / high half of the sub_23F0
+    /// id) and bit 4 of its progress word, which shows the row.
+    fn note_voice_row(&mut self, name: &str) {
         let speaker = voice_speaker(name);
         let g = |n: usize| format!("G{n:03}");
-        let heard = self.var(&g(73)) | i32::from((1u32 << speaker) as u16 as i16);
-        self.set_var(&g(73), heard);
         if speaker == 23 {
             return;
         }
@@ -4815,6 +4835,12 @@ impl Game {
             let v = self.var(&w) | 4;
             self.set_var(&w, v);
         }
+    }
+
+    /// VPLY past a seek: the speaker gets its bit in G073.
+    fn note_voice_heard(&mut self, name: &str) {
+        let heard = self.var("G073") | i32::from((1u32 << voice_speaker(name)) as u16 as i16);
+        self.set_var("G073", heard);
     }
 
     /// `name` as the scene voice at voice row `row`'s volume, both voice players stopped first (sub_4E170:
@@ -4875,7 +4901,7 @@ impl Game {
         extras.append(&mut self.page.choice_extras);
         let (first, last) = std::mem::take(&mut self.page_ring);
         if finished && !texts.is_empty() {
-            let bubble = self.assets.build == Build::Overseas && self.var("F1105") >= 3;
+            let bubble = self.assets.build != Build::Witch && self.var("F1105") >= 3;
             self.backlog_pages.push(BacklogPage { texts, extras, first, last, bubble });
         }
         self.page.chars.clear();
@@ -5389,11 +5415,20 @@ impl Game {
             v if v < top - 0.5 && !witch && !bubble => lay.ascent,
             v => v.max(top),
         };
+        // F(847 + i) >= 1 puts the message on row max(line + extra, 0) of sub_391A0's line table (1.03 0x397d0),
+        // which for a bubble starts at its text origin cut to whole units (dword_B03CCC, a word; 1.0.2: the main
+        // window's line 65); its other messages go on a pitch below the one before, from the origin as it is
+        let jump_top = if bubble && f >= 1 && !witch { ((top - lay.ascent) / UY).trunc() * UY + lay.ascent } else { top };
         let (start, mut base) = if self.page.chars.is_empty() {
-            let y = top + extra.max(0) as f32 * lay.line_height;
+            let y = jump_top + extra.max(0) as f32 * lay.line_height;
             if indent && !witch { ((lay.left, up(y)), lay.left) } else { ((lay.left, y), lay.left) }
         } else {
-            let y = (self.page.pen.1 + lay.line_height * (1 + extra) as f32 + PARAGRAPH_GAP).max(top);
+            let y = if jump_top != top {
+                let line = ((self.page.pen.1 - top) / lay.line_height).round();
+                (jump_top + lay.line_height * (line + (1 + extra) as f32)).max(jump_top)
+            } else {
+                (self.page.pen.1 + lay.line_height * (1 + extra) as f32 + PARAGRAPH_GAP).max(top)
+            };
             if indent {
                 // on the message before's last line (Tsukihime: line - 1; Witch on the Holy Night: line - 1 while
                 // F(847 + i) is 0, else its own line). From the box's right edge on the base is the slot's x on
@@ -5843,8 +5878,8 @@ impl Game {
                 out.extend(self.bar_quad(&pc, Some(count), [rgb[0], rgb[1], rgb[2], alpha], edge));
             }
             // (sub_38EC0 draws nothing while a rewind runs)
-            // (the overseas sub_38EC0 also draws nothing in auto mode, word_1916DEC bit 0)
-            let auto_hidden = self.assets.build != Build::Japanese && self.auto;
+            // (and nothing in auto mode, word_191C62C bit 0; 1.0.2 drew it)
+            let auto_hidden = self.auto;
             if self.assets.build == Build::Witch {
                 self.witch_icon_quads(&mut out, shift, a * content * layer);
             } else if self.icon_fade > 0.0 && !self.rewinding && !auto_hidden {
@@ -6182,8 +6217,8 @@ impl Game {
                         r.blur(&mut enc, &b.tex, a, [0.0, 1.0], 1.25, BlurMode::FullAdd);
                         let up = Quad::rect(a.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
                         r.draw(&mut enc, rt, Some([0.0, 0.0, 0.0, 1.0]), &[up]);
-                    } else if self.assets.build == knife_core::exe::Build::Overseas {
-                        // sub_9EC50 (its sigma argument unused): the capture scaled to the half-size "filter
+                    } else {
+                        // sub_A29C0 (overseas sub_9EC50; its sigma argument unused): the capture scaled to the half-size "filter
                         // Defocus" buffer, then sub_9CCD0(1.25)'s meshes, 2 ceil(3.75) + 1 = 9 quads offset
                         // sigma sqrt(2 pi) k / 1920 (/ 1080) in UV, each at its weight, horizontally and then
                         // vertically (shader 55, through the backbuffer and copied back), then scaled up 2x
@@ -6198,14 +6233,6 @@ impl Game {
                         r.blur(&mut enc, &b.tex, a, [0.0, step], 1.25, BlurMode::Uv);
                         let up = Quad::rect(a.tex.clone(), [0.0, 0.0, CANVAS_W as f32, CANVAS_H as f32], [1.0; 4]);
                         r.draw(&mut enc, rt, Some([0.0, 0.0, 0.0, 1.0]), &[up]);
-                    } else {
-                        // sub_A0A90(0, 0, 2.25): sigma 2.25 taps spaced 1.75 px (of 1920), horizontally, vertically,
-                        // horizontally again and vertically again (targets +107, +214, +107, +321)
-                        let step = 1.75 * CANVAS_W as f32 / 1920.0;
-                        r.blur(&mut enc, &self.canvas.tex, &self.blur_rt, [step, 0.0], 2.25, BlurMode::FullAdd);
-                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25, BlurMode::FullAdd);
-                        r.blur(&mut enc, &rt.tex, &self.blur_rt, [step, 0.0], 2.25, BlurMode::FullAdd);
-                        r.blur(&mut enc, &self.blur_rt.tex, rt, [0.0, step], 2.25, BlurMode::FullAdd);
                     }
                     self.menu_captured = true;
                 }
@@ -6245,6 +6272,12 @@ impl Game {
     }
 
     // ---- save / load --------------------------------------------------------------
+
+    /// The message window can be hidden (sub_84040; overseas sub_80650, Witch on the Holy Night sub_63360; 1.0.2
+    /// had no check): the content fade (off_AE05B0) is not 0 and F1103 is 0.
+    pub fn window_hideable(&self) -> bool {
+        self.page.dim < 1.0 && self.var("F1103") == 0
+    }
 
     /// Whether the game is at a point that can be saved (a message or a choice).
     pub fn can_save(&self) -> bool {
@@ -6519,9 +6552,10 @@ impl Game {
         if let Some(v) = f.clip_inset {
             l.clip_inset = v as i16;
         }
-        // field 17: 0 (or noalpha on a translucent layer) drops the blend, another mode replaces it
+        // field 17: 0 (or noalpha on a layer whose alpha target, +0x24, is below 1) drops the blend, another
+        // mode replaces it
         if let Some(v) = f.blend {
-            let mode = if v == 0 || (v == 8 && l.alpha.value() < 1.0) { -1 } else { v };
+            let mode = if v == 0 || (v == 8 && l.alpha.to < 1.0) { -1 } else { v };
             if mode != l.stbr {
                 l.stbr = mode;
                 l.blend = blend_mode(mode).0;
@@ -6648,6 +6682,23 @@ impl Game {
         }
         let name = String::from_utf8(dest).ok()?;
         self.assets.image_index_of(&name).map(|_| name)
+    }
+
+    /// Every image layer's grade as the stage holds it, built again at the next commit (see `seek_regrade`).
+    fn regrade_all(&mut self) {
+        for l in self.stage.layers.iter_mut().flatten() {
+            if !matches!(l.source, Source::Image(_)) {
+                continue;
+            }
+            let bake = crate::grade::Bake::new(l.stec_mode, l.snx[0], l.snx[1]);
+            if l.stec_mode == 1 {
+                l.fill = Some(bake.fill(l.stec_color));
+            }
+            if bake != l.bake {
+                l.bake = bake;
+                l.regrade = true;
+            }
+        }
     }
 
     fn rebake(&mut self, li: i32) {
@@ -6777,10 +6828,11 @@ impl Game {
         None
     }
 
-    /// Overseas sub_86840 (from sub_884F0): a record of one of these scenes whose F1122 (the PGST id, read
-    /// through sub_55300) is below 1 or the scene's value shows the picture alone instead of its stage.
+    /// sub_8A190 (from sub_89490; overseas sub_86840; not 1.0.2): a record of one of these scenes whose F1122
+    /// (the PGST id, read through sub_55300) is below 1 or the scene's value shows the picture alone instead of
+    /// its stage.
     fn preview_picture(&self, d: &crate::save::SaveData) -> Option<String> {
-        if self.assets.build != knife_core::exe::Build::Overseas {
+        if self.assets.build == knife_core::exe::Build::Witch {
             return None;
         }
         let (n, want) = match d.scene {
@@ -7169,6 +7221,7 @@ impl Game {
         self.seek_node = false;
         self.seek_ended = false;
         self.seek_defer = false;
+        self.seek_regrade = false;
         self.ring_restored = false;
         self.seek_audio = None;
         self.speed = 1;

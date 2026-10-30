@@ -480,8 +480,8 @@ pub const CG_ORIGINS: &[(&str, u16, u16)] = &[
 pub const CG_LANGUAGE_STRIPS: &[&str] =
     &["IMG1736", "IMG1737", "IMG3819", "IMG3821", "IMG1699", "IMG1700", "IMG1701", "IMG3822", "IMG1702", "IMG2581", "IMG4026"];
 
-/// Overseas groups that differ (off_32E248): IMG3999 at 3130 x 1266, IMG4193 added to group 285, and group 327
-/// without IMG0568 / IMG0573 / IMG3415 / IMG3404 / IMG3408 / IMG3416.
+/// The groups 1.0.3 and the overseas build (off_32E248) changed from 1.0.2: IMG3999 at 3130 x 1266, IMG4193 added
+/// to group 285, and group 327 without IMG0568 / IMG0573 / IMG3415 / IMG3404 / IMG3408 / IMG3416.
 pub const CG_GROUPS_OVERSEAS: &[(usize, &[CgEntry])] = &[
     (222, &[("IMG3996", true, 1781, 3130, 1266), ("IMG3997", true, 1782, 3130, 1266), ("IMG3998", true, 1783, 3130, 1266), ("IMG3999", true, 1784, 3130, 1266), ("IMG4000", true, 1785, 3130, 1266), ("IMG4001", true, 1786, 3130, 1266), ("IMG4002", true, 1787, 3130, 1266)]),
     (285, &[("IMG0400", false, 250, 5760, 3240), ("IMG3262", true, 1194, 5760, 3240), ("IMG0401", false, 251, 5760, 3240), ("IMG3260", true, 1192, 5760, 3240), ("IMG4193", true, 1978, 5760, 3240), ("IMG3261", true, 1193, 5760, 3240)]),

@@ -61,7 +61,7 @@ _SEPL(0,1,MOON_SE03001,,`001:4000,,`017:50);_ZM01801($000107);_IF__(F077,lt,4,LV
 
 ### Scenes
 
-The game has 549 scenes, from `000_START_SCRIPT` and `001_00_00` (the prologue) through the story to the gallery's `528_ARCHIVE`, then `529_QACALL` (the Q&A scenes), `530_STAFFROLL`, a test scene and the archive's jump tables (`532_JUMP00` to `548_JUMPQA`). They hold 1,035,614 commands besides the `_Z` macros, and 42,601 messages; the inline codes appear as `@n` 607 times, `@k` 443, `@e` 443 and `@x` 287. A table in the executable maps each scene's script id to its archive index. `JUMP(id, label)` leaves for another scene, optionally at a label. The program counter is simply the index of the command in the scene's `;`-separated list. Save records store byte offsets into the decompressed text instead.
+The game has 549 scenes, from `000_START_SCRIPT` and `001_00_00` (the prologue) through the story to the gallery's `528_ARCHIVE`, then `529_QACALL` (the Q&A scenes), `530_STAFFROLL`, a test scene and the archive's jump tables (`532_JUMP00` to `548_JUMPQA`). They hold 1,035,575 commands besides the `_Z` macros (Japanese 1.0.3), and 42,601 messages; the inline codes appear as `@n` 607 times, `@k` 443, `@e` 443 and `@x` 287. A table in the executable maps each scene's script id to its archive index. `JUMP(id, label)` leaves for another scene, optionally at a label. The program counter is simply the index of the command in the scene's `;`-separated list. Save records store byte offsets into the decompressed text instead.
 
 ### Command syntax
 
@@ -297,14 +297,14 @@ Loading clears every F word, restores the subset, rebuilds the stage, restarts t
 
 ## Instruction set
 
-The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 commands in all. Six of the names are PS4 leftovers that the Switch dispatcher drops. Arguments are listed in order; `=` gives the default for an empty argument, and `` `NN `` marks a keyed argument. Use counts are across all 549 scenes.
+The Switch scripts (Japanese 1.0.3) use 94 command names plus the three `_Z` macros, 1,082,380 commands in all. Six of the names are PS4 leftovers that the Switch dispatcher drops. Arguments are listed in order; `=` gives the default for an empty argument, and `` `NN `` marks a keyed argument. Use counts are across all 549 scenes.
 
 ### Flow and variables
 
 | Command | Arguments | Effect | Uses |
 | --- | --- | --- | --- |
-| `WKST` | var, `eq`, value | Set a variable (the middle word is fixed) | 487,136 |
-| `WKAD` | var, value | Add to a variable | 45,691 |
+| `WKST` | var, `eq`, value | Set a variable (the middle word is fixed) | 487,100 |
+| `WKAD` | var, value | Add to a variable | 45,671 |
 | `WKOR` | var, value | Bitwise OR into a variable | 21 |
 | `IF__` | a, op, b, label | Go on if `a op b` holds, else jump to the label. Ops: `eq ne gt lt ge le`, and `an` (a AND b ≠ 0) | 1,194 |
 | `GOTO` | label | Jump within the scene | 101 |
@@ -312,13 +312,14 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 | `JUMP` | scene id, label | Go to another scene (and mark the flowchart edge) | 1,741 |
 | `IFSC` | \_, label | Go on when started from the gallery, else jump | 2 |
 | `IFUR` | \_, label | Jump when every Q&A ending node (533–556) is complete, else go on | 1 |
-| `IFP4` | \_, label | Always jumps on the Switch, skipping a PS4-only block | 204 |
+| `IFP4` | \_, label | Always jumps on the Switch, skipping a PS4-only block | 203 |
 | `IFLA` | language, label | Overseas build only: go on in that language, else jump | 0 (JP) |
 | `WTTM` | ms, noclick | Wait `max(1, ms × 3/50)` frames; a click ends it unless `noclick` | 14,828 |
 | `END_` |  | End the story: stop the sounds and fade to black, then back to the title (or to the gallery in a replay) | 519 |
 | `RTM_` |  | End the story like END\_; the two differ only in the end result the title and gallery act on | 544 |
 | `RTMN`, `RTM2` |  | `RTMN` ends the scene but keeps the BGM playing; `RTM2` only sets that keep flag | 1 each |
 | `NOP_` |  | Nothing, but ends the frame's dispatch | 1 |
+| `DMMY` |  | Nothing: what update 1.0.3 left where it dropped a command; the dispatch goes on | 75 |
 
 ### Messages and the window
 
@@ -332,7 +333,7 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 | `CLO3` |  | Hide the window; the page is kept; text hidden until the next message | 12,208 |
 | `CLO4` | ms | Fade the window content out | 978 |
 | `CLO5` | ms | Window on at full alpha; content fades in | 596 |
-| `WNTY` | type | Window style (0–2 bands, 3–32 Q&A bubbles); also F799 = page break | 58,576 |
+| `WNTY` | type | Window style (0–2 bands, 3–32 Q&A bubbles); also F799 = page break | 58,558 |
 | `MSQK` | ms = 1000, ax = 5, ay = 5 | Shake the message text for `ms` (capped: over 10,000 becomes 1,000) | 30 |
 
 ### Choices
@@ -348,22 +349,22 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 
 | Command | Arguments | Effect | Uses |
 | --- | --- | --- | --- |
-| `STCH` | layer, image, x, y, zoom, alpha, prio, \_, \_, variant a, variant b, clip parent, clip x, y, w, h, inset, inset mode, \_, clip rotation | Put an image (or `BLACK`, `WHITE`, ...) on a layer; shown from the next commit. Args 7–8 (`,CC` in the scripts) are not read | 54,503 |
-| `SCH2` | as STCH, arg 18 = source layer | STCH that copies a source layer's state (quakes, pivot, effects) | 4,674 |
-| `STCC` | layer = 0 | Clear a layer, or all of them for −1 | 63,260 |
+| `STCH` | layer, image, x, y, zoom, alpha, prio, \_, \_, variant a, variant b, clip parent, clip x, y, w, h, inset, inset mode, \_, clip rotation | Put an image (or `BLACK`, `WHITE`, ...) on a layer; shown from the next commit. Args 7–8 (`,CC` in the scripts) are not read | 54,494 |
+| `SCH2` | as STCH, arg 18 = source layer | STCH that copies a source layer's state (quakes, pivot, effects) | 4,675 |
+| `STCC` | layer = 0 | Clear a layer, or all of them for −1 | 63,261 |
 | `STCP` | layer, prio | Draw priority; 0 hides | 51,568 |
 | `STCL` | rel, layer, x0, y0, x1, y1, ms, ease (or rel, layer, dx, dy, ms, ease) | Move; stops the layer's motion | 9 |
-| `STGS` | layer, from, to, ms, ease | Alpha tween (0–255) | 8,114 |
-| `STZ4` | layer, zx0, zy0, zx1, zy1, ms, ease | Zoom tween (×1000) | 32,319 |
-| `STRT` | layer, from, to, ms, ease | Rotation tween (1/100 degree) | 21,691 |
-| `STPV` | layer, px, py, rot | Set the pivot that zoom and rotation turn about | 734 |
+| `STGS` | layer, from, to, ms, ease | Alpha tween (0–255) | 8,110 |
+| `STZ4` | layer, zx0, zy0, zx1, zy1, ms, ease | Zoom tween (×1000) | 32,317 |
+| `STRT` | layer, from, to, ms, ease | Rotation tween (1/100 degree) | 21,683 |
+| `STPV` | layer, px, py, rot | Set the pivot that zoom and rotation turn about | 733 |
 | `STCF` | layer, mask = 63 | Wait for the layer's tweens (all layers for −1) | 5,179 |
 | `SACL` | layer, on | Absolute flag: ignore the clip parent's transform | 450 |
 | `SBAS` | layer, base | Take another layer's transform as base | 943 |
 | `SOXY` | layer, \_, \_, dx, dy | Draw offset | 208 |
 | `STRR` | layer, r | Clip rotation for children (−99999 follows the child) | 448 |
-| `STBR` | layer, mode, override | Blend mode | 14,946 |
-| `STEC` | layer, mode, colour | 0 reset, 1 colour fill, 2–82 colour grade (applied at the next image build) | 12,906 |
+| `STBR` | layer, mode, override | Blend mode | 14,940 |
+| `STEC` | layer, mode, colour | 0 reset, 1 colour fill, 2–82 colour grade (applied at the next image build) | 12,900 |
 | `SNX2`, `SNX3` | layer, v | Brightness 1 + v/255, contrast 1 + v/100 (baked into the texture) | 1,678 / 845 |
 | `STNS` | layer, n | Film grain n (0 off) | 196 |
 | `STRA` | layer, id, ms | Heat haze from the haze table (−1: every layer with an image) | 569 |
@@ -379,7 +380,7 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 
 | Command | Arguments | Effect | Uses |
 | --- | --- | --- | --- |
-| `FADS` | mode, ms, rule, text | Present the stage: 0 crossfade, 1 cut, 2 rule wipe (see Stage and transitions) | 34,029 |
+| `FADS` | mode, ms, rule, text | Present the stage: 0 crossfade, 1 cut, 2 rule wipe (see Stage and transitions) | 34,031 |
 | `SHOK` | ax, ay, period = 300, count = 3, delay | Sine shake of the screen | 870 |
 | `SHAF` | ms | Stop the shake, or fade it out over `ms` | 397 |
 | `SQK2` | layer, ax = 15, ay = 15, period, dur, delay, follow, ramp | Random layer quake | 1,236 |
@@ -402,7 +403,7 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 | `SEFD` | ch, `` `001 `` ms | Fade a channel out (all for a negative channel) | 3,516 |
 | `SEVL` | ch, `` `017 `` volume, `` `001 `` ms | Change a channel's volume | 1,285 |
 | `SESP` | ch | Stop a channel at once | 18 |
-| `VPLY` | voice | The next message plays this voice | 16,690 |
+| `VPLY` | voice | The next message plays this voice | 16,689 |
 | `VPL2` | voice | Play a voice now | 16 |
 | `VCWT` |  | Wait for the voice to finish | 75 |
 | `TOMP` | n | Play movie n (the language's copy); unwatched story movies cannot be skipped | 48 |
@@ -420,7 +421,7 @@ The Switch scripts use 93 command names plus the three `_Z` macros, 1,082,419 co
 
 ### Ignored on the Switch
 
-`SNX4` (8,762 uses), `FANX` (2,741), `IFNX` (234), `WTSV` (28), `STQK` (3) and `TRPY` (2) fall through the dispatcher's default case. `FANX` is still read by the image look-ahead, which only preloads.
+`SNX4` (8,758 uses), `FANX` (2,741), `IFNX` (233), `WTSV` (28), `STQK` (3) and `TRPY` (1) fall through the dispatcher's default case. `FANX` is still read by the image look-ahead, which only preloads.
 
 ## Menus and the overseas build
 
@@ -449,7 +450,7 @@ Five modes: CG viewer, music player, flowchart, movies and endings.
 
 ### The overseas build
 
-The overseas release (Tsukihime -A piece of blue glass moon-, with English and Chinese) is the same engine with a few hundred changed functions. knife tells the two apart from the data (`w_allpac.nam` present) and runs either from the same code.
+The overseas release (Tsukihime -A piece of blue glass moon-, with English and Chinese) is the same engine with a few hundred changed functions. knife tells the two apart from the data (`w_allpac.nam` present) and runs either from the same code. The Japanese release's update 1.0.3 takes many of the overseas build's changes: its scripts, the system text numbering, the menu blur, choice glow, endings gallery, save previews, save deletion with X and a number of input details. The table compares 1.0.3 with the overseas build.
 
 | Area | Japanese build | Overseas build |
 | --- | --- | --- |
@@ -457,12 +458,12 @@ The overseas release (Tsukihime -A piece of blue glass moon-, with English and C
 | Archives | `allpac`, `allui`, ... | `w_allpac`, `w_allui`, ... with 140 extra images; some images stack one strip per language |
 | Script text | One text block | One block per language in `script_text.mrg`, chosen by `$` references |
 | Script commands |  | `IFLA(language, label)` for language-specific branches |
-| System text | `SYSMES_TEXT` | `SYSMES_TEXT_ML`, with one message ("Deleted") inserted at 217, so later ids shift by one |
+| System text | `SYSMES_TEXT`, with one message (削除しました, "Deleted") inserted at 217 in 1.0.3, so later ids shift by one | `SYSMES_TEXT_ML`, with the same message inserted |
 | Text layout | Fixed character grid, kinsoku | English at 0.9 × size with UAX #14 line breaking; wider windows, backlog and choice layouts |
 | Fonts | TsukuMin, TsukuGo, FOT-Seurat | Per-language folders (`en`, `en2`, `en3`: Helvetica, DemosNext, FOT-Seurat); CFF glyphs with trailing data after `endchar` are cleaned up before drawing |
 | Movies | One copy | `_en`, `_zc` and `_zt` copies of the prologue, openings and phase titles |
 | UI | Japanese atlases | `name_<language>` atlases, per-language logo slices and phase-title cells |
-| Endings gallery | Unlocked by the node bit | Unlocked by its completed nodes (G300 bits) |
+| Endings gallery | Unlocked by its completed nodes (G300 bits; before 1.0.3 by the node bit) | Unlocked by its completed nodes |
 | Save file |  | Same format, so saves are interchangeable apart from the language setting |
 
 ## Witch on the Holy Night

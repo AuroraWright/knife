@@ -378,6 +378,10 @@ pub struct Ui {
     last_track: Option<usize>,
     /// SYSMES_TEXT strings (music titles), loaded on first use
     sysmes: Vec<String>,
+    /// Text slot 20's message and glyph scale: sub_A9C70 (overseas sub_A7790) keeps a laid-out slot as it is
+    /// when it is set to the text it holds (sub_C0384), and nothing clears slot 20, so the SELS / SELA message
+    /// takes the window's pop of the frame its text was last set to a different message
+    sels_slot: Option<(String, f32)>,
     /// help_txt word cells of the language (CONTHELP_TXT_UV, jp_9A710), and that language
     guide_words: (usize, Vec<[u16; 4]>),
     /// seconds since the title screen appeared (logo / menu fade-in)
@@ -603,6 +607,8 @@ pub struct Ui {
     /// overseas language change (sub_2D720 / sub_2D910's dword_9D3A44 steps) and the button it shows picked
     lang_seq: Option<LangSeq>,
     lang_pick: Option<usize>,
+    /// the overseas sub_2BFE0 ran for English while the config was open (`conf_rect`)
+    conf_rects_en: bool,
     /// dword_9D3A60: config input waits these frames (counted down once no capture shows)
     lang_cool: u32,
     /// time towards the next 60 Hz step of `lang_seq` / `lang_cool`
@@ -680,7 +686,7 @@ fn en_radio_cell(k: usize, v: bool, col: usize, english: bool) -> [f32; 4] {
     }
 }
 
-/// Overseas btn_base2 cells of the check objects 57 / 61 (row 0) and 71 (row 80) (frames 0x35EFF4..): 288
+/// Overseas (and 1.0.3) btn_base2 cells of the check objects 57 / 61 (row 0) and 71 (row 80) (frames 0x35EFF4..): 288
 /// wide from x 8 + 304 col, or for English 392 wide from 400 col (sub_2BFE0).
 fn en_toggle_cell(t: usize, col: usize, english: bool) -> [f32; 4] {
     let y = if t < 2 { 0.0 } else { 80.0 };
@@ -805,7 +811,8 @@ const fn rects<const N: usize>(t: [[i16; 4]; N]) -> [[f32; 4]; N] {
     o
 }
 
-/// btn_base1 rows (y, width) for each radio pair's (true, false) buttons.
+/// btn_base1 rows (y, width) for each radio pair's (true, false) buttons, with 1.0.2's 10 px margin around the
+/// cell (1.0.3 crops it).
 const RADIO_CELLS: [[(f32, f32); 2]; 6] = [
     [(6.0, 140.0), (94.0, 140.0)],
     [(182.0, 140.0), (270.0, 188.0)],
@@ -990,7 +997,8 @@ struct GalMovie {
 
 /// CG viewer transitions (cGalleryCGPhoto sub_C368). Sprite 176 holds a capture over the viewer (lower
 /// priority draws on top): opening, its 0.5 s quad-in tween (sub_C498 -> state 4, sub_CD58) fades the gallery
-/// capture (surface 1) from 1 to 0 off the picture; closing (sub_CE60) fades it back in, quad-out over 0.5 s;
+/// capture (surface 1) from 1 to 0 off the picture; closing (sub_CE60) fades the grey layer and the picture
+/// out over the live gallery, quad-out over 0.5 s (1.0.2 faded a capture of the gallery back in);
 /// a picture change (sub_CA54) captures the screen (sub_A4610(1), surface 3) and wipes it away through
 /// rule_26 (previous) / rule_27 (next) linearly over 0.5 s.
 #[derive(Clone, Copy, PartialEq)]
@@ -1137,6 +1145,7 @@ impl Ui {
             under: false,
             last_track: None,
             sysmes: Vec::new(),
+            sels_slot: None,
             guide_words: (usize::MAX, Vec::new()),
             title_clock: 0.0,
             cg_flash: (None, 0.0),
@@ -1249,6 +1258,7 @@ impl Ui {
             conf_test_row: None,
             conf_hold: 0,
             lang_seq: None,
+            conf_rects_en: false,
             lang_pick: None,
             lang_cool: 0,
             lang_ms: 0.0,
@@ -1328,6 +1338,7 @@ impl Ui {
             10 => {
                 self.file.set_language(q.word);
                 game.change_language(r, q.word);
+                self.conf_rects_en = crate::text::english();
                 let gallery = self.tex.contains_key("gallerymenu_btn");
                 self.tex = Self::load_textures(game, r, gallery);
                 self.sysmes.clear();
@@ -1460,12 +1471,11 @@ impl Ui {
         [392.0 + col * 240.0, 109.0 + row * 139.0 - scroll.trunc(), 231.0, 130.5]
     }
 
-    /// sub_926F0(1): every ending node 533..556 completed (unlocks the QA_25 button, object 418).
+    /// sub_FA00 (overseas sub_FF40): every ending record's completed node (unlocks the QA_25 button, object
+    /// 418; 1.0.2's sub_926F0(1) took RDED 533..556).
     fn all_endings(game: &Game) -> bool {
         match game.assets.build {
-            knife_core::exe::Build::Japanese => (533..=556).all(|n| crate::game::get_bit(&game.endings, n)),
-            // sub_FF40: every record's completed node
-            knife_core::exe::Build::Overseas => (0..24).all(|i| Self::ending_ok(game, i)),
+            knife_core::exe::Build::Japanese | knife_core::exe::Build::Overseas => (0..24).all(|i| Self::ending_ok(game, i)),
             // Witch on the Holy Night has no Q&A corner
             knife_core::exe::Build::Witch => false,
         }
@@ -1575,8 +1585,8 @@ impl Ui {
         use crate::game::get_bit;
         match game.assets.build {
             _ if i == 24 => Self::all_endings(game),
-            knife_core::exe::Build::Japanese => get_bit(&game.nodes, crate::gallery::ENDINGS[i].0),
-            knife_core::exe::Build::Overseas => {
+            // 1.0.2 took the entry's RDST bit (ENDINGS .0)
+            knife_core::exe::Build::Japanese | knife_core::exe::Build::Overseas => {
                 let (a, b) = crate::gallery::EN_ENDING_DONE[i];
                 [a, b].into_iter().any(|n| n >= 0 && get_bit(&game.endings, n as usize))
             }
@@ -2148,6 +2158,9 @@ impl Ui {
         self.stack_hover.push(self.hover);
         self.stack.push(self.screen);
         self.screen = s;
+        if s == Screen::Config {
+            self.conf_rects_en = false;
+        }
         if s != Screen::Menu {
             self.sys_focus = false;
         }
@@ -2775,12 +2788,15 @@ impl Ui {
                 .conf_layout()
                 .into_iter()
                 .map(|(c, p)| {
-                    let mut rc = Self::conf_rect(c, p);
                     // a slider's touch object is its knob, which rides the value along the 508 px track
-                    if let Ctl::Slider(i) = c {
-                        let (v, max, _) = self.conf_slider(game, i);
-                        rc[0] += v / max * 508.0;
-                    }
+                    let p = match c {
+                        Ctl::Slider(i) => {
+                            let (v, max, _) = self.conf_slider(game, i);
+                            [p[0] + v / max * 508.0, p[1]]
+                        }
+                        _ => p,
+                    };
+                    let mut rc = self.conf_rect(c, p);
                     if !matches!(c, Ctl::Tab(_) | Ctl::Default) {
                         let y0 = rc[1].max(CONF_VIEW[1]);
                         let y1 = (rc[1] + rc[3]).min(CONF_VIEW[1] + CONF_VIEW[3]);
@@ -3079,8 +3095,8 @@ impl Ui {
 
     /// Frames a viewer transition waits before its tween runs: a picture change spends sub_CA54's substates 0..7
     /// capturing the screen, making sprite 176 and loading the next picture (the old view holds meanwhile), and
-    /// the tween's first step comes in the update after (sub_CD58, which also shows the guide); closing makes
-    /// sprite 176 first (sub_CE60 substate 0).
+    /// the tween's first step comes in the update after (sub_CD58, which also shows the guide); closing starts a
+    /// frame late (sub_CE60 substate 0).
     fn cg_hold(&self) -> f32 {
         match self.cg_fx {
             CgFx::Switch(..) => 8.0 / 60.0,
@@ -3180,7 +3196,7 @@ impl Ui {
     }
 
     /// B, a guide tap or a strong vertical flick in the viewer (sub_C56C -> state 5, sub_CE60): sound 2, the
-    /// guide fades out (sub_5EA4, 0.5 s) and the gallery capture fades back in over the picture.
+    /// guide fades out (sub_5EA4, 0.5 s) and the picture fades out over the gallery.
     fn cg_close(&mut self, game: &mut Game) {
         if self.cg_fx != CgFx::None {
             return;
@@ -3464,31 +3480,34 @@ impl Ui {
         v
     }
 
-    /// Hit rectangle of a control placed at `p`.
-    fn conf_rect(c: Ctl, p: [f32; 2]) -> [f32; 4] {
-        let [x, y] = p;
-        match c {
-            Ctl::Tab(_) => [x, y, 192.0, 80.0],
-            Ctl::Default => [x, y, 288.0, 72.0],
-            Ctl::Minus(_) | Ctl::Plus(_) => [x, y, 80.0, 40.0],
-            // the knob object (0x46B370 entries 81, 86, 90, 99 + 5k...): rect (144, 39)-(167, 63) of 640 x 448 inside
-            // the conf_sbtn sprite, at value 0 (`items` adds the knob's travel)
-            Ctl::Slider(_) => [x + 432.0, y + 39.0 * 1080.0 / 448.0, 69.0, 24.0 * 1080.0 / 448.0],
-            Ctl::Toggle(t) if crate::assets::overseas() => {
-                let [x0, _, x1, _] = en_toggle_cell(t, 0, crate::text::english());
-                [x, y, x1 - x0, 72.0]
-            }
-            Ctl::Toggle(_) => [x + 2.0, y, 304.0, 72.0],
-            Ctl::Radio(k, v) if crate::assets::overseas() => {
-                let [x0, _, x1, _] = en_radio_cell(k, v, 0, crate::text::english());
-                [x, y, x1 - x0, 48.0]
-            }
-            Ctl::Radio(k, v) => [x + 10.0, y, RADIO_CELLS[k][usize::from(!v)].1 - 10.0, 68.0],
-            // the object rect (0, 7)-(56, 26) of 640 x 448
-            Ctl::Lang(_) => [x, y + 7.0 * H / 448.0, 168.0, 19.0 * H / 448.0],
-            Ctl::Mute(_) => [x, y, 136.0, 64.0],
-            Ctl::Test(_) => [x, y, 104.0, 56.0],
-        }
+    /// Hit rectangle of a control placed at `p`: config objects go through the generic hit test (sub_AE840,
+    /// overseas sub_AD1C0) with the object table's rect (0x46B370, overseas 0x35A878) in 640x448 units from the
+    /// truncated position (`object_rect`), whatever the sprite's frame. The overseas sub_2BFE0 writes the x1 of
+    /// objects 72 / 73 / 75 / 77 (English 82 / 82 / 147 / 147, else the table's), but opening the config
+    /// loads the table after it: only a language change in the open config (`conf_rects_en`) keeps them.
+    fn conf_rect(&self, c: Ctl, p: [f32; 2]) -> [f32; 4] {
+        let overseas = crate::assets::overseas();
+        let wide = overseas && self.conf_rects_en;
+        let r = match c {
+            Ctl::Tab(_) => [0, 4, 64, 29],
+            Ctl::Default => [0, 0, 96, 29],
+            Ctl::Toggle(_) => [0, 0, if overseas { 130 } else { 96 }, 29],
+            Ctl::Minus(_) | Ctl::Plus(_) => [0, 0, 26, 16],
+            Ctl::Slider(_) => [144, 39, 167, 63],
+            // objects 69 / 70, 72..77 (the sound tab's voice radios, JP 91..94 / overseas 95..98, as the first
+            // pair)
+            Ctl::Radio(0 | 4 | 5, false) => [0, 2, 40, 21],
+            Ctl::Radio(0 | 4 | 5, true) => [0, 0, 40, 19],
+            Ctl::Radio(1, v) => [0, 0, if wide { 82 } else if v { 40 } else { 56 }, 19],
+            Ctl::Radio(2, true) => [0, 0, if overseas { 82 } else { 69 }, 19],
+            Ctl::Radio(2 | 3, false) if wide => [0, 0, 147, 19],
+            Ctl::Radio(..) => [0, 0, 80, 19],
+            Ctl::Mute(_) => [0, 0, 45, 26],
+            Ctl::Test(_) => [0, 0, 34, 23],
+            // objects 78..81
+            Ctl::Lang(_) => [0, 7, 56, 26],
+        };
+        Self::object_rect([p[0] * 640.0 / W, p[1] * 448.0 / H], r)
     }
 
     /// (value, maximum, step) of slider row i on the current tab: maxima from dword_46CDB0[628 tab + 602 + row];
@@ -3850,14 +3869,11 @@ impl Ui {
                     let src = if hovered(i) { [0.0, 0.0, 936.0, 248.0] } else { [0.0, 256.0, 936.0, 248.0] };
                     self.sprite(q, "conf_sbtn", [kx, y, 936.0, 248.0], Some(src));
                 }
-                Ctl::Toggle(t) if crate::assets::overseas() => {
-                    let [x0, y0, x1, y1] = en_toggle_cell(t, col as usize, crate::text::english());
-                    self.sprite(q, "btn_base2", [x, y, x1 - x0, y1 - y0], Some([x0, y0, x1 - x0, y1 - y0]));
-                }
                 Ctl::Toggle(t) => {
-                    let row = if t < 2 { 0.0 } else { 80.0 };
-                    // frames 0x46F4B0..: offset (-10/3, 0) of 640 x 448, source from x -2 (the cell's 0 at x - 8)
-                    self.sprite(q, "btn_base2", [x - 8.0, y, 304.0, 72.0], Some([col * 304.0, row, 304.0, 72.0]));
+                    // 1.0.3 frames 0x473410.. are the overseas cells (1.0.2: offset (-10/3, 0) of 640 x 448
+                    // with the cells' 8 px margin)
+                    let [x0, y0, x1, y1] = en_toggle_cell(t, col as usize, crate::assets::overseas() && crate::text::english());
+                    self.sprite(q, "btn_base2", [x, y, x1 - x0, y1 - y0], Some([x0, y0, x1 - x0, y1 - y0]));
                 }
                 Ctl::Radio(k, v) if crate::assets::overseas() => {
                     let [x0, y0, x1, y1] = en_radio_cell(k, v, col as usize, crate::text::english());
@@ -3869,11 +3885,12 @@ impl Ui {
                     self.sprite(q, CONF_LANG_TEX, [x, y, 248.0, 80.0], Some(src));
                 }
                 Ctl::Radio(k, v) => {
+                    // 1.0.3 frames 0x473350..: the cells 48 tall without offset (1.0.2: offset (-10, -10) px
+                    // with a 10 px margin, which holds the hover / selected glow's halo); the selected OFF's
+                    // reads from y 100, its art 4 px higher
                     let (cy, w) = RADIO_CELLS[k][usize::from(!v)];
-                    // the sheet draws the selected OFF 4 px higher; its frame (0x46F490) reads from y 90, not 94
-                    let cy = if cy == 94.0 && col == 2.0 { 90.0 } else { cy };
-                    // frames 0x46F3F0..: offset (-10/3, -4.148) of 640 x 448 (-10, -10 px), source from x -10
-                    self.sprite(q, "btn_base1", [x, y - 10.0, w - 10.0, 68.0], Some([col * 256.0, cy, w - 10.0, 68.0]));
+                    let cy = if cy == 94.0 && col == 2.0 { 100.0 } else { cy + 10.0 };
+                    self.sprite(q, "btn_base1", [x, y, w - 20.0, 48.0], Some([col * 256.0, cy, w - 20.0, 48.0]));
                 }
                 Ctl::Mute(_) => {
                     self.sprite(q, "btn_mute", [x, y, 136.0, 64.0], Some([32.0 + col * 152.0, 32.0, 136.0, 64.0]));
@@ -5679,11 +5696,12 @@ impl Ui {
         self.save_pointer_row(game);
     }
 
-    /// The save list's X (overseas sub_50FC0 state 2, 0x1000): a used entry under the cursor asks to delete it.
+    /// The save list's X (sub_51A10 state 2, overseas sub_50FC0, 0x1000; not 1.0.2): a used entry under the
+    /// cursor asks to delete it.
     pub(super) fn save_delete_key(&mut self, game: &mut Game) {
         let Screen::SaveLoad { save, scroll } = self.screen else { return };
         // (0x1000 && sub_40E90: not while dword_AFFCC4 runs)
-        if game.assets.build != knife_core::exe::Build::Overseas || self.side || self.busy() || self.save_cool > 0 {
+        if game.assets.build == knife_core::exe::Build::Witch || self.side || self.busy() || self.save_cool > 0 {
             return;
         }
         let Some(slot) = self.hover.filter(|&h| h < SLOTS_PER_PAGE).and_then(|h| self.save_list(save).get(scroll + h).copied()) else {
@@ -5876,7 +5894,7 @@ impl Ui {
         true
     }
 
-    /// sub_90440, every title frame: once every ending is completed (sub_926F0(1)) and G069 is clear, set G069
+    /// sub_90440, every title frame: once every ending is completed (sub_FA00) and G069 is clear, set G069
     /// and show the banner; it rises over 30 frames, holds 300, then fades out over 30.
     fn complete_update(&mut self, game: &mut Game, f: f32) {
         match &mut self.complete {
@@ -6865,8 +6883,8 @@ impl Ui {
             Screen::Music if matches!(self.hover.and_then(|h| self.items(game).get(h).map(|(_, a)| *a)), Some(Action::MusicCtl(_) | Action::MusicVol)) => Some(10),
             Screen::Flowchart { .. } => Some(if self.flow.as_ref().is_some_and(|c| c.scroll_max > 0.0) { 0 } else { 10 }),
             Screen::CgView { .. } => Some(9),
-            // the overseas save list's guide (11) adds X 削除
-            Screen::SaveLoad { .. } if game.assets.build == knife_core::exe::Build::Overseas => Some(11),
+            // the save list's guide (11; 1.0.2 0) adds X 削除
+            Screen::SaveLoad { .. } if game.assets.build != knife_core::exe::Build::Witch => Some(11),
             Screen::Music | Screen::SaveLoad { .. } => Some(0),
             // sub_2AA80 (overseas 0x2BA10): the Controls tab (dword_AED32C == 2) has guide 1 (B back, L/R page)
             Screen::Config => Some(if self.conf_tab == 2 { 1 } else { 2 }),
@@ -7169,8 +7187,16 @@ impl Ui {
         let (w, h) = (824.0 * k, 416.0 * k);
         self.sprite_c(out, "dialog_win", [(W - w) / 2.0, (H - h) / 2.0, w, h], None, a, Blend::Alpha);
         let msg = self.sysmes.get(msg).cloned().unwrap_or_default();
-        // text slot 20 (sub_AB4D0 scale 0.37 k x 0.46044 k, spacing 0 + 4 / 0 + 14 px, sub_A7790)
-        let size = [60.0 * 0.37 * k, 60.0 * 0.46044 * k];
+        // text slot 20 (sub_ADD80 scale 0.37 k x 0.46044 k, spacing 0 + 4 / 0 + 14 px, sub_A9C70), the scale
+        // kept from when the slot took this text (the drawn position still follows k, sub_ADFD0)
+        let ks = match &self.sels_slot {
+            Some((t, ks)) if *t == msg => *ks,
+            _ => {
+                self.sels_slot = Some((msg.clone(), k));
+                k
+            }
+        };
+        let size = [60.0 * 0.37 * ks, 60.0 * 0.46044 * ks];
         let lay = crate::game::LAYOUT;
         let top = (224.0 - 42.311 * k) * H / 448.0;
         let baseline = top + crate::text::msg_ascent(lay.ascent * size[1] / lay.size);
@@ -7278,11 +7304,12 @@ impl Ui {
                     }
                     // sub_4F240: 100 * 0.827 x 53 * 1.092 units at (151, y + 23.23), quad scale 1.15 about its top left
                     let thumb = [fx + 52.0, fy + 56.0, 300.0 * 0.827 * 1.15, 53.0 * 1.092 * 1.15 * H / 448.0];
-                    // drawn only once made (word_F1F438[40]); nothing in its place until then. Overseas the whole
-                    // entry (frame overlay, date, time, AUTO tag, titles) waits for it too: a fresh save's row stays
-                    // blank until its thumbnail is made, while the info panel already shows the record
+                    // drawn only once made (word_F1F438[40]); nothing in its place until then. 1.0.3 (sub_4FCB0)
+                    // and overseas the whole entry (frame overlay, date, time, AUTO tag, titles) waits for it too:
+                    // a fresh save's row stays blank until its thumbnail is made, while the info panel already
+                    // shows the record
                     let pic = game.preview(slot, &d);
-                    if pic.is_none() && game.assets.build == knife_core::exe::Build::Overseas {
+                    if pic.is_none() && game.assets.build != knife_core::exe::Build::Witch {
                         continue;
                     }
                     if let Some(t) = pic {
@@ -7520,22 +7547,19 @@ impl Ui {
                     let text = |i: i32| usize::try_from(i).ok().and_then(|i| self.sysmes.get(i)).cloned().unwrap_or_default();
                     let (name, desc) = (text(name), text(desc));
                     // sub_16E00: two sub_227F0 type-3 text widgets (slots 175 + 2k / 176 + 2k) at (1392, 404) and
-                    // (1392, 452), widget scale (1.2, 1.0), boxes 400 x 48 / 400 x 200, spacing (-3, -12); title
+                    // (1392, 452), widget scale (1.2, 1.0), boxes 200 x 48 / 150 x 200 (1.0.2: 400 x 48 / 400 x 200),
+                    // spacing (-3, -12); title
                     // colour 0x4210 (RGB565 66,65,132), description colour 0 (black). Neither sets 0x100000, so
                     // the message font. sub_25DD4 -> sub_AB4D0 scale 1.2 * 640 / 1920 x 1.0 * 448 / 1080,
-                    // character spacing -3 + 4 px, line spacing -12 + 14 px; sub_A7790 box width (int)(400 * 1920 / 640) px.
-                    // Overseas: boxes 200 x 48 / 150 x 200 (English: 136 wide, both at x 1390 = 0x44ADC000, character spacing
-                    // -3.75); sub_25DD4 adds slot flags 0x9001000 (0x1000: no sub_C3834 hold, which in the
-                    // Japanese build only hides the texts on the change frame, where the fade-in is at 0)
+                    // character spacing -3 + 4 px, line spacing -12 + 14 px; sub_A7790 box width (int)(w * 1920 / 640) px.
+                    // English (overseas): the description 136 wide, both at x 1390 = 0x44ADC000, character spacing
+                    // -3.75. sub_25DD4 adds slot flags 0x9001000 (1.0.3 and overseas; 1.0.2 none; 0x1000: no sub_C3834 hold, which only
+                    // hid the texts on the change frame, where the fade-in is at 0)
                     const SIZE: [f32; 2] = [1.2 * 640.0 / 1920.0 * 60.0, 448.0 / 1080.0 * 60.0];
                     let english = crate::text::english();
                     let spacing = if english { -3.75 + 4.0 } else { 1.0 };
                     let x = if english { 1390.0 } else { 1392.0 };
-                    let (title_box, desc_box) = match (overseas, english) {
-                        (false, _) => (400.0, 400.0),
-                        (true, false) => (200.0, 150.0),
-                        (true, true) => (200.0, 136.0),
-                    };
+                    let (title_box, desc_box) = if english { (200.0, 136.0) } else { (200.0, 150.0) };
                     let lay = crate::game::LAYOUT;
                     let ascent = crate::text::msg_ascent(lay.ascent * SIZE[1] / lay.size);
                     let pitch = crate::text::line_feed() * gs() * SIZE[1] / crate::text::BASE_SIZE + 2.0;
@@ -7806,8 +7830,8 @@ impl Ui {
             Screen::CgView { group, pos } => {
                 // cGalleryCGPhoto (sub_BA18): a full-screen layer (0x466738, priority 700) at colour 0.85
                 // (sub_E2490 0x3F59999A; Switch grey 217) under
-                // the picture (priority 380), so the screen around a picture is light grey. Opening and closing
-                // crossfade with the gallery as captured (`CgFx`).
+                // the picture (priority 380), so the screen around a picture is light grey. Opening crossfades
+                // with the gallery as captured, closing fades the viewer out over the gallery (`CgFx`).
                 let u = self.cg_u();
                 let a = match self.cg_fx {
                     CgFx::Open => u * u,
@@ -7881,9 +7905,9 @@ impl Ui {
                 out.push(Quad::rect(white.clone(), [0.0, 0.0, W, H], [0.0, 0.0, 0.0, 0.75]));
                 out.extend(game.backlog_quads(r, scroll));
                 let n = game.backlog_len();
-                // sub_9B0C4: with nothing to scroll (max <= min) the slider sits at the top; the overseas
-                // sub_27D10 draws the widget only with more than one page (AE71E4 >= 1)
-                if n > 1 || game.assets.build != knife_core::exe::Build::Overseas {
+                // sub_9B0C4: with nothing to scroll (max <= min) the slider sits at the top; sub_27D10 draws the
+                // widget only with more than one page (dword_AEC1E4 >= 1; 1.0.2 always)
+                if n > 1 || game.assets.build == knife_core::exe::Build::Witch {
                     self.draw_scroll_bar(out, if n > 1 { 1.0 - scroll as f32 / (n - 1) as f32 } else { 0.0 }, 608.0);
                 }
                 self.fade_quads(out, n0, self.scr_a);

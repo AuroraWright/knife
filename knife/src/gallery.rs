@@ -23,7 +23,7 @@ pub struct Entry {
 /// A group's entries in the loaded build.
 fn group(g: usize) -> Option<(u32, &'static [CgEntry])> {
     let &(cond, entries) = CG_GROUPS.get(g)?;
-    if crate::assets::overseas()
+    if !crate::assets::witch()
         && let Some(&(_, e)) = CG_GROUPS_OVERSEAS.iter().find(|(n, _)| *n == g)
     {
         return Some((cond, e));
@@ -124,8 +124,8 @@ pub fn music_unlocked(heard: impl Fn(i32) -> bool, node: impl Fn(usize) -> bool,
 /// the openings need their in-game viewing flag.
 pub const MOVIES: &[(usize, Option<u16>)] = &[(4, None), (5, Some(0)), (6, Some(1))];
 
-/// Ending gallery (cGalleryEnding, records at 0x3374E8 = {scene id, RDST node bit, confirm}):
-/// (node bit, scene id, SYSMES id of the play confirmation). Main endings first, then the 21 dead ends.
+/// Ending gallery (cGalleryEnding, records at 0x33AE34, see `EN_ENDING_DONE`): (node bit, scene id, SYSMES id
+/// of the play confirmation, 1.0.2's numbering). Main endings first, then the 21 dead ends.
 pub const ENDINGS: &[(usize, i32, usize)] = &[
     (544, 1011, 1482),
     (555, 1022, 1493),
@@ -151,13 +151,14 @@ pub const ENDINGS: &[(usize, i32, usize)] = &[
     (552, 1019, 1490),
     (553, 1020, 1491),
     (554, 1021, 1492),
-    // object 418: QA_25, shown once every ending is completed (sub_926F0(1): RDED 533..556 all set)
+    // object 418: QA_25, shown once every ending is completed (sub_FA00: `EN_ENDING_DONE`)
     (557, 1024, 1495),
 ];
 
-/// The overseas build's ending records (jd_3374E8, 20 bytes: scene id, the Japanese node bit, two completed
-/// nodes, confirm): an entry is reached once either node (-1 = none) is completed (RDED, G300 bits,
-/// sub_922C0), not by its RDST bit; sub_FF40 (QA_25, the congratulation banner) needs all 24.
+/// The ending records of 1.0.3 (0x33AE34) and the overseas build (jd_3374E8), 20 bytes: scene id, the node bit,
+/// two completed nodes, confirm. An entry is reached once either node (-1 = none) is completed (RDED, G300
+/// bits, sub_937C0 / overseas sub_922C0), not by its RDST bit (1.0.2: 12-byte records, the RDST bit); sub_FA00
+/// (overseas sub_FF40; QA_25, the congratulation banner) needs all 24.
 pub const EN_ENDING_DONE: [(i32, i32); 24] = [
     (14, -1), (300, -1), (309, -1), (187, -1), (31, -1), (316, -1), (317, -1), (92, -1),
     (94, -1), (138, -1), (151, -1), (319, -1), (170, -1), (171, -1), (190, -1), (321, -1),

@@ -30,7 +30,7 @@ enum Cmd {
     Lines,
     /// Load executable tables and print a summary
     Tables {
-        #[arg(long, default_value = "switch_exefs/uncompressed_main")]
+        #[arg(long, default_value = "switch_exefs_103/uncompressed_main")]
         exe: PathBuf,
         /// Print every image record
         #[arg(long)]
@@ -40,7 +40,7 @@ enum Cmd {
     /// (knife/data/exe_tables_overseas.bin for switch_exefs_eng/uncompressed_main, exe_tables_witch.bin for
     /// switch_exefs_woh/uncompressed_main)
     ExeTables {
-        #[arg(long, default_value = "switch_exefs/uncompressed_main")]
+        #[arg(long, default_value = "switch_exefs_103/uncompressed_main")]
         exe: PathBuf,
         #[arg(default_value = "knife/data/exe_tables.bin")]
         out: PathBuf,

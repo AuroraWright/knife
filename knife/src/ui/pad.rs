@@ -210,9 +210,10 @@ impl Ui {
             // A shows a hidden window (and does not advance)
             Pad::A | Pad::Down if self.touch.hidden => self.show_window(),
             Pad::A | Pad::Down => game.advance(),
-            // B: stops skip mode first, else hides / shows the window
+            // B: stops skip mode first, else hides / shows the window; it hides only a window that is up
+            // (sub_84040), else shows it
             Pad::B if game.skip_mode => game.skip_mode = false,
-            Pad::B if self.touch.hidden => self.show_window(),
+            Pad::B if self.touch.hidden || !game.window_hideable() => self.show_window(),
             Pad::B => self.touch.hidden = true,
             // Y opens the system menu, ending skip mode and showing the window
             Pad::Y if !game.menu_lock => {

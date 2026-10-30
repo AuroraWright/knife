@@ -24,7 +24,8 @@ Holy Night does differently.
 
 knife needs the game data from your own copy of the game:
 
-1. Extract the romfs of the game's Switch release.
+1. Extract the romfs of the game's Switch release, with its latest update applied (knife follows the Japanese
+   Tsukihime's update 1.0.3; data from its earlier versions still plays).
 2. Add the Switch's shared system font, which the menus and help lines use. Dump
    `nintendo_udsg-r_std_003.bfttf` from the firmware's FontStandard archive (system title 0100000000000811)
    and copy it into the extracted romfs folder, for example:

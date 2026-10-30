@@ -196,10 +196,10 @@ const OVERSEAS_TITLES: [&str; 4] =
 /// Witch on the Holy Night's application titles by game language.
 const WITCH_TITLES: [&str; 4] = ["魔法使いの夜", "WITCH ON THE HOLY NIGHT", "魔法使之夜", "魔法使之夜"];
 
-/// The SYSMES message the overseas build inserts at 217 (the "deleted" popup, `jp_50FC0` state 25). knife keeps
-/// the Japanese numbering and moves it here, past the Japanese build's 1498 messages.
+/// The SYSMES message the overseas build and the Japanese 1.0.3 update insert at 217 (the "deleted" popup,
+/// `jp_50FC0` state 25). knife keeps the Japanese 1.0.2 numbering and moves it here, past 1.0.2's 1498 messages.
 pub const SYSMES_DELETED: usize = 1498;
-const SYSMES_OVERSEAS_INSERT: usize = 217;
+const SYSMES_DELETED_AT: usize = 217;
 
 /// The loaded executable is the overseas build (for tables that differ between the builds).
 static OVERSEAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -806,7 +806,7 @@ impl Assets {
 
     /// The game language's system strings, indexed by the Japanese build's ids (u32 language count, u32 count,
     /// u64 0, then per language a u64 offset of a table of u64 offsets of NUL-terminated UTF-8 strings; entry 0
-    /// is the language's folder name). The overseas file's message 217 moves to `SYSMES_DELETED`.
+    /// is the language's folder name). The overseas and 1.0.3 files' message 217 moves to `SYSMES_DELETED`.
     pub fn sysmes(&self) -> Vec<String> {
         self.sysmes_in(self.language)
     }
@@ -824,8 +824,8 @@ impl Assets {
                     Some(String::from_utf8_lossy(&d[o..o + end]).into_owned())
                 })
                 .collect::<Option<Vec<String>>>()?;
-            if self.build == Build::Overseas && v.len() > SYSMES_OVERSEAS_INSERT {
-                let deleted = v.remove(SYSMES_OVERSEAS_INSERT);
+            if self.build != Build::Witch && v.len() > SYSMES_DELETED {
+                let deleted = v.remove(SYSMES_DELETED_AT);
                 v.resize(SYSMES_DELETED, String::new());
                 v.push(deleted);
             }

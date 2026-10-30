@@ -101,16 +101,29 @@ impl Choice {
     }
 }
 
-/// sub_84E50: the options at x 88 units (English 32, the overseas build's v4), each in a text slot 466 units
-/// wide (English 566: sub_84E50 / sub_83B20 sub_AC7D0(slot, 2, ..)), with the message text style.
+/// sub_84E50: the options at x 88 units (English 32, the overseas build's v4).
 fn choice_x() -> f32 {
     if crate::text::english() { 32.0 } else { 88.0 }
 }
 
+/// sub_80D00 (SELS / SELA / SELD; overseas sub_7D0C0; 1.0.2 inline at 0x80068) gives the option slots 20 + n
+/// the message slot's geometry, docked: 464 units wide (English 573), scale 0.76, spacing (0, 10) (1.0.2:
+/// (0, 0), lines 10 px closer).
 fn choice_layout() -> Layout {
-    let w = if crate::text::english() { 566.0 } else { 466.0 };
-    Layout { left: choice_x() * UX, right: (choice_x() + w) * UX, ..msg_layout() }
+    msg_layout()
 }
+
+/// The glow source slots 160 + n (sub_80D00, overseas sub_7D0C0): the same but 573 units wide (1.0.2: 464,
+/// spacing (0, -9)).
+fn glow_layout() -> Layout {
+    let lay = msg_layout();
+    Layout { right: lay.left + 573.0 * UX, ..lay }
+}
+
+/// The option objects 217 + n (sub_84A80, overseas sub_80FF0): rect (0, 0)-(466, 29) of unk_6607B0 (1.0.2
+/// unk_65BBB8) from (88, the row's box top); the overseas jp_84E50 sets x1 566 for English and y1 58 for an
+/// option with a '^'.
+const OPTION_TOUCH: [i32; 4] = [0, 0, 466, 29];
 
 /// The first option's baseline on an empty page (sub_38D20 gives no pen): its box at 63.881 units (English
 /// 54.178).
@@ -489,12 +502,30 @@ impl Game {
             ChoiceKind::Wik => WIK_RECTS.iter().map(|&[x0, y0, x1, y1]| [x0 * UX, y0 * UY, (x1 - x0) * UX, (y1 - y0) * UY]).collect(),
             ChoiceKind::Page => (0..c.opts.len())
                 .map(|i| {
-                    let top = c.top + i as f32 * lay.line_height - lay.ascent;
-                    let w = c.placed[i].last().map_or(0.0, |p| p.x + p.width() - lay.left);
-                    [lay.left, top, w, lay.line_height]
+                    let [x0, y0, mut x1, mut y1] = OPTION_TOUCH;
+                    if crate::assets::overseas() {
+                        if text::english() {
+                            x1 = 566;
+                        }
+                        if self.resolve_text(&c.opts[i].text).contains('^') {
+                            y1 = 58;
+                        }
+                    }
+                    // the hit test (sub_AE840) from the truncated position, bounds inclusive
+                    let (x, y) = (choice_x().trunc() + x0 as f32, ((c.top + i as f32 * lay.line_height - lay.ascent) / UY).trunc() + y0 as f32);
+                    [x * UX, y * UY, (x1 - x0 + 1) as f32 * UX, (y1 - y0 + 1) as f32 * UY]
                 })
                 .collect(),
-            _ => DIALOG_BUTTONS.iter().map(|&(x, _)| [x * UX, DIALOG_BUTTON_Y * UY, 216.0, 56.0]).collect(),
+            // touch rect (10, -10)-(60, 40) from the object's (int) position, bounds inclusive (1.0.2:
+            // (-10, -10)-(60, 45))
+            _ => DIALOG_BUTTONS
+                .iter()
+                .map(|&(x, _)| {
+                    let [x0, y0, x1, y1] = DIALOG_BUTTON_TOUCH;
+                    let (x, y) = (x.trunc() + x0, DIALOG_BUTTON_Y.trunc() + y0);
+                    [x * UX, y * UY, (x1 - x0 + 1.0) * UX, (y1 - y0 + 1.0) * UY]
+                })
+                .collect(),
         }
     }
 
@@ -669,14 +700,29 @@ impl Game {
         Some((msg, c.hover, c.alpha, scale))
     }
 
-    /// Texture 5: the option texts (text slots 160+, rows of 64 px) gaussian-blurred (sub_A0A90(.., 2.0)).
+    /// Texture 5: the option texts (text slots 160+, rows of 160 px) gaussian-blurred (sub_A7060(1, 2.0)).
     /// Drawn here at the options' own canvas positions; the glow takes each option's band.
     pub(super) fn render_choice_glow(&mut self, r: &mut Renderer, enc: &mut wgpu::CommandEncoder) {
-        let (lay, band) = (choice_layout(), self.glow_band());
-        let Some(c) = &mut self.choice else { return };
+        let (lay, band) = (choice_layout(), GLOW_BAND);
+        let glow_lay = glow_layout();
+        let Some(c) = &self.choice else { return };
         if c.kind != ChoiceKind::Page || !c.glow_dirty || crate::assets::witch() {
             return;
         }
+        // the glow slots wrap at their own width
+        let placed: Vec<Vec<PlacedChar>> = c
+            .opts
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mut placed = Vec::new();
+                let runs = text::parse_markup(&self.resolve_text(&o.text));
+                let base = c.top + i as f32 * lay.line_height;
+                text::layout(&self.font, &glow_lay, &runs, glow_lay.left, base, 0.0, 0, &mut placed);
+                placed
+            })
+            .collect();
+        let Some(c) = &mut self.choice else { return };
         c.glow_dirty = false;
         let mut quads = Vec::new();
         // SELD (0x800e4) gives slots 160+ the option text behind "@c9" with flags 0x201000: 0x200000 forces the
@@ -685,7 +731,7 @@ impl Game {
         // So the glow source is the glyph and its edge, all white; the edge is the message text's rim.
         // Each option has its own row of the texture (slot 160 + n at y 8 + n * band), so a row's glow never
         // takes in the next option's.
-        for (i, opt) in c.placed.iter().enumerate() {
+        for (i, opt) in placed.iter().enumerate() {
             let row = i as f32 * band - Self::glow_row_top(c.top, i, &lay);
             for p in opt {
                 for (dx, dy) in [(0.0, 0.0), (-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0), (-1.5, -1.5), (1.5, -1.5), (-1.5, 1.5), (1.5, 1.5)] {
@@ -698,18 +744,13 @@ impl Game {
         let text_rt = self.choice_text_rt.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "choice text"));
         r.draw(enc, text_rt, Some([0.0; 4]), &quads);
         let glow = self.choice_glow.get_or_insert_with(|| r.create_canvas_target(CANVAS_W, CANVAS_H, "choice glow"));
-        // sub_A0A90(0, -2, 2.0): shader 51 whiteness, sigma 2 taps (13 taps) spaced 1.5 px of 1920. It queues
+        // sub_A7060(1, 2.0) (1.0.2: sub_A0A90(0, -2, 2.0)): shader 51 whiteness, sigma 2 taps (13 taps) spaced 1.5 px of 1920. It queues
         // four passes (h, v, h, v, the last back into texture 5) like the menu blur, but the Switch glow is two
         // passes wide: against the Switch (first choice of 04_00_ARC04_1B) two passes give the glow's sum 0.97,
         // its far halo 1.015 and 1.81 mean abs, four passes a halo 1.54 too wide (2.36)
         let step = 1.5 * CANVAS_W as f32 / 1920.0;
         r.blur(enc, &text_rt.tex, &self.blur_rt, [step, 0.0], 2.0, BlurMode::White);
         r.blur(enc, &self.blur_rt.tex, glow, [0.0, step], 2.0, BlurMode::White);
-    }
-
-    /// The glow texture's rows: 64 px, 160 in the overseas build (room for two-line options).
-    fn glow_band(&self) -> f32 {
-        if self.assets.build == knife_core::exe::Build::Overseas { 160.0 } else { 64.0 }
     }
 
     /// Canvas y where option `i`'s glow row is drawn: the texture 5 row at y - 3.3185 (the text sits 8 px into
@@ -779,7 +820,7 @@ impl Game {
         let lay = choice_layout();
         let pitch = lay.line_height;
         let x = choice_x();
-        let band = self.glow_band();
+        let band = GLOW_BAND;
         for i in 0..c.opts.len() {
             let base = c.top + i as f32 * pitch;
             let top = base - lay.ascent;
@@ -978,4 +1019,8 @@ impl Game {
 /// units, top-left), dialog_btn_ja frames as in the confirm dialog.
 pub const DIALOG_BUTTONS: [(f32, bool); 2] = [(241.0, false), (327.0, true)];
 pub const DIALOG_BUTTON_Y: f32 = 238.52;
+/// Their touch rect (unk_65BBC0 +12, x0 y0 x1 y1 from the position), the same in 1.0.3 and the overseas build.
+const DIALOG_BUTTON_TOUCH: [f32; 4] = [10.0, -10.0, 60.0, 40.0];
+/// The glow texture's rows: 160 px (sub_85AD0, overseas sub_82100: room for two-line options; 1.0.2 had 64).
+const GLOW_BAND: f32 = 160.0;
 

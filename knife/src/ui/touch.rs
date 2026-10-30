@@ -602,6 +602,8 @@ impl Ui {
     fn rewind_step(&mut self, game: &mut Game, r: &Renderer) {
         let choice = game.in_choice();
         self.touch.rewound = game.rewind_step(r);
+        // (1.0.3's sub_41760 and the overseas build also write 2 after a step, but only test it against 0, and
+        // the next held frame sets it back to 1 and steps again)
         if crate::assets::witch() && !choice {
             self.touch.rewind_rest = 1.0;
         }
@@ -1069,11 +1071,16 @@ impl Ui {
             }
         }
 
-        // message window (sub_40ED0): hidden while the last touch is in the bottom 40 units (y > 408 of 448),
-        // back with a touch above them (that touch does not also tap)
+        // message window (sub_40ED0): hidden while the last touch is in the bottom 40 units (y > 408 of 448) and
+        // the window is up (sub_84040; else it shows and the touch moves to y 398), back with a touch above them
+        // (that touch does not also tap)
         if in_game && self.touch.panel == Panel::Closed {
             if y > 408.0 {
-                self.touch.hidden = true;
+                if game.window_hideable() {
+                    self.touch.hidden = true;
+                } else {
+                    self.show_window();
+                }
             } else if y < 408.0 && self.touch.hidden && self.touch.down {
                 self.touch.hidden = false;
                 self.touch.swallow |= held;
@@ -1095,11 +1102,9 @@ impl Ui {
                 }
             }
             Panel::Opening => {
-                if self.touch.panel_t == 0.0
-                    && matches!(game.assets.build, knife_core::exe::Build::Overseas | knife_core::exe::Build::Witch)
-                {
-                    // overseas sub_4E170 state 1: sub_4E0C0 and sub_4F100 before the slide (Witch on the Holy
-                    // Night: objects 185 / 186 and sub_2E8C0)
+                if self.touch.panel_t == 0.0 {
+                    // sub_4EC10 state 1 (overseas sub_4E170; not 1.0.2): sub_4EAD0 and sub_4EB80 before the slide
+                    // (Witch on the Holy Night: objects 185 / 186 and sub_2E8C0)
                     self.panel_flags_save(game);
                     self.panel_flags_scene(game);
                 }
