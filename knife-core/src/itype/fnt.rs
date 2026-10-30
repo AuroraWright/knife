@@ -2333,13 +2333,17 @@ const DELTA_CODES: [(u8, u16, Delta); 191] = [
 mod tests {
     use super::*;
 
-    /// AA[] over a glyph of 12 points in three contours, x the projection and freedom vectors: the points' x and
-    /// the stack after.
-    fn aa(stack: &[i32], ppem: i32) -> (Vec<i32>, Vec<i32>) {
-        let ox = vec![0, 64, 0, 0, 64, 64, -128, -128, 64, 0, 128, 64];
-        let oy = vec![-128, -192, 0, -64, -128, -192, 64, 128, 128, -192, 64, 0];
-        let on = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1];
-        let g = Element { x: ox.clone(), y: oy.clone(), ox: ox.clone(), oy: oy.clone(), oox: ox, ooy: oy, on, f: vec![0; 12], sp: vec![0, 4, 8], ep: vec![3, 7, 11] };
+    /// A glyph of points with their original positions (the instructed ones start there), on-curve flags and
+    /// contour ends.
+    fn glyph(x: Vec<i32>, y: Vec<i32>, ox: Vec<i32>, oy: Vec<i32>, on: Vec<u8>, ep: Vec<u16>) -> Element {
+        let sp = std::iter::once(0).chain(ep.iter().take(ep.len().saturating_sub(1)).map(|&e| e.wrapping_add(1))).collect();
+        let f = vec![0; x.len()];
+        Element { x, y, oox: ox.clone(), ooy: oy.clone(), ox, oy, on, f, sp, ep }
+    }
+
+    /// AA[] (its selector on top of `stack`) over glyph `g` alone, every zone pointer on it: the result, the
+    /// glyph, the stack and the loop count after.
+    fn aa(stack: &[i32], ppem: i32, pv: [i16; 2], fv: [i16; 2], loop_: i32, g: Element) -> (R, Element, Vec<i32>, i32) {
         let mut it = Interp {
             id: 0,
             fpgm: Arc::from(&[][..]),
@@ -2362,15 +2366,15 @@ mod tests {
             it: &mut it,
             zones: [Element::default(), g],
             zp: [1; 3],
-            proj: [0x4000, 0],
-            free: [0x4000, 0],
-            dual: [0x4000, 0],
+            proj: pv,
+            free: fv,
+            dual: pv,
             pf: 0x4000,
             mover: Mover::X,
             project: Proj::X,
             old_project: Proj::X,
             rp: [0; 3],
-            loop_: 0,
+            loop_,
             op: 0x7F,
             stack: stack.to_vec(),
             code: Arc::from(&[][..]),
@@ -2379,17 +2383,53 @@ mod tests {
             depth: 0,
             autohint: None,
         };
-        m.aa().unwrap();
-        (m.zones[1].x.clone(), m.stack)
+        let r = m.aa();
+        let [_, g] = std::mem::take(&mut m.zones);
+        (r, g, m.stack, m.loop_)
     }
 
     /// The compressed delta hints as the SDK's sub_181BA0 moves the points (the executable run under an
     /// emulator on the same state).
     #[test]
     fn compressed_deltas() {
-        let (x, stack) = aa(&[42762, 18898, 48153, 0, 7, 64, 64, 253], 7);
-        assert_eq!((x, stack), (vec![0, 64, 0, 0, 128, 128, -64, -64, 128, 64, 192, 128], vec![]));
-        let (x, stack) = aa(&[30267, 31511, 37631, 7770, 30851, 257, 252], 12);
-        assert_eq!((x, stack), (vec![128, 192, 128, 128, 192, 192, 0, 0, 192, 128, 256, 192], vec![]));
+        let ox = vec![0, 64, 0, 0, 64, 64, -128, -128, 64, 0, 128, 64];
+        let oy = vec![-128, -192, 0, -64, -128, -192, 64, 128, 128, -192, 64, 0];
+        let on = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1];
+        let g = glyph(ox.clone(), oy.clone(), ox, oy, on, vec![3, 7, 11]);
+        let x = [0x4000, 0];
+        let (r, e, stack, _) = aa(&[42762, 18898, 48153, 0, 7, 64, 64, 253], 7, x, x, 0, g.clone());
+        assert_eq!((r.is_ok(), e.x, stack), (true, vec![0, 64, 0, 0, 128, 128, -64, -64, 128, 64, 192, 128], vec![]));
+        let (r, e, stack, _) = aa(&[30267, 31511, 37631, 7770, 30851, 257, 252], 12, x, x, 0, g);
+        assert_eq!((r.is_ok(), e.x, stack), (true, vec![128, 192, 128, 128, 192, 192, 0, 0, 192, 128, 256, 192], vec![]));
+    }
+
+    /// tools/itype/aa_fuzz.py's cases (KNIFE_AA_CASES, one per line: `ppem pv.x pv.y fv.x fv.y loop|stack|x|y|
+    /// ox|oy|on|ep`), each one's result written to KNIFE_AA_OUT: `ok|stack|loop|x|y|flags` or `error`.
+    #[test]
+    fn exe_cases() {
+        let Ok(path) = std::env::var("KNIFE_AA_CASES") else { return };
+        let ints = |p: &str| p.split_whitespace().map(|v| v.parse::<i32>().unwrap()).collect::<Vec<_>>();
+        let join = |v: &mut dyn Iterator<Item = String>| v.collect::<Vec<_>>().join(" ");
+        let mut out = String::new();
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let p: Vec<Vec<i32>> = line.split('|').map(ints).collect();
+            let h = &p[0];
+            let on = p[6].iter().map(|&v| v as u8).collect();
+            let ep = p[7].iter().map(|&v| v as u16).collect();
+            let g = glyph(p[2].clone(), p[3].clone(), p[4].clone(), p[5].clone(), on, ep);
+            let (pv, fv) = ([h[1] as i16, h[2] as i16], [h[3] as i16, h[4] as i16]);
+            let (r, g, stack, loop_) = aa(&p[1], h[0], pv, fv, h[5], g);
+            out += &match r {
+                Ok(()) => format!(
+                    "ok|{}|{loop_}|{}|{}|{}\n",
+                    join(&mut stack.iter().map(i32::to_string)),
+                    join(&mut g.x.iter().map(i32::to_string)),
+                    join(&mut g.y.iter().map(i32::to_string)),
+                    join(&mut g.f.iter().map(u8::to_string))
+                ),
+                Err(_) => "error\n".to_string(),
+            };
+        }
+        std::fs::write(std::env::var("KNIFE_AA_OUT").unwrap(), out).unwrap();
     }
 }
