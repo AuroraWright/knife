@@ -149,7 +149,52 @@ Each frame the text head moves by 16.667 ms / text speed characters. The default
 
 When the head reaches the end, the click wait is armed the frame after, and the script moves on the frame after that.
 
-Lines wrap at a fixed character count for the slot width: 28 full-width characters in the message window. Japanese kinsoku characters never start a line. English text (overseas build) uses nn::font's UAX #14 line breaker over the executable's own tables, at 0.9 × the glyph size. Inline tags such as `[heart]`, `[onpu]` and `[ber05]` become glyphs from `exfont_nx01.bffnt` or drawn bars, and "…" is stretched across its whole cell.
+### The text processor
+
+A message's text reaches the screen in three stages, the same in all three builds: a tagger turns the markup into characters and control codes, a line breaker picks the line ends, and nn::font's text writer draws the result, handing every control code to the engine's tag processor.
+
+**Tagging.** The message parser (`sub_BDC2C`) rewrites the markup as a byte string in which every byte below 0x20 is a tag:
+
+- a ruby `<漢字|かんじ>` becomes 0x01 base 0x02 0x03 ruby 0x04;
+- a run of ASCII (any character up to U+0100, or in the private use area) is wrapped in 0x10 … 0x11, which draws it in half-width cells. The tagger closes the run at `@`, `<`, `[`, a bar, a line feed and before any raw control byte;
+- each "…" is wrapped in 0x12 … 0x13, which stretches it across its whole cell;
+- two or more dashes (―, ─, —) or boxes (■) become one exfont run: 0x0D, the count, the glyph, 0x06. A single dash is the plain exfont glyph;
+- the 39 bracket names (`[heart]`, `[onpu]`, `[ber00]` to `[ber30]`, `[zap00]` and so on) become characters from `exfont_nx01.bffnt`, from an outlined set when the text has an edge. `[berNN]` and `[zapNN]` open a bar instead: tag 0x16 or 0x19 and full-width spaces for the bar to cover, closed by 0x17. Unknown names stay text;
+- `@x` becomes 0x0C, `@i` 0x0E and `@r` 0x0B. A Q&A bubble's text is wrapped in 0x18 … 0x15, the bubble font;
+- any other byte below 0x20 in the line is copied as it is, so the writer takes it as a tag and never draws it as a glyph. The French fan patch's form feeds (0x0C) work this way.
+
+Two spaces in a row become U+3000 first, except in English text.
+
+**Line breaking** (`sub_BF0F8`). The breaker works on a plain copy of the tagged text: characters, run tags and line feeds, with the ruby text left out and an exfont run written as its glyph repeated. For each line:
+
+1. nn::font's UAX #14 breaker finds the last character that fits the width, measured by running the real writer with the measuring tag processor. In English (overseas build) this is the whole rule, at 0.9 × the glyph size.
+2. In Japanese and Chinese a character count then holds the line to N, 28 in the message window. A full-width character counts 1, "!?" 1, half-width characters half (rounded up), tags 0. Within N the kinsoku lists decide where the line ends: characters that may not start a line, may not end one, or may hang past the edge. Over N the line is cut back to N − 2 unless its last character may hang.
+3. The count applies even when the rest of the text fits the width. In the Japanese build (1.0.3), 35 あ after a raw 0x10 fit the width at half-width cells but still break after 27. The overseas build and Witch on the Holy Night count text that ends inside an open run as exactly N, so the same line stays whole there.
+
+The breaks map back to the tagged text through a table of offsets, one per copied character or tag. A break that falls inside an exfont run moves to before the run, so the run starts the next line.
+
+**Writing.** The writer draws the tagged text glyph by glyph and calls the tag processor for each code. There are two processors, one for measuring (`sub_DD0D8`, used by the line breaker) and one for drawing (`sub_DD334`), and they do not handle quite the same codes:
+
+| Code | Effect |
+| --- | --- |
+| 0x01 base 0x02, 0x03 ruby 0x04 | A ruby; a second writer draws the ruby over the base's width |
+| 0x05 | When measuring, swallows the next byte and saves the cell width, which a later 0x11 restores; ignored when drawing |
+| 0x07, 0x08 | Swallow the next byte |
+| 0x09 | Tab: the cursor to the next multiple of 4 glyph widths |
+| 0x0A | Line feed |
+| 0x0B, 0x0F / 0x0E | Italic off / italic on (0.25) |
+| 0x0C | The cursor to the previous message's end, which is how `@x` continues a line |
+| 0x0D n … 0x06 | Stretch the next glyph across n cells (dash runs) |
+| 0x10 … 0x11 | Save the cell width, x scale and spacing, then halve the cell, set x scale 0.725 and scale the spacing (0.5 in Japanese and English, 1.0 in Chinese); 0x11 restores them |
+| 0x12 … 0x13 | Widen x by (width + spacing) / width, then restore it |
+| 0x14, 0x15, 0x18 | The font order: the gothic face, the text's own, the Q&A bubble's |
+| 0x16, 0x19 | Move the open ber / zap bar to the writer's cursor (the last one wins); with no bar, nothing |
+| 0x1A, 0x1B | Overseas build and Witch on the Holy Night: open a run like 0x10, closed by 0x11 |
+| 0x02, 0x04 alone, 0x17, 0x1C to 0x1F | Nothing |
+
+All the run tags share one save, so a raw run tag stacks with the tagger's: a raw 0x10 before "ab", then a raw 0x11 before "cdかき", draws "abcd" at quarter-width cells and かき still at half width, because the tagger's own 0x10 replaced the saved full width. A glyph draws only if the message's first print registered it in the glyph cache, and the print registers each piece of text under the font order of the last 0x14, 0x15 or 0x18 before it.
+
+Raw codes that the scripts never use can break the Switch game. A 0x03 with no 0x01 before it reads a ruby base that was never set and aborts the game. knife draws every raw code as the Switch does and stops with an error where the Switch would crash.
 
 ### Window and content fades
 
@@ -545,6 +590,7 @@ Changed commands:
 | Window types | 0–2 bands, 3–32 bubbles at 78% alpha | 0–2 bands, 3–98 speech bubbles at full alpha, in brown text and the shared system font, with their own origin table |
 | Text colour | White | An option: white, read text in light orange, or a per-speaker table; an option for the edge and shadow |
 | ASCII runs | Fixed half-width cells | The font's own advances at 0.725 × the size, kerned |
+| Text tags | Bracket names, 0x10 … 0x11 runs, 0x18 the bubble font | No bracket names (`[ber03]` stays text). Runs opened by 0x10 or 0x1B use the font's own widths, and runs opened by 0x1A use half-width cells. The line count counts 8 letters as 8 and 13 as 4 or 5. 0x18 is never registered, so text after a raw 0x18 is blank, and a raw 0x14 swaps the faces' fonts and stops the game |
 | Layer anchor | Position + the image's shift | The image's centre sits on the position; zoom and rotation turn about the pivot |
 | Quakes | Two slots per layer, three commands | One slot per layer (`STQK`), its type picking the behaviour |
 | Grain | A new offset every frame, at 0.6 × | A new offset and mirroring every 3, 6 or 9 frames, at 0.9375 × |
