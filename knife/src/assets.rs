@@ -218,11 +218,11 @@ pub fn select_build(build: Build) {
     WITCH.store(build == Build::Witch, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The Tsukihimates English patch's code changes are on (`--tsukimates`; Japanese 1.0.2 build only).
-static TSUKIMATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The Tsukihimates English patch's code changes are on (`--tsukihimates`; Japanese 1.0.2 build only).
+static TSUKIHIMATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_tsukimates(on: bool) {
-    TSUKIMATES.store(on, std::sync::atomic::Ordering::Relaxed);
+pub fn set_tsukihimates(on: bool) {
+    TSUKIHIMATES.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The Tsukihimates patch (Tsukihime-Translation's beatrice.hku, an IPS for the 1.0.2 exe F4B3318D…): sub_BDC2C
@@ -230,8 +230,8 @@ pub fn set_tsukimates(on: bool) {
 /// sub_BDC2C's test at 0xBE86C, the ruby passes sub_C1080 / sub_C1FDC keep printable ASCII); sub_C5610 puts no
 /// line feed at a break outside a ruby group (0xC5A18 / 0xC5A24), and sub_BF0F8 counts no break in the slot's
 /// line count +0x108B8 (0xC05CC). The rest of the patch allows recording and screenshots.
-pub fn tsukimates() -> bool {
-    TSUKIMATES.load(std::sync::atomic::Ordering::Relaxed)
+pub fn tsukihimates() -> bool {
+    TSUKIHIMATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn witch() -> bool {

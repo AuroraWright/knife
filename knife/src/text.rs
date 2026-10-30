@@ -1184,11 +1184,11 @@ fn slot_space(c: char, spacing: f32, pass: Pass) -> f32 {
 }
 
 /// Whether `pass`'s tagger puts `c` in an ASCII run (tags 0x10 / 0x11): printable ASCII. The Tsukihimates
-/// patch (`assets::tsukimates`) has sub_BDC2C's text pass take every code up to U+0100 and U+E000..=U+F000
+/// patch (`assets::tsukihimates`) has sub_BDC2C's text pass take every code up to U+0100 and U+E000..=U+F000
 /// instead, line feeds and other control codes included (its test at 0xBE86C), while the ruby passes keep
 /// printable ASCII.
 fn in_run(c: char, pass: Pass) -> bool {
-    if pass == Pass::Text && crate::assets::tsukimates() {
+    if pass == Pass::Text && crate::assets::tsukihimates() {
         let u = c as u32;
         u <= 0x100 || (0xE000..=0xF000).contains(&u)
     } else {
@@ -3341,7 +3341,7 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
         }
         // the Tsukihimates patch: sub_C5610 puts no line feed at a break outside a ruby group; the tag 12 a break
         // turned 31 stays (`cut`)
-        if crate::assets::tsukimates() {
+        if crate::assets::tsukihimates() {
             continue;
         }
         // sub_BF0F8 keeps a break only where its plain copy has a table entry: an exfont run has one at its

@@ -6,7 +6,7 @@
   the system menu's new blur, choices laid out and touched as in 1.0.3, the save list's X to delete a save,
   the endings gallery and CG groups, and the config's new radio and toggle art. Extract the game with
   update 1.0.3 applied; data from 1.0.2 still plays.
-- `--tsukimates` applies the code changes of the [Tsukihimates](https://github.com/Tsukihimates/Tsukihime-Translation)
+- `--tsukihimates` applies the code changes of the [Tsukihimates](https://github.com/Tsukihimates/Tsukihime-Translation)
   English patch (Japanese release, with their romfs as the mod assets folder), so their text breaks and
   places lines as their patched game does.
 - Fan translations display as on the Switch: form feeds, control codes in the text, accented letters
