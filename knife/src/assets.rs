@@ -14,7 +14,7 @@ use knife_core::{
     format::{
         archive::Archive,
         bntx::{self, TexFormat},
-        bntx_decode,
+        bntx_decode, jpeg,
         script::{SceneArchive, ScriptText},
         sfnt,
     },
@@ -1034,6 +1034,12 @@ fn decode_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>, bool)> {
     if bntx::is_bntx(data) {
         let t = bntx::parse(data)?.into_iter().next().context("empty BNTX")?;
         return Ok((t.width, t.height, bntx_decode::to_rgba8(&t)?, t.format.is_srgb()));
+    }
+    // nn::image::JpegDecoder (sub_A3180), libjpeg 9's ISLOW decode bit for bit (`jpeg::decode`)
+    if jpeg::is_jpeg(data)
+        && let Ok((w, h, rgb)) = jpeg::decode(data)
+    {
+        return Ok((w, h, rgb.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(), true));
     }
     let img = image::load_from_memory(data).context("decoding image")?.to_rgba8();
     Ok((img.width(), img.height(), img.into_raw(), true))

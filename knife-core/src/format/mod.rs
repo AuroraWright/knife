@@ -5,6 +5,7 @@ pub mod bffnt;
 pub mod bfttf;
 pub mod bntx;
 pub mod bntx_decode;
+pub mod jpeg;
 pub mod mzp;
 pub mod mzx;
 pub mod nx;
