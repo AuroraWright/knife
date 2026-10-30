@@ -64,7 +64,23 @@ pub enum Pixels {
 struct Decoding {
     name: String,
     strip: Option<(usize, usize)>,
-    pixels: std::sync::mpsc::Receiver<Result<Pixels>>,
+    pixels: std::sync::mpsc::Receiver<Result<Decoded>>,
+}
+
+/// Decoded pixels, and whether they are Witch on the Holy Night's HD twin (`Lookup`): jp_AAA40 passes its HD
+/// flag through jp_B02A0 to jp_A3180, which then bakes at scale 1 rather than 0.66667.
+type Decoded = (Pixels, bool);
+
+/// Where `decode_pixels` reads an image: the archives in lookup order, and Witch on the Holy Night's docked
+/// twins. The layer loads (jp_3ECC0 / jp_97B80 -> jp_B6A20 mode -1 -> jp_AAA40) take the HD list when docked
+/// (jp_A59D0, as knife always is): jp_AA340 reads the entry index jp_32360 found in jallpac (archive 8) /
+/// allpacml (9) from jallpachd (10) / allpachdml (11), whose entries line up with them (jallpac's past
+/// jallpachd's end are the thumbnails and colour cards, which other paths load), and from jallpac when the
+/// jallpachd entry is empty (jp_B49F0).
+#[derive(Clone)]
+struct Lookup {
+    archives: Vec<Arc<Archive>>,
+    twins: Vec<(Arc<Archive>, Arc<Archive>)>,
 }
 
 /// How many of the latest cached images `Assets::trim_images` keeps unreferenced (prefetched ones waiting for
@@ -400,28 +416,36 @@ impl Assets {
 
     /// The image archives in lookup order: jp_32360 resolves a name with jp_A90C0(name, -1), which searches
     /// allpac (archive 9), then allpacml (10), then the others; allpac and allpacml come first here for
-    /// `image_bytes`' thumbnails.
-    fn image_archives(&self) -> Vec<Arc<Archive>> {
-        [Some(&self.allpac), self.allpacml.as_ref(), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
+    /// `image_bytes`' thumbnails. Witch on the Holy Night reads allpac's and allpacml's through their HD twins.
+    fn image_archives(&self) -> Lookup {
+        let archives = [Some(&self.allpac), self.allpacml.as_ref(), self.allpaccg.as_ref(), Some(&self.allui), self.allpachd.as_ref()]
             .into_iter()
             .flatten()
             .cloned()
-            .collect()
+            .collect();
+        let twins = [(Some(&self.allpac), self.allpachd.as_ref()), (self.allpacml.as_ref(), self.allpachdml.as_ref())]
+            .into_iter()
+            .filter(|_| self.build == Build::Witch)
+            .filter_map(|(sd, hd)| Some((sd?.clone(), hd?.clone())))
+            .collect();
+        Lookup { archives, twins }
     }
 
     /// Witch on the Holy Night's HD lookup (jp_A90C0(name, 1)): jallpachd's list (jd_18C0514 = 2), then
     /// allpachdml's (3), then allui's (4).
-    fn hd_archives(&self) -> Vec<Arc<Archive>> {
-        [self.allpachd.as_ref(), self.allpachdml.as_ref(), Some(&self.allui)].into_iter().flatten().cloned().collect()
+    fn hd_archives(&self) -> Lookup {
+        let archives = [self.allpachd.as_ref(), self.allpachdml.as_ref(), Some(&self.allui)].into_iter().flatten().cloned().collect();
+        Lookup { archives, twins: Vec::new() }
     }
 
     /// Whether jp_A90C0(name, 1) finds `name` (CG mode's pictures).
     pub fn has_image_hd(&self, name: &str) -> bool {
-        self.hd_archives().iter().any(|a| a.find_stem(name).is_some())
+        self.hd_archives().archives.iter().any(|a| a.find_stem(name).is_some())
     }
 
-    /// A picture through the HD lookup (CG mode's textures 285 / 286, jp_B6A20 after sub_83E00(2 / 3)), sized
-    /// by its texels: the HD files are stored at the 1920x1080 size the tables give.
+    /// A picture through the HD lookup (CG mode's textures 285 / 286, jp_B6A20 after sub_83E00(2 / 3), baked at
+    /// scale 1 like every docked HD load), sized by its texels: the HD files are stored at the 1920x1080 size the
+    /// tables give.
     pub fn image_hd(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
         let (name, grade, key) = Self::image_key(name, Bake::NONE);
         let key = format!("HD {key}");
@@ -429,7 +453,7 @@ impl Assets {
             return i.clone();
         }
         let pixels = Self::decode_pixels(&self.hd_archives(), &name, grade, self.strip(&name));
-        let img = match pixels.and_then(|p| self.upload_pixels(r, &name, p)) {
+        let img = match pixels.and_then(|(p, _)| self.upload_pixels(r, &name, (p, true))) {
             Ok(mut i) => {
                 i.width = i.tex.width as f32;
                 i.height = i.tex.height as f32;
@@ -444,7 +468,9 @@ impl Assets {
         img
     }
 
-    fn image_bytes(archives: &[Arc<Archive>], name: &str) -> Option<Vec<u8>> {
+    /// An image's file, and whether it is an HD twin (`Lookup`).
+    fn image_bytes(lookup: &Lookup, name: &str) -> Option<(Vec<u8>, bool)> {
+        let archives = &lookup.archives;
         if let Some(stem) = name.strip_prefix(THUMB) {
             // sub_895A0: the layer's allpac entry - (bg_top.mzp + 1) + (thumstand_top.mzp + 1), a copy of the
             // art at 1/6 size (a 4x4 transparent DUMMY.NXZ for the `_aa_bb` variants and IMG7000 / IMG7001);
@@ -454,12 +480,19 @@ impl Assets {
                 .into_iter()
                 .find_map(|(a, base, thumbs)| a.filter(|a| a.find_stem(stem).is_some()).map(|a| (a, base, thumbs)))?;
             let i = a.find_stem(stem)?.checked_sub(a.find_stem(base)? + 1)? + a.find_stem(thumbs)? + 1;
-            return a.read(i).inspect_err(|e| tracing::warn!("reading thumbnail {stem}: {e}")).ok();
+            return a.read(i).inspect_err(|e| tracing::warn!("reading thumbnail {stem}: {e}")).ok().map(|d| (d, false));
         }
         for a in archives {
             if let Some(i) = a.find_stem(name) {
+                let twin = lookup.twins.iter().find(|(sd, _)| Arc::ptr_eq(sd, a)).map(|(_, hd)| hd);
+                if let Some(hd) = twin.filter(|hd| hd.entries().get(i).is_some_and(|e| e.stored_sectors > 0)) {
+                    match hd.read(i) {
+                        Ok(d) => return Some((d, true)),
+                        Err(e) => tracing::warn!("reading {name} from {}: {e}", hd.name),
+                    }
+                }
                 match a.read(i) {
-                    Ok(d) => return Some(d),
+                    Ok(d) => return Some((d, false)),
                     Err(e) => tracing::warn!("reading {name} from {}: {e}", a.name),
                 }
             }
@@ -563,7 +596,7 @@ impl Assets {
         }
     }
 
-    fn finish_image(&mut self, r: &Renderer, key: String, name: &str, pixels: Result<Pixels>) -> Option<Arc<Image>> {
+    fn finish_image(&mut self, r: &Renderer, key: String, name: &str, pixels: Result<Decoded>) -> Option<Arc<Image>> {
         let img = match pixels.and_then(|p| self.upload_pixels(r, name, p)) {
             Ok(i) => Some(Arc::new(i)),
             Err(e) => {
@@ -599,10 +632,10 @@ impl Assets {
 
     /// The CPU side of an image load (no renderer needed): archive read, BNTX parse or image decode, grade, and
     /// the language strip.
-    fn decode_pixels(archives: &[Arc<Archive>], name: &str, grade: Bake, strip: Option<(usize, usize)>) -> Result<Pixels> {
-        let data = Self::image_bytes(archives, name).context("not found")?;
+    fn decode_pixels(lookup: &Lookup, name: &str, grade: Bake, strip: Option<(usize, usize)>) -> Result<Decoded> {
+        let (data, hd) = Self::image_bytes(lookup, name).context("not found")?;
         if !grade.cpu() && strip.is_none() && bntx::is_bntx(&data) {
-            return Ok(Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?, !grade.raw));
+            return Ok((Pixels::Bntx(bntx::parse(&data)?.into_iter().next().context("empty BNTX")?, !grade.raw), hd));
         }
         let (w, mut h, mut px, srgb) = decode_image(&data)?;
         let mut rows_of = None;
@@ -615,14 +648,15 @@ impl Assets {
         }
         if grade.cpu() {
             grade.apply(&mut px, srgb);
-            return Ok(Pixels::Baked(w, h, px, rows_of));
+            return Ok((Pixels::Baked(w, h, px, rows_of), hd));
         }
-        Ok(Pixels::Rgba(w, h, px, (!grade.raw).then_some(srgb), rows_of))
+        Ok((Pixels::Rgba(w, h, px, (!grade.raw).then_some(srgb), rows_of), hd))
     }
 
-    fn upload_pixels(&self, r: &Renderer, name: &str, pixels: Pixels) -> Result<Image> {
-        // sub_A3180's bake scale for the story images (sub_AAA40 / sub_B6A20, the save previews' too)
-        let k = 2.0 / 3.0;
+    fn upload_pixels(&self, r: &Renderer, name: &str, (pixels, hd): Decoded) -> Result<Image> {
+        // sub_A3180's bake scale for the story images (sub_AAA40 / sub_B6A20, the save previews' too), 1 for an
+        // HD twin (jp_A3180's v8 under jp_B02A0's HD flag)
+        let k = if hd { 1.0 } else { 2.0 / 3.0 };
         let tex = match pixels {
             Pixels::Bntx(t, true) => upload_bntx(r, &t, k)?,
             Pixels::Bntx(t, false) => upload_bntx_raw(r, &t)?,
@@ -633,14 +667,14 @@ impl Assets {
         let no_shake = self.image_info(name).is_some_and(|i| i.no_shake);
         let (width, height, center_x, center_y, level) = match self.image_info(name) {
             // Witch on the Holy Night's layer draw (sub_1A090 -> jp_B0460 / sub_16210 / jp_36520) sizes the quad by
-            // the altered texture, (u32)(size / (2 / 3)) px (jp_A3180, the f32 0x3F2AAAAB) in the 1920x1080 space, a language-strip
-            // image's height over the strip count; the ImageInfo gives only the centre (+52 / +56) the position is
-            // offset by. Its width / height can disagree (SOU_L_12_10_00_01_01: 228 x 384 units, texture 402 x 860).
+            // the altered texture, (u32)(size / (2 / 3)) px (jp_A3180, the f32 0x3F2AAAAB; size / 1 for an HD twin)
+            // in the 1920x1080 space, a language-strip image's height over the strip count; the ImageInfo gives only
+            // the centre (+52 / +56) the position is offset by. Its width / height can disagree (SOU_L_12_10_00_01_01: 228 x 384 units, texture 402 x 860).
             // The save thumbnails (jp_89AD0) size their 1/6 copies by texture / (1 / 6) in the 1280x720 thumbnail
             // surface, 1.5 times that in the 1920 space the previews are laid out in.
             Some(i) if witch() => {
                 let n = self.strip(name).map_or(1, |(_, n)| n as u32);
-                let (k, m) = if name.starts_with(THUMB) { (1.0 / 6.0, 1.5) } else { (2.0 / 3.0, 1.0) };
+                let (k, m) = if name.starts_with(THUMB) { (1.0 / 6.0, 1.5) } else { (k, 1.0) };
                 let alt = |v: u32| (v as f32 / k) as u32 as f32 * m;
                 let w = alt(tex.width) / 3.0;
                 let h = alt(tex.height * n) / n as f32 * 362.0 / 1080.0;
