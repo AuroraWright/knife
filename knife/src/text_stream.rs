@@ -54,9 +54,9 @@ pub fn plain_text(text: &str) -> String {
         match run {
             Run::Text(s) | Run::Bar { text: s, .. } => output.extend(s.chars().map(crate::text::tag_symbol)),
             Run::Ruby { base, .. } => output.push_str(&base),
-            Run::Newline => output.push('\n'),
+            Run::Newline { .. } => output.push('\n'),
             Run::Control('\t') => output.push('\t'),
-            Run::Italic | Run::Wobble(_) | Run::Plain | Run::Fill(_) | Run::Edge(_) | Run::Indent | Run::Control(_) | Run::Font(_) | Run::RubyAt { .. } => {}
+            Run::Italic | Run::Wobble(_) | Run::Plain | Run::Fill(_) | Run::Edge(_) | Run::Indent { .. } | Run::Control(_) | Run::Font(_) | Run::RubyAt { .. } => {}
         }
     }
     output.trim_matches(|c| c == '\n' || c == '\r').to_owned()

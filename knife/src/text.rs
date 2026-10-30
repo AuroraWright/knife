@@ -1006,7 +1006,7 @@ impl FontAtlas {
                 // English: no spacing after the run, as in the messages
                 pen += n as f32 * (w + spacing) - spacing;
                 if !free {
-                    pen += slot_space(chars.get(i).copied().unwrap_or(c), spacing);
+                    pen += slot_space(chars.get(i).copied().unwrap_or(c), spacing, Pass::Text);
                 }
                 continue;
             }
@@ -1022,7 +1022,7 @@ impl FontAtlas {
                 if let Some(q) = self.ex_quad(g, h, (gx, baseline), color) {
                     batches.push(true, Quad { pos: q.pos.map(|[x, y]| [gx + (x - gx) * sx, y]), ..q });
                 }
-                pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing) };
+                pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing, Pass::Text) };
                 continue;
             }
             // quad_stretched centres its stretch on the em; shift it back so the glyph starts at gx
@@ -1031,7 +1031,7 @@ impl FontAtlas {
                 batches.push(false, if rim.is_some() { edged_glyph(q, [0; 3]) } else { q });
             }
             // nn::font's TextWriter spaces each glyph from the one before at its own spacing (`steps`)
-            pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing) };
+            pen += cell + if free { spacing } else { slot_space(chars.get(i).copied().unwrap_or(c), spacing, Pass::Text) };
         }
         batches.flush(out);
         // and after the text's last character (`kern_last`)
@@ -1047,7 +1047,7 @@ impl FontAtlas {
         let chars = lone_dashes(slot_chars(s).collect(), Pass::Text, |g| self.has_ex(g));
         let prop = prop_runs(&chars, Pass::Text);
         // the spacing goes before each glyph but the first (`steps`)
-        let first = chars.first().map_or(0.0, |&c| slot_space(c, spacing));
+        let first = chars.first().map_or(0.0, |&c| slot_space(c, spacing, Pass::Text));
         let mut prev = None;
         chars
             .iter()
@@ -1055,7 +1055,7 @@ impl FontAtlas {
             .map(|(&c, &p)| {
                 let (cell, _) = self.slot_cell(c, w, h, english(), p);
                 let k = if english() { self.kern(prev.replace(c), c, h) } else { 0.0 };
-                k + cell + slot_space(c, spacing)
+                k + cell + slot_space(c, spacing, Pass::Text)
             })
             .sum::<f32>()
             - first
@@ -1116,7 +1116,7 @@ impl FontAtlas {
             (self.advance(c, h) * k, k)
         } else if prop {
             (self.advance(c, h) * k * 0.725, k * 0.725)
-        } else if (' '..='~').contains(&c) {
+        } else if in_run(c, Pass::Text) {
             (w * 0.5, k * 0.725)
         } else {
             (w, k)
@@ -1179,8 +1179,21 @@ pub enum Pass {
 
 /// The character space after `c`: inside sub_BDC2C's ASCII runs (tag 0x10) scaled by `run_spacing`; English
 /// has no ASCII runs.
-fn slot_space(c: char, spacing: f32) -> f32 {
-    if (' '..='~').contains(&c) { spacing * run_spacing() } else { spacing }
+fn slot_space(c: char, spacing: f32, pass: Pass) -> f32 {
+    if in_run(c, pass) { spacing * run_spacing() } else { spacing }
+}
+
+/// Whether `pass`'s tagger puts `c` in an ASCII run (tags 0x10 / 0x11): printable ASCII. The Tsukihimates
+/// patch (`assets::tsukimates`) has sub_BDC2C's text pass take every code up to U+0100 and U+E000..=U+F000
+/// instead, line feeds and other control codes included (its test at 0xBE86C), while the ruby passes keep
+/// printable ASCII.
+fn in_run(c: char, pass: Pass) -> bool {
+    if pass == Pass::Text && crate::assets::tsukimates() {
+        let u = c as u32;
+        u <= 0x100 || (0xE000..=0xF000).contains(&u)
+    } else {
+        (' '..='~').contains(&c)
+    }
 }
 
 /// The character space's factor inside an ASCII run, +100932 (sub_C36D8): 0.5 for Japanese, 1.0 for Chinese;
@@ -1324,8 +1337,9 @@ impl PlacedChar {
 #[derive(Clone, Debug)]
 pub enum Run {
     Text(String),
-    /// `under`: the ruby text held `@_` (jp_C1080: the slot's ruby mode +100968 = 2, `layout`)
-    Ruby { base: String, ruby: String, under: bool },
+    /// `under`: the ruby text held `@_` (jp_C1080: the slot's ruby mode +100968 = 2, `layout`). `raw`: raw
+    /// bytes 0x01 base 0x02 0x03 ruby 0x04, which sub_BDC2C copies as text (no ruby group of sub_C1080's)
+    Ruby { base: String, ruby: String, under: bool, raw: bool },
     /// a raw 0x03 ruby 0x04 not right after its base: the tag processor (case 3, sub_DDA1C) centres the ruby
     /// over the width of the last base a 0x01 measured (+16 / +24 / +32), ending at the cursor; the text before
     /// it draws as text (Switch: `あ\x01漢字\x02いう\x03かんじ\x04えお`'s かんじ over いう). None: no base before it
@@ -1333,7 +1347,9 @@ pub enum Run {
     /// slot never set (address 0) or an earlier text left, or scans on past the text, which stops the game
     /// (Switch: crashed or froze)
     RubyAt { base: Option<String>, ruby: String },
-    Newline,
+    /// `@n` / `^` (sub_BDC2C writes a line feed, closing an ASCII run before it) or a line feed in the text
+    /// (`raw`), which sub_BDC2C copies like `Control`: the writer starts a new line
+    Newline { raw: bool },
     /// a run of bar tags (`[ber..]` / `[zap00]`): its text (a U+3000 per tag) under one bar from the sheet
     /// row `row` on (`Bar`)
     Bar { row: u8, text: String },
@@ -1352,8 +1368,9 @@ pub enum Run {
     Edge(u8),
     /// `@x` (jp_BDC2C tag 12; `a4` flag 0x10, slot flag 0x40, drops it) or a 0x0C in the text: the writer's
     /// cursor x goes to the slot's base x (+101032, sub_DD0D8 / jp_DD334 case 0xC; `layout`'s `base`). Page
-    /// text opens with it to go on after the message before (`Game::show_message`).
-    Indent,
+    /// text opens with it to go on after the message before (`Game::show_message`). `raw`: a 0x0C, which
+    /// sub_BDC2C copies like `Control`; `@x` closes an ASCII run before its tag.
+    Indent { raw: bool },
     /// Another control character in the text, which sub_BDC2C copies as it is (closing an ASCII run before it)
     /// and the writer takes as a tag, never a glyph (Switch: 0x02, 0x0B, 0x1A, 0x1F draw nothing and take no
     /// room): a tab moves the cursor to the next stop (nn::font sub_140CC8), 0x0E is `@i`'s tag 14 and 0x0B /
@@ -1469,11 +1486,12 @@ pub fn trailing_gap(runs: &[Run], spacing: f32) -> f32 {
     for r in runs.iter().rev() {
         match r {
             Run::Text(t) | Run::Bar { text: t, .. } | Run::Ruby { base: t, .. } => {
+                let pass = if matches!(r, Run::Ruby { .. }) { Pass::Base } else { Pass::Text };
                 if let Some(c) = t.chars().last() {
-                    return if english() { if run_kind(c).is_some() { 0.0 } else { spacing } } else { slot_space(c, spacing) };
+                    return if english() { if run_kind(c).is_some() { 0.0 } else { spacing } } else { slot_space(c, spacing, pass) };
                 }
             }
-            Run::Newline | Run::Indent | Run::Control('\t') => return 0.0,
+            Run::Newline { .. } | Run::Indent { .. } | Run::Control('\t') => return 0.0,
             _ => {}
         }
     }
@@ -1551,6 +1569,7 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                         base: b.to_string(),
                         ruby,
                         under,
+                        raw: false,
                     });
                 } else {
                     cur.push_str(&body);
@@ -1570,13 +1589,13 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                         runs.push(Run::Font(FontOrder::List));
                         gothic = false;
                     } else if n == 'n' {
-                        runs.push(Run::Newline);
+                        runs.push(Run::Newline { raw: false });
                     } else if n == 'r' {
                         runs.push(Run::Plain);
                     } else if n == 'i' {
                         runs.push(Run::Italic);
                     } else if n == 'x' {
-                        runs.push(Run::Indent);
+                        runs.push(Run::Indent { raw: false });
                     } else if n == 'a' {
                         // jp_BDC2C reads the character after `@a` whatever it is
                         runs.push(Run::Wobble(match it.next() {
@@ -1597,7 +1616,7 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                 if !cur.is_empty() {
                     runs.push(Run::Text(std::mem::take(&mut cur)));
                 }
-                runs.push(Run::Newline);
+                runs.push(Run::Newline { raw: false });
             }
             // sub_BDC2C copies a control character as it is (closing an ASCII run before it), and the tag
             // processor takes a 0x0C as `@x`'s tag 12 (Switch: a form feed in a line moves the cursor to the
@@ -1606,7 +1625,7 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                 if !cur.is_empty() {
                     runs.push(Run::Text(std::mem::take(&mut cur)));
                 }
-                runs.push(Run::Indent);
+                runs.push(Run::Indent { raw: true });
             }
             // a raw ruby: sub_BDC2C copies 0x01 base 0x02 0x03 ruby 0x04 as they are, and the tag processor takes
             // them as the markup's own (cases 1 / 3; Switch: `あ\x01漢字\x02\x03かんじ\x04いう` as `あ<漢字|かんじ>いう`)
@@ -1619,7 +1638,7 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                     runs.push(Run::Text(std::mem::take(&mut cur)));
                 }
                 last_base = Some(base.clone());
-                runs.push(Run::Ruby { base, ruby, under: false });
+                runs.push(Run::Ruby { base, ruby, under: false, raw: true });
             }
             // a base alone draws as text; case 1 measures it up to its 0x02 for a later 0x03
             '\u{1}' => {
@@ -1643,7 +1662,13 @@ pub fn parse_markup_edge(s: &str, edge: bool) -> Vec<Run> {
                 let ruby: String = it.by_ref().take_while(|&d| d != '\u{4}').collect();
                 runs.push(Run::RubyAt { base: last_base.clone().filter(|_| closed), ruby });
             }
-            c if c < ' ' && c != '\n' => {
+            '\n' => {
+                if !cur.is_empty() {
+                    runs.push(Run::Text(std::mem::take(&mut cur)));
+                }
+                runs.push(Run::Newline { raw: true });
+            }
+            c if c < ' ' => {
                 if !cur.is_empty() {
                     runs.push(Run::Text(std::mem::take(&mut cur)));
                 }
@@ -1884,16 +1909,21 @@ impl Style {
 #[allow(clippy::too_many_arguments)]
 fn steps(atlas: &FontAtlas, chars: &[char], next: Option<char>, pass: Pass, size: f32, sx: f32, spacing: f32, st: &Style) -> Vec<(f32, f32, f32)> {
     let prop = prop_runs(chars, pass);
-    let gap = |c: char| if pass == Pass::Ruby && !ruby_runs_scaled() { spacing } else { slot_space(c, spacing) };
+    let gap = |c: char, p: Pass| if pass == Pass::Ruby && !ruby_runs_scaled() { spacing } else { slot_space(c, spacing, p) };
     chars
         .iter()
         .enumerate()
         .map(|(i, &c)| {
-            let after = gap(chars.get(i + 1).copied().or(next).unwrap_or(c));
+            // the character after a ruby base is the text's
+            let after = match (chars.get(i + 1), next) {
+                (Some(&d), _) => gap(d, pass),
+                (None, Some(d)) => gap(d, Pass::Text),
+                (None, None) => gap(c, pass),
+            };
             if english() {
                 return (atlas.advance_in(c, size, st.font) * sx, sx, after);
             }
-            if !(' '..='~').contains(&c) {
+            if !in_run(c, pass) {
                 return (size * sx, sx, after);
             }
             let k = match pass {
@@ -1976,7 +2006,7 @@ fn next_char(runs: &[Run], i: usize) -> Option<char> {
                     return Some(c);
                 }
             }
-            Run::Italic | Run::Wobble(_) | Run::Plain | Run::Fill(_) | Run::Edge(_) | Run::Indent | Run::RubyAt { .. } => {}
+            Run::Italic | Run::Wobble(_) | Run::Plain | Run::Fill(_) | Run::Edge(_) | Run::Indent { .. } | Run::RubyAt { .. } => {}
             _ => return None,
         }
     }
@@ -2015,12 +2045,21 @@ pub fn layout_from(
     let base = if base == 0.0 || base - x >= lay.right - lay.left { x } else { base };
     // the line starts (sub_BF0F8, `plan_lines`), by the index of each `push`
     let plan = plan_lines(atlas, lay, runs, x, base, style.measure);
+    // a ruby group sub_C5610 split at a line break: two groups, the second starting the line
+    let split;
+    let runs = match plan.as_ref().filter(|p| !p.splits.is_empty()) {
+        Some(p) => {
+            split = split_rubies(runs, &p.splits);
+            &split[..]
+        }
+        None => runs,
+    };
     // English text (N = -1): sub_BF0F8 breaks the line at a tag 12 when the room after the base is under
     // `ROOM_MIN_ENGLISH` (`indent_room`), as at every other tag 12 with less than `ROOM_MIN`
     let english_cuts: Vec<bool> = match &plan {
         None if english() => {
             let min = if crate::assets::witch() { kinsoku::ROOM_MIN_ENGLISH_WITCH } else { kinsoku::ROOM_MIN_ENGLISH };
-            let rooms = runs.iter().enumerate().filter(|(_, r)| matches!(r, Run::Indent)).map(|(i, _)| indent_room(lay, base - x, next_char(runs, i)));
+            let rooms = runs.iter().enumerate().filter(|(_, r)| matches!(r, Run::Indent { .. })).map(|(i, _)| indent_room(lay, base - x, next_char(runs, i)));
             rooms.map(|room| room < min || room < kinsoku::ROOM_MIN).collect()
         }
         _ => Vec::new(),
@@ -2159,7 +2198,7 @@ pub fn layout_from(
     for (ri, run) in runs.iter().enumerate() {
         let next = next_char(runs, ri);
         match run {
-            Run::Newline => {
+            Run::Newline { .. } => {
                 x = lay.left;
                 baseline += lay.line_height;
                 flow.newline();
@@ -2189,7 +2228,7 @@ pub fn layout_from(
                 // after its last glyph, to the next multiple of 4 glyph widths from where the text began, and no
                 // character space before the next glyph (Switch: "abcd<tab>ef" puts e 4 x 45.6 px after a)
                 let gap = match out[start..].last() {
-                    Some(pc) if pc.baseline == baseline => if english() { if pc.run.is_some() { 0.0 } else { lay.spacing } } else { slot_space(pc.c, lay.spacing) },
+                    Some(pc) if pc.baseline == baseline => if english() { if pc.run.is_some() { 0.0 } else { lay.spacing } } else { slot_space(pc.c, lay.spacing, Pass::Text) },
                     _ => 0.0,
                 };
                 let stop = lay.size * lay.sx * 4.0;
@@ -2206,7 +2245,7 @@ pub fn layout_from(
                     style.font = f;
                 }
             }
-            Run::Indent => {
+            Run::Indent { .. } => {
                 // sub_BF0F8 breaks the line at the tag (sub_C5610 puts a line feed before it), and each break
                 // makes the text's first tag 12 left a 31
                 let k = indent;
@@ -2228,7 +2267,7 @@ pub fn layout_from(
                     // a line's first, so a glyph already on the line leaves it before the next one
                     let printed = out[start..].last().is_some_and(|pc| pc.baseline == baseline);
                     let gap = match next {
-                        Some(c) if printed => if english() { lay.spacing } else { slot_space(c, lay.spacing) },
+                        Some(c) if printed => if english() { lay.spacing } else { slot_space(c, lay.spacing, Pass::Text) },
                         _ => 0.0,
                     };
                     x = base + gap;
@@ -2262,8 +2301,10 @@ pub fn layout_from(
                 if style.measure == FontOrder::Gothic {
                     style.font = FontOrder::Gothic;
                 }
+                // raw ruby bytes: the base is sub_BDC2C's text
+                let bpass = if matches!(run, Run::Ruby { raw: true, .. }) { Pass::Text } else { Pass::Base };
                 let bchars: Vec<char> = base.chars().collect();
-                let bstep = steps(atlas, &bchars, next, Pass::Base, lay.size, lay.sx, lay.spacing, &style);
+                let bstep = steps(atlas, &bchars, next, bpass, lay.size, lay.sx, lay.spacing, &style);
                 let bw: f32 = bstep.iter().map(|s| s.0 + s.2).sum();
                 // the base's last character must fit (the line size in characters above)
                 let last = bstep.last().map_or(0.0, |s| s.0 + s.2);
@@ -2282,7 +2323,7 @@ pub fn layout_from(
                             flow.placed(at, out.get(at).map_or(x, |pc| pc.x), baseline != y);
                         }
                     } else {
-                        text(base, Pass::Base, next, None, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow);
+                        text(base, bpass, next, None, &mut style, &mut x, &mut baseline, &mut order, out, &mut flow);
                     }
                 }
                 // sub_DDA1C: the ruby writer at 0.52 of the text's scale and spacing, centred over the base (the
@@ -2416,6 +2457,152 @@ struct LinePlan {
     /// the tags 12 sub_BF0F8 turned into line breaks (`kinsoku::Breaks::cut`): the text's first this many draw
     /// nothing
     cut: usize,
+    /// the ruby groups a break splits (sub_C5610), each its own line's
+    splits: Vec<RubySplit>,
+}
+
+/// A ruby group sub_C5610 splits at a line break: `0x01 base1 0x02 0x03 ruby1 0x04 \n 0x01 base2 0x02 0x03 ruby2
+/// 0x04`. `run`: the `Run::Ruby`; `units`: the plan units (`base`: characters) of its base the first line
+/// keeps; the ruby text's two parts.
+struct RubySplit {
+    run: usize,
+    units: usize,
+    base: usize,
+    ruby: (String, String),
+}
+
+/// nn::util::PickOutCharacterFromUtf8String's characters of `b` up to its end or a NUL: each one's byte offset.
+fn utf8_starts(b: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < b.len() && b[p] != 0 {
+        out.push(p);
+        p += match b[p] {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+    }
+    out
+}
+
+/// sub_C1080's ruby text between its 0x03 and 0x04: printable ASCII runs in tags 0x10 / 0x11, an exfont run as
+/// 0xD n glyph 6, the last run closed; with each element's end and the characters of `chars` it holds so far.
+fn tagged_ruby(chars: &[char], has_ex: &impl Fn(char) -> bool) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let (mut t, mut ends, mut open) = (Vec::new(), Vec::new(), false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let n = chars[i..].iter().take_while(|&&d| run_kind(d) == run_kind(c)).count().min(255);
+        let ex = run_kind(c).filter(|&g| has_ex(g) && makes_run(g, n, Pass::Ruby));
+        if (ex.is_some() || !in_run(c, Pass::Ruby)) && std::mem::take(&mut open) {
+            t.push(0x11);
+        }
+        let mut buf = [0; 4];
+        match ex {
+            Some(g) => {
+                t.extend([0x0D, n as u8]);
+                t.extend(g.encode_utf8(&mut buf).bytes());
+                t.push(6);
+                i += n;
+            }
+            None => {
+                if in_run(c, Pass::Ruby) && !std::mem::replace(&mut open, true) {
+                    t.push(run_tag(chars, i, Pass::Ruby) as u8);
+                }
+                t.extend(c.encode_utf8(&mut buf).bytes());
+                i += 1;
+            }
+        }
+        ends.push((t.len(), i));
+    }
+    if open {
+        t.push(0x11);
+    }
+    (t, ends)
+}
+
+/// sub_C5610 at a line break in a ruby group (a3 >= 0). `plain`: the group's span of sub_BF0F8's plain copy
+/// (from `from`), its units' first and last copies `offs` / `lasts`, the break at `b`. The source has the base
+/// as sub_C1080 wrote it (an exfont run's copies as 0xD n glyph 6, the break's offset that of its first or last
+/// copy's source, none between); the break moves back over a tag before it (a2 - 2 after 7 or 13, a2 - 1
+/// after 1 3 5 7 13 14 16 18), and from the group's 0x01 it is v22 = (a2 - start) characters of the base's
+/// v19 by byte proportion (Switch truncates: an ASCII base keeps the character at the break on the first
+/// line), v23 = v21 v22 / v19 of the ruby text's v21 (tags and an exfont run's bytes counted as characters).
+/// v23 <= 0: a line feed before the group, `Some(None)`. Else the ruby splits after v23 characters, the
+/// first of the rest moved up when it is in NO_START (+101792, sub_C3A3C) and the one after it is not, else
+/// the split one character earlier if both are. `None`: the break has no source offset (inside an exfont run).
+fn ruby_split(plain: &[u8], offs: &[usize], lasts: &[usize], from: usize, b: usize, ruby: &str, has_ex: &impl Fn(char) -> bool) -> Option<Option<RubySplit>> {
+    // the base's source, with each plain offset's source offset and each unit's glyph's
+    let (mut src, mut map, mut glyphs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut p = 0;
+    let mut u = 0;
+    while p < plain.len() {
+        if u < offs.len() && from + p == offs[u] {
+            let len = utf8_starts(&plain[p..]).get(1).copied().unwrap_or(plain.len() - p);
+            let g = std::str::from_utf8(&plain[p..p + len]).ok().and_then(|s| s.chars().next());
+            if g == Some(EX_DASH) || g == Some(EX_BOX) {
+                let n = (lasts[u] - offs[u]) / len + 1;
+                map.push((from + p, src.len()));
+                src.extend([0x0D, n as u8]);
+                map.push((lasts[u], src.len()));
+                glyphs.push((src.len(), n));
+                src.extend_from_slice(&plain[p..p + len]);
+                src.push(6);
+                p = lasts[u] - from + len;
+            } else {
+                map.push((from + p, src.len()));
+                glyphs.push((src.len(), 1));
+                src.extend_from_slice(&plain[p..p + len]);
+                p += len;
+            }
+            u += 1;
+        } else {
+            // a run tag
+            map.push((from + p, src.len()));
+            src.push(plain[p]);
+            p += 1;
+        }
+    }
+    let at = map.iter().find(|&&(o, _)| o == b)?.1;
+    // the source from the group's 0x01: v115[start + i]
+    let byte = |i: usize| match i {
+        0 => 1,
+        i => src.get(i - 1).copied().unwrap_or(2),
+    };
+    let a2 = at + 1;
+    let v10 = if a2 >= 2 && matches!(byte(a2 - 2), 7 | 13) {
+        a2 - 2
+    } else {
+        match byte(a2 - 1) {
+            t if t <= 0x12 && (1u32 << t) & 0x560AA != 0 => a2 - 1,
+            _ => a2,
+        }
+    };
+    let bstarts = utf8_starts(&src);
+    let rchars: Vec<char> = ruby.chars().collect();
+    let (rsrc, rends) = tagged_ruby(&rchars, has_ex);
+    let rstarts = utf8_starts(&rsrc);
+    let (v19, v21) = (bstarts.len(), rstarts.len());
+    let v22 = (v10 * v19).checked_div(src.len()).unwrap_or(0);
+    let v23 = (v21 * v22).checked_div(v19).unwrap_or(0);
+    if v23 == 0 {
+        return Some(None);
+    }
+    let cut = |starts: &[usize], k: usize, len: usize| starts.get(k).copied().unwrap_or(len);
+    let mut r = cut(&rstarts, v23, rsrc.len());
+    let rest: Vec<char> = std::str::from_utf8(&rsrc[r..]).map(|s| s.chars().take(2).collect()).unwrap_or_default();
+    let no_start = |c: Option<&char>| c.is_some_and(|c| kinsoku_rules().no_start.contains(*c));
+    if no_start(rest.first()) {
+        r = if no_start(rest.get(1)) { cut(&rstarts, v23 - 1, rsrc.len()) } else { r + rest[0].len_utf8() };
+    }
+    let bcut = cut(&bstarts, v22, src.len());
+    let units = glyphs.iter().take_while(|&&(g, _)| g < bcut).count();
+    let base = glyphs[..units].iter().map(|&(_, n)| n).sum();
+    let split = rends.iter().take_while(|&&(e, _)| e <= r).last().map_or(0, |&(_, k)| k);
+    let ruby = (rchars[..split].iter().collect(), rchars[split..].iter().collect());
+    Some(Some(RubySplit { run: 0, units, base, ruby }))
 }
 
 /// The tag sub_BDC2C opens an ASCII run with at `chars[i]`: 0x10, and in Witch on the Holy Night (jp_BDC2C /
@@ -2503,10 +2690,26 @@ fn raw_glyphs(atlas: &FontAtlas, lay: &Layout, runs: &[Run], start: &Style) -> O
     if !runs.iter().any(|r| matches!(r, Run::Control(c) if stateful(*c))) {
         return None;
     }
-    // sub_BDC2C's text: ASCII runs in their tags, closed before any other character or a run's end (English
-    // text has neither ASCII runs nor … tags)
+    // sub_BDC2C's text: ASCII runs in their tags, closed before any other character, markup code or the text's
+    // end; a raw control code is another character (English text has neither ASCII runs nor … tags)
     let mut chars: Vec<Vec<char>> = Vec::new();
     let mut items = Vec::new();
+    let mut open = false;
+    let close = |items: &mut Vec<Item>, open: &mut bool| {
+        if std::mem::take(open) {
+            items.push(Item::Tag('\u{11}'));
+        }
+    };
+    // a raw code: in or out of a run as the character it is
+    let raw = |c: char, items: &mut Vec<Item>, open: &mut bool| {
+        if !eng && in_run(c, Pass::Text) {
+            if !std::mem::replace(open, true) {
+                items.push(Item::Tag(run_tag(&[c], 0, Pass::Text)));
+            }
+        } else {
+            close(items, open);
+        }
+    };
     for (ri, run) in runs.iter().enumerate() {
         let cs = match run {
             Run::Text(t) => lone_dashes(t.chars().collect(), Pass::Text, |g| atlas.has_ex(g)),
@@ -2514,11 +2717,10 @@ fn raw_glyphs(atlas: &FontAtlas, lay: &Layout, runs: &[Run], start: &Style) -> O
         };
         match run {
             Run::Text(_) => {
-                let mut open = false;
                 let mut i = 0;
                 while i < cs.len() {
                     let c = cs[i];
-                    let ascii = !eng && (' '..='~').contains(&c);
+                    let ascii = !eng && in_run(c, Pass::Text);
                     if open && !ascii {
                         items.push(Item::Tag('\u{11}'));
                         open = false;
@@ -2540,19 +2742,31 @@ fn raw_glyphs(atlas: &FontAtlas, lay: &Layout, runs: &[Run], start: &Style) -> O
                     }
                     i += 1;
                 }
-                if open {
-                    items.push(Item::Tag('\u{11}'));
-                }
             }
-            Run::Control(c) => items.push(Item::Raw(ri, *c)),
+            Run::Control(c) => {
+                raw(*c, &mut items, &mut open);
+                items.push(Item::Raw(ri, *c));
+            }
+            Run::Indent { raw: true } => raw('\u{c}', &mut items, &mut open),
+            Run::Newline { raw: true } => raw('\n', &mut items, &mut open),
             // the markup's own tags: `@i` 14, `@r` 11, `@g` / `@h` 20 / 21
-            Run::Italic => items.push(Item::Raw(ri, '\u{e}')),
-            Run::Plain => items.push(Item::Raw(ri, '\u{b}')),
-            Run::Font(f) => items.push(Item::Raw(ri, if *f == FontOrder::Gothic { '\u{14}' } else { '\u{15}' })),
-            _ => {}
+            Run::Italic => {
+                close(&mut items, &mut open);
+                items.push(Item::Raw(ri, '\u{e}'));
+            }
+            Run::Plain => {
+                close(&mut items, &mut open);
+                items.push(Item::Raw(ri, '\u{b}'));
+            }
+            Run::Font(f) => {
+                close(&mut items, &mut open);
+                items.push(Item::Raw(ri, if *f == FontOrder::Gothic { '\u{14}' } else { '\u{15}' }));
+            }
+            _ => close(&mut items, &mut open),
         }
         chars.push(cs);
     }
+    close(&mut items, &mut open);
     // the English writer has no fixed width (+56 clear, +32 = 0: a raw 0x12 widens the x scale without bound and
     // the text after it on the line draws nowhere; Switch, `mn\x12op\x13qr` draws "mn")
     let base = Pen { cell: 1.0, sx: 1.0, stretch: 1.0, mstretch: 1.0, sp: 1.0, fixed: !eng };
@@ -2986,10 +3200,21 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
     // each pushed unit's byte offsets in `plain`: its first and last copy (an exfont run's glyph repeated)
     let mut offs = Vec::new();
     let mut lasts = Vec::new();
+    // sub_C1080's ruby groups: (run, span in `plain` of the base's characters and tags, first unit)
+    let mut rubies: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
     let mut open = false;
     let close = |plain: &mut String, open: &mut bool| {
         if std::mem::take(open) {
             plain.push('\u{11}');
+        }
+    };
+    let raw_code = |plain: &mut String, open: &mut bool, c: char| {
+        if in_run(c, Pass::Text) {
+            if !std::mem::replace(open, true) {
+                plain.push(run_tag(&[c], 0, Pass::Text));
+            }
+        } else {
+            close(plain, open);
         }
     };
     let chars_of = |plain: &mut String, open: &mut bool, offs: &mut Vec<usize>, lasts: &mut Vec<usize>, t: &str, pass: Pass| {
@@ -3002,7 +3227,7 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
                 Some(g) if has_ex(g) && makes_run(g, n, pass) => (g, n),
                 _ => (c, 1),
             };
-            if (' '..='~').contains(&g) {
+            if in_run(g, pass) {
                 if !*open {
                     plain.push(run_tag(&chars, i, pass));
                     *open = true;
@@ -3018,7 +3243,7 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
             i += n;
         }
     };
-    for run in runs {
+    for (ri, run) in runs.iter().enumerate() {
         match run {
             Run::Text(t) => chars_of(&mut plain, &mut open, &mut offs, &mut lasts, t, Pass::Text),
             Run::Bar { text, .. } => {
@@ -3028,25 +3253,47 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
                 close(&mut plain, &mut open);
                 plain.push('\u{17}');
             }
+            // raw ruby bytes are text to sub_BDC2C, the ruby text out of the plain copy with its tags
+            Run::Ruby { base, ruby, raw: true, .. } => {
+                raw_code(&mut plain, &mut open, '\u{1}');
+                chars_of(&mut plain, &mut open, &mut offs, &mut lasts, base, Pass::Text);
+                for c in ['\u{2}', '\u{3}'].into_iter().chain(ruby.chars()) {
+                    let mut tags = String::new();
+                    raw_code(&mut tags, &mut open, c);
+                }
+                raw_code(&mut plain, &mut open, '\u{4}');
+            }
             Run::Ruby { base, .. } => {
                 close(&mut plain, &mut open);
+                let (from, unit) = (plain.len(), offs.len());
                 chars_of(&mut plain, &mut open, &mut offs, &mut lasts, base, Pass::Base);
                 close(&mut plain, &mut open);
+                rubies.push((ri, from..plain.len(), unit));
             }
-            Run::Newline => {
-                close(&mut plain, &mut open);
+            Run::Newline { raw } => {
+                // a line feed in the text is a character to sub_BDC2C's run test, `@n` / `^` close the run
+                if *raw {
+                    raw_code(&mut plain, &mut open, '\n');
+                } else {
+                    close(&mut plain, &mut open);
+                }
                 offs.push(plain.len());
                 lasts.push(plain.len());
                 plain.push('\n');
             }
-            Run::Indent => {
-                close(&mut plain, &mut open);
+            Run::Indent { raw } => {
+                // a raw 0x0C is a character to sub_BDC2C's run test, `@x` closes the run
+                if *raw {
+                    raw_code(&mut plain, &mut open, '\u{c}');
+                } else {
+                    close(&mut plain, &mut open);
+                }
                 offs.push(plain.len());
                 lasts.push(plain.len());
                 plain.push('\u{c}');
             }
             Run::Control(c) => {
-                close(&mut plain, &mut open);
+                raw_code(&mut plain, &mut open, *c);
                 plain.push(*c);
             }
             Run::Font(f) => plain.push(if *f == FontOrder::Gothic { '\u{14}' } else { '\u{15}' }),
@@ -3070,7 +3317,33 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
     let breaks = kinsoku::breaks(lb, plain.as_bytes(), lay.right - x, lay.right - lay.left, base - x, &m, kinsoku_rules());
     let mut starts = vec![false; offs.len()];
     let mut trailing = false;
+    let mut splits = Vec::new();
     for b in breaks.starts {
+        // a break in a ruby group (sub_BF0F8: the group whose source span holds its offset, a3 >= 0): sub_C5610
+        // splits the ruby over the lines or moves the group down whole (`ruby_split`), once per group here
+        if let Some(&(ri, ref span, unit)) = rubies.iter().find(|r| r.1.contains(&b)) {
+            let Run::Ruby { ruby, .. } = &runs[ri] else { continue };
+            let units = offs[unit..].iter().take_while(|&&o| o < span.end).count();
+            let done = splits.iter().any(|s: &RubySplit| s.run == ri) || starts[unit..unit + units].contains(&true);
+            if !done && let Some(cut) = ruby_split(&plain.as_bytes()[span.clone()], &offs[unit..unit + units], &lasts[unit..unit + units], span.start, b, ruby, &has_ex) {
+                match cut {
+                    Some(s) => {
+                        match starts.get_mut(unit + s.units) {
+                            Some(st) => *st = true,
+                            None => trailing = true,
+                        }
+                        splits.push(RubySplit { run: ri, ..s });
+                    }
+                    None => starts[unit] = true,
+                }
+            }
+            continue;
+        }
+        // the Tsukihimates patch: sub_C5610 puts no line feed at a break outside a ruby group; the tag 12 a break
+        // turned 31 stays (`cut`)
+        if crate::assets::tsukimates() {
+            continue;
+        }
         // sub_BF0F8 keeps a break only where its plain copy has a table entry: an exfont run has one at its
         // first copy (the tag 0xD) and its last (the character), and sub_C5610 moves either before the 0xD, so
         // the whole run starts the line; a break between them is dropped (Switch, Witch on the Holy Night:
@@ -3088,7 +3361,22 @@ fn plan_lines_with(has_ex: impl Fn(char) -> bool, advance: impl Fn(char) -> f32,
     }
     let indents = starts.iter().zip(&indent).filter(|&(_, &i)| i).map(|(&s, _)| s).collect();
     let starts = starts.into_iter().zip(newline.iter().zip(&indent)).filter(|&(_, (&nl, &i))| !nl && !i).map(|(s, _)| s).collect();
-    Some(LinePlan { starts, trailing, indents, cut: breaks.cut })
+    Some(LinePlan { starts, trailing, indents, cut: breaks.cut, splits })
+}
+
+/// `runs` with each split ruby group (`RubySplit`) as its two groups.
+fn split_rubies(runs: &[Run], splits: &[RubySplit]) -> Vec<Run> {
+    let mut out = runs.to_vec();
+    let mut splits: Vec<&RubySplit> = splits.iter().collect();
+    splits.sort_by_key(|s| std::cmp::Reverse(s.run));
+    for s in splits {
+        if let Run::Ruby { base, under, raw, .. } = &runs[s.run] {
+            let k = base.char_indices().nth(s.base).map_or(base.len(), |(i, _)| i);
+            let part = |base: &str, ruby: &str| Run::Ruby { base: base.to_string(), ruby: ruby.to_string(), under: *under, raw: *raw };
+            out.splice(s.run..=s.run, [part(&base[..k], &s.ruby.0), part(&base[k..], &s.ruby.1)]);
+        }
+    }
+    out
 }
 
 /// The characters of a message's English text as sub_BF0F8 hands them to the line breaker: the slot's whole
@@ -3115,7 +3403,7 @@ impl Flow {
                 match run {
                     Run::Text(t) | Run::Bar { text: t, .. } => chars.extend(lone_dashes(t.chars().collect(), Pass::Text, |g| atlas.has_ex(g))),
                     Run::Ruby { base, .. } => chars.extend(base.chars()),
-                    Run::Newline => chars.push('\n'),
+                    Run::Newline { .. } => chars.push('\n'),
                     _ => {}
                 }
             }

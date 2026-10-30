@@ -157,6 +157,10 @@ struct Cli {
     /// Let every story movie be skipped (B, Plus, A or a tap), even unwatched ones the Switch plays through
     #[arg(long)]
     skip_movies: bool,
+    /// Apply the Tsukihimates English patch's code changes (its IPS for the Japanese 1.0.2 exe): Latin text in
+    /// half-width cells and no automatic line breaks. Use with their romfs as the mod assets folder.
+    #[arg(long)]
+    tsukimates: bool,
     /// Debug: set script variables after the start, comma-separated NAME=VALUE (e.g. F822=0)
     #[cfg_attr(feature = "debug", arg(long, value_delimiter = ','))]
     #[cfg_attr(not(feature = "debug"), arg(skip))]
@@ -795,6 +799,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse_from(ini::merged_args());
     let build = assets::detect_build(&cli.assets_dir());
     assets::select_build(build);
+    if cli.tsukimates {
+        anyhow::ensure!(build == knife_core::exe::Build::Japanese, "--tsukimates patches the Japanese release's executable");
+        assets::set_tsukimates(true);
+    }
     save::set_file(cli.save_file.clone().unwrap_or_else(|| save::default_file(build)));
     savedata::set_system_language(cli.language.unwrap_or_else(|| assets::system_language(build)));
     if let Some(language) = cli.language {

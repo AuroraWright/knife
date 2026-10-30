@@ -51,10 +51,9 @@ pub const WITCH: Rules = Rules {
 const PAIR_A: &[u8] = "Œ".as_bytes();
 const PAIR_B: &[u8] = "œ".as_bytes();
 
-/// The slot's measure for the breaker: the plain text's cell widths from `start`. sub_C7240's writer starts each
-/// line outside an ASCII run (Switch: a line that begins inside a run measures its letters at the full cell
-/// until the run's next tag, half cells after a 0x10), and a character runs past the width when its cell ends
-/// past it (a line's first character always fits).
+/// The slot's measure for the breaker: the plain text's cell widths from `start`, with sub_C7240's writer
+/// (`Writer`) carried from the line before, and a character runs past the width when its cell ends past it (a
+/// line's first character always fits).
 pub struct Measure<'a> {
     /// the fixed cell (+100900) and the character spacing (+100912): a run tag halves the cell and scales the
     /// spacing by `run_spacing` (+100932: 0.5 for Japanese, 1.0 for Chinese)
@@ -117,6 +116,18 @@ fn starts(a: &Buf, pair: &[u8], n: usize) -> bool {
 /// A printable ASCII character (0x20..=0x7E)
 fn ascii(b: u8) -> bool {
     b.wrapping_sub(32) <= 0x5E
+}
+
+/// (cell fraction, spacing fraction, proportional)
+type Pen = (f32, f32, bool);
+
+/// sub_C7240's writer between the breaker's lines: its pen, the measuring tag processor's one save (shared by
+/// the line measures) and the start of the last line measured (+112)
+#[derive(Clone, Copy)]
+struct Writer {
+    pen: Pen,
+    save: Pen,
+    last: Option<usize>,
 }
 
 struct Text<'a> {
@@ -214,57 +225,79 @@ impl Text<'_> {
         if open { -1 } else { full }
     }
 
-    /// The first character past the width from `start` (`Measure`), stopping at a line feed.
-    /// The measuring tag processor (sub_DD0D8; Witch on the Holy Night's jp_DD0D8) keeps one save of the
-    /// writer: a run tag saves the cell fraction and spacing fraction and halves both (the spacing by
-    /// `run_spacing`), 0x11 restores them, so a raw 0x10 before a run leaves the text after it at half
-    /// cells; 0x05 / 0x07 / 0x08 drop the character after them, and 0x0D and 0x03 the text up to their 0x06 /
-    /// 0x04.
-    fn overflow(&self, start: usize, end: usize, width: f32, m: &Measure) -> Option<usize> {
-        let (mut x, mut first) = (0.0f32, true);
-        // (cell fraction, spacing fraction, proportional) and its save
-        let mut pen = (1.0f32, 1.0f32, false);
-        let mut save = pen;
-        let mut p = start;
-        while p < end {
-            let q = p;
-            let c = self.get(&mut p);
-            match c[0] {
-                0x11 => pen = (save.0, save.1, false),
-                b if self.tag(b) => {
-                    save = pen;
-                    pen = (save.0 * 0.5, save.1 * m.run_spacing, b != 0x1A);
-                }
-                0x0A => return None,
-                0x05 | 0x07 | 0x08 => {
-                    self.get(&mut p);
-                }
-                0x0D | 0x03 => {
-                    let stop = if c[0] == 0x0D { 0x06 } else { 0x04 };
-                    while p < end && self.get(&mut p)[0] != stop {}
-                }
-                1..=0x1F => {}
-                _ => {
-                    let w = match (pen.0 < 1.0, pen.2, m.prop) {
-                        (true, true, Some(f)) => f(std::str::from_utf8(&c[..strlen(&c)]).ok().and_then(|s| s.chars().next()).unwrap_or(' ')),
-                        _ => m.cell * pen.0,
-                    };
-                    if !first && x + w > width {
-                        return Some(q);
-                    }
-                    first = false;
-                    x += w + m.spacing * pen.1;
-                }
+    /// The measuring tag processor (sub_DD0D8; Witch on the Holy Night's jp_DD0D8) on one character `c` read
+    /// at `*p`: a run tag saves the pen in the processor's one save and halves the cell and spacing fractions
+    /// (the spacing by `run_spacing`), 0x11 restores the save, so a raw 0x10 before a run leaves the text after
+    /// it at half cells; 0x05 / 0x07 / 0x08 drop the character after them, and 0x0D and 0x03 the text up to
+    /// their 0x06 / 0x04. False for a character that draws.
+    fn process(&self, c: &Buf, p: &mut usize, end: usize, w: &mut Writer, m: &Measure) -> bool {
+        match c[0] {
+            0x11 => w.pen = (w.save.0, w.save.1, false),
+            b if self.tag(b) => {
+                w.save = w.pen;
+                w.pen = (w.pen.0 * 0.5, w.pen.1 * m.run_spacing, b != 0x1A);
+            }
+            0x05 | 0x07 | 0x08 => {
+                self.get(p);
+            }
+            0x0D | 0x03 => {
+                let stop = if c[0] == 0x0D { 0x06 } else { 0x04 };
+                while *p < end && self.get(p)[0] != stop {}
+            }
+            1..=0x1F => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// The first character past the width from `start` (`Measure`), stopping at a line feed. sub_C7240 first
+    /// runs the writer over the text from the last line it measured to `start` (none after sub_BF0F8 clears
+    /// it at a break or a tag 12, the writer then as it was), so a line after a raw line feed inside a run
+    /// measures at the run's half cells; the line is measured on a copy of the writer, and the tags it reads
+    /// leave their save in the processor.
+    fn overflow(&self, start: usize, end: usize, width: f32, m: &Measure, w: &mut Writer) -> Option<usize> {
+        if let Some(mut p) = w.last.filter(|&p| p != start) {
+            while p < start {
+                let c = self.get(&mut p);
+                self.process(&c, &mut p, start, w, m);
             }
         }
-        None
+        w.last = Some(start);
+        let mut copy = *w;
+        let (mut x, mut first) = (0.0f32, true);
+        let mut p = start;
+        let over = loop {
+            if p >= end {
+                break None;
+            }
+            let q = p;
+            let c = self.get(&mut p);
+            if c[0] == 0x0A {
+                break None;
+            }
+            if self.process(&c, &mut p, end, &mut copy, m) {
+                continue;
+            }
+            let pen = copy.pen;
+            let cw = match (pen.0 < 1.0, pen.2, m.prop) {
+                (true, true, Some(f)) => f(std::str::from_utf8(&c[..strlen(&c)]).ok().and_then(|s| s.chars().next()).unwrap_or(' ')),
+                _ => m.cell * pen.0,
+            };
+            if !first && x + cw > width {
+                break Some(q);
+            }
+            first = false;
+            x += cw + m.spacing * pen.1;
+        };
+        w.save = copy.save;
+        over
     }
 
     /// sub_148988: the line's last character (a byte offset), or `end` when the rest fits.
-    fn last_on_line(&self, lb: &LineBreak, start: usize, end: usize, width: f32, m: &Measure) -> usize {
+    fn last_on_line(&self, lb: &LineBreak, start: usize, end: usize, width: f32, m: &Measure, w: &mut Writer) -> usize {
         // with the rest in the width the line still ends at a mandatory break (UAX #14 class BK: a line feed,
         // a tag 12)
-        let Some(over) = self.overflow(start, end, width, m) else {
+        let Some(over) = self.overflow(start, end, width, m, w) else {
             return self.t[start..end].iter().position(|&b| b == 0x0A || b == 0x0C).map_or(end, |i| start + i);
         };
         let s = std::str::from_utf8(&self.t[start..end]).unwrap_or_default();
@@ -558,8 +591,9 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, base: f32, m:
     let mut out = Vec::new();
     let mut cut = 0;
     let (mut start, mut w, mut n) = (0, first, per_line(first, m));
+    let mut writer = Writer { pen: (1.0, 1.0, false), save: (1.0, 1.0, false), last: None };
     while start < end {
-        let mut brk = t.last_on_line(lb, start, end, w, m);
+        let mut brk = t.last_on_line(lb, start, end, w, m, &mut writer);
         if brk >= end {
             break;
         }
@@ -591,6 +625,7 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, base: f32, m:
                 } else {
                     (w, n) = (room, per_line(room, m));
                 }
+                writer.last = None;
                 start = brk + 1;
                 continue;
             }
@@ -627,6 +662,7 @@ pub fn breaks(lb: &LineBreak, text: &[u8], first: f32, width: f32, base: f32, m:
             out.push(p);
         }
         start = nl.unwrap_or_else(|| brk + char_len(t.at(brk)));
+        writer.last = None;
         (w, n) = (width, full);
     }
     Breaks { starts: out, cut }

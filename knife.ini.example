@@ -43,3 +43,7 @@ skip-intro = false
 
 ; Let every story movie be skipped, even unwatched ones the Switch plays through.
 skip-movies = false
+
+; Apply the Tsukihimates English patch's code changes (Japanese release only);
+; put their romfs in the mod assets folder.
+tsukimates = false

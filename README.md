@@ -72,6 +72,7 @@ development packages to build). An `ffmpeg` executable on the `PATH` is used as 
 | `-f`, `--fullscreen` | start in fullscreen |
 | `--skip-intro` | leave out the TYPE-MOON logo movie and the notice before the title |
 | `--skip-movies` | let every story movie be skipped, even the ones the Switch plays through the first time |
+| `--tsukimates` | apply the [Tsukihimates](https://github.com/Tsukihimates/Tsukihime-Translation) English patch's code changes (Japanese release; their romfs as the mod assets folder) |
 
 With `--text-websocket`, every client receives each message as plain text and each choice's options one per
 line; a client that connects late first gets the most recent text.

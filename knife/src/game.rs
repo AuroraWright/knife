@@ -5379,7 +5379,7 @@ impl Game {
         // message starts at the left a line up (sub_A80D0), and the tag moves the cursor to the slot's base x
         // (sub_A8190): the end cursor of the message before (+101024) + 2 units (0 before the page's first, so
         // short of the left edge, which makes it 0 and sub_C3710 the slot's x)
-        let indent = runs.iter().any(|r| matches!(r, text::Run::Indent));
+        let indent = runs.iter().any(|r| matches!(r, text::Run::Indent { .. }));
         // Tsukihime's line up from line 0 reads the line table's entry -1, the quake's frame count dword_AFECC8
         // (an int, read as a float about 0): the line's box top at the screen's top (Switch: a page's first
         // message with a 0x0C at y 19 of 1080, 157 px above line 0's). Witch on the Holy Night stays on line 0.
@@ -5602,7 +5602,7 @@ impl Game {
             // text half a glyph cell further, as the click icon's), a line up while F(847 + i) is below 32; from
             // the box's right edge on the left of the line after
             let (y, base) = match end_x {
-                Some(e) if runs.iter().any(|r| matches!(r, text::Run::Indent)) => {
+                Some(e) if runs.iter().any(|r| matches!(r, text::Run::Indent { .. })) => {
                     let x: f32 = e + 2.0 * UX + if english_cursor { lay.size * 0.5 } else { 0.0 };
                     if x >= lay.right {
                         (y + lay.line_height, lay.left)
