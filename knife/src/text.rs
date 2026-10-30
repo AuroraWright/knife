@@ -1759,10 +1759,14 @@ fn run_kind(c: char) -> Option<char> {
 
 /// Ruby scale (dword_3C9430[language]: Japanese 0.52, English 0.55, Chinese 0.51) of the text's glyph scale
 /// and spacing, and the ruby cursor's usual extra y (slot +101748 = -2 * H / 1080 from the slot init's
-/// +100924; `Layout::ruby_y`). Witch on the Holy Night's table (dword_2869F4) has Japanese at 0.45.
+/// +100924; `Layout::ruby_y`). Witch on the Holy Night's table (dword_2869F4) has Japanese at 0.45, and its
+/// sub_A7790 leaves the slot init's +52 (copied to +100924) at sub_BCDB0's default -2.4, which Tsukihime's (both
+/// builds) sets to -2 (`RUBY_Y_WITCH`; Switch, guest memory: Witch on the Holy Night's page slots' +100924 and
+/// +101756 both -2.4; its first ruby page's ふ over 触 exact, 0.4 px below -2's).
 const RUBY_SCALE: [f32; 5] = [0.52, 0.55, 0.51, 0.51, 0.45];
 const RUBY_SCALE_WITCH: [f32; 5] = [0.45, 0.55, 0.51, 0.51, 0.45];
 pub const RUBY_Y: f32 = -2.0;
+pub const RUBY_Y_WITCH: f32 = -2.4;
 
 /// Characters that must not start a line (kinsoku).
 fn no_line_start(c: char) -> bool {

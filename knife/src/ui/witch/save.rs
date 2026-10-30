@@ -904,7 +904,7 @@ impl Ui {
             a8: 6.0,
             bubble,
             z,
-            ruby_y: crate::text::RUBY_Y,
+            ruby_y: crate::text::RUBY_Y_WITCH,
         };
         let placed = game.witch_slot_layout(&d.preview, 84.667, pane_y + 33.185, slot);
         out.extend(game.witch_slot_quads(r, &placed, bubble || z.is_some(), &d.preview, 2, a));

@@ -178,7 +178,7 @@ pub const WITCH_LAYOUT: Layout = Layout {
     sx: 1.0,
     line_height: 0.0,
     ascent: ASCENT,
-    ruby_y: text::RUBY_Y,
+    ruby_y: text::RUBY_Y_WITCH,
 };
 /// Witch on the Holy Night in English: x 30, 556 units wide (sub_1AE20), and WoH's sub_A7790 also takes 0.9 of every
 /// English text slot's glyph size.
@@ -190,7 +190,7 @@ pub const WITCH_EN_LAYOUT: Layout = Layout {
     sx: 1.0,
     line_height: 0.0,
     ascent: ASCENT,
-    ruby_y: text::RUBY_Y,
+    ruby_y: text::RUBY_Y_WITCH,
 };
 /// The overseas build's message layout keeps the Japanese one for Japanese and Chinese; the docked game
 /// (sub_A59D0: the 1920x1080 display mode) never takes its handheld branch (box 46, 0.85 glyphs, 508 wide).
