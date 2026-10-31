@@ -1,6 +1,6 @@
 # Changes
 
-## 0.9.10 (unreleased)
+## 0.9.10 (2026-10-31)
 
 - The Japanese release follows the Switch's update 1.0.3, which brings it close to the overseas release:
   the system menu's new blur, choices laid out and touched as in 1.0.3, the save list's X to delete a save,
@@ -11,6 +11,10 @@
   places lines as their patched game does.
 - Fan translations display as on the Switch: form feeds, control codes in the text, accented letters
   built from parts in TrueType fonts, and the fonts' character maps and fallback glyph.
+- Control codes in the text move bars, break lines and switch fonts as on the Switch in all three builds.
+  In Witch on the Holy Night, bracket names such as `[heart]` stay plain text, and a code that stops the
+  Switch game stops knife with an error.
+- The bars of `[ber]` and `[zap]` sit a pixel lower, as on the Switch.
 - TrueType fonts are hinted by a port of the game's own interpreter, so their letters match the Switch's
   pixel for pixel.
 - English lines break over the whole message, so an italic word at the edge of the box moves to the next
@@ -22,6 +26,7 @@
   textures at their own size instead of scaled-up SD ones.
 - Some script commands in a few scenes of each game read garbled arguments; they now read the right ones.
 - Pressing down through the Japanese config's system tab no longer crashes.
+- The engine write-up covers the text processor: how a message's markup becomes tags, lines and glyphs.
 
 ## 0.9.9 (2026-10-28)
 
