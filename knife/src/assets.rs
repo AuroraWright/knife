@@ -83,9 +83,13 @@ struct Lookup {
     twins: Vec<(Arc<Archive>, Arc<Archive>)>,
 }
 
-/// How many of the latest cached images `Assets::trim_images` keeps unreferenced (prefetched ones waiting for
-/// their command).
+/// How many prefetched images `Assets::trim_images` keeps unreferenced while they wait for their command (the
+/// latest ones: a prefetch the script never reaches is let go once enough newer ones arrive).
 const FRESH_IMAGES: usize = 64;
+/// GPU memory the cached images may take before `Assets::trim_images` drops the unreferenced ones: Windows
+/// charges every texture to the process's committed memory, and without a budget a long session kept GBs of
+/// pictures shown once.
+const IMAGE_BUDGET: u64 = 512 << 20;
 /// How many prefetched images `Assets::finish_prefetched` uploads a frame.
 const UPLOADS_PER_FRAME: usize = 2;
 
@@ -138,7 +142,9 @@ pub struct Assets {
     images: HashMap<String, Option<Arc<Image>>>,
     /// the images `prefetch` is decoding, by cache key
     decoding: HashMap<String, Decoding>,
-    /// the most recently cached images, which `trim_images` keeps for the commands that asked ahead for them
+    /// prefetched images no command has taken yet, which `trim_images` keeps for the commands that asked ahead
+    /// for them (a taken one is held by its layer while shown: keeping every recent picture as well kept GBs of
+    /// story art)
     fresh: std::collections::VecDeque<String>,
     sounds: HashMap<String, Option<Arc<Pcm>>>,
     /// the sound effects `prefetch_sound` is decoding, by cache key
@@ -271,7 +277,12 @@ impl Assets {
         let scenes = SceneArchive::parse(&std::fs::read(roots.path("allscr.mrg")).context("reading allscr.mrg")?)?;
         let script_text = std::fs::read(roots.path("script_text.mrg")).context("reading script_text.mrg")?;
         let sar_name = if build == Build::Witch { "witch.bfsar" } else { "knife1.bfsar" };
-        let sar = SoundArchive::parse(std::fs::read(roots.path(sar_name)).with_context(|| format!("reading {sar_name}"))?)?;
+        let sar = {
+            let file = std::fs::File::open(roots.path(sar_name)).with_context(|| format!("opening {sar_name}"))?;
+            // SAFETY: the game files are read-only inputs and not modified while mapped (as the archives).
+            let map = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {sar_name}"))?;
+            SoundArchive::parse(map)?
+        };
         let allui = Arc::new(roots.archive(&w("allui"))?);
         let languages = Self::sysmes_file(&allui, build).map_or(1, |d| sysmes_u32(&d, 0).unwrap_or(1).max(1) as usize);
         let mut a = Self {
@@ -531,17 +542,22 @@ impl Assets {
     pub fn image_graded(&mut self, r: &Renderer, name: &str, bake: Bake) -> Option<Arc<Image>> {
         let (name, grade, key) = Self::image_key(name, bake);
         if let Some(i) = self.images.get(&key) {
-            return i.clone();
+            let i = i.clone();
+            // a prefetched image has reached its command
+            if let Some(at) = self.fresh.iter().position(|k| *k == key) {
+                self.fresh.remove(at);
+            }
+            return i;
         }
         // one already on its way: wait for it rather than read it again
         if let Some(d) = self.decoding.remove(&key)
             && d.strip == self.strip(&name)
             && let Ok(pixels) = d.pixels.recv()
         {
-            return self.finish_image(r, key, &name, pixels);
+            return self.finish_image(r, key, &name, pixels, false);
         }
         let pixels = Self::decode_pixels(&self.image_archives(), &name, grade, self.strip(&name));
-        self.finish_image(r, key, &name, pixels)
+        self.finish_image(r, key, &name, pixels, false)
     }
 
     /// Cache key of an image load: (upper-case name, effective bake, key).
@@ -607,12 +623,20 @@ impl Assets {
         for (k, name, strip, pixels) in done {
             // a language change while it decoded makes a language-strip image stale
             if strip == self.strip(&name) {
-                self.finish_image(r, k, &name, pixels);
+                self.finish_image(r, k, &name, pixels, true);
             }
         }
     }
 
-    fn finish_image(&mut self, r: &Renderer, key: String, name: &str, pixels: Result<Decoded>) -> Option<Arc<Image>> {
+    /// Upload and cache a decoded image; a `prefetched` one is kept for its command (`fresh`).
+    fn finish_image(
+        &mut self,
+        r: &Renderer,
+        key: String,
+        name: &str,
+        pixels: Result<Decoded>,
+        prefetched: bool,
+    ) -> Option<Arc<Image>> {
         let img = match pixels.and_then(|p| self.upload_pixels(r, name, p)) {
             Ok(i) => Some(Arc::new(i)),
             Err(e) => {
@@ -620,17 +644,22 @@ impl Assets {
                 None
             }
         };
-        self.fresh.push_back(key.clone());
-        if self.fresh.len() > FRESH_IMAGES {
-            self.fresh.pop_front();
+        if prefetched {
+            self.fresh.push_back(key.clone());
+            if self.fresh.len() > FRESH_IMAGES {
+                self.fresh.pop_front();
+            }
         }
         self.images.insert(key, img.clone());
         img
     }
 
-    /// Drop cached images nobody else references.
+    /// Drop cached images nobody else references (but the `FRESH_IMAGES` latest) once more than `keep` are
+    /// cached or they take more than `IMAGE_BUDGET`.
     pub fn trim_images(&mut self, keep: usize) {
-        if self.images.len() <= keep {
+        if self.images.len() <= keep
+            && self.images.values().flatten().map(|i| i.tex.bytes()).sum::<u64>() <= IMAGE_BUDGET
+        {
             return;
         }
         let fresh = &self.fresh;

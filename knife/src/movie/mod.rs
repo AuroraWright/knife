@@ -108,6 +108,8 @@ pub(crate) const H: u32 = 1080;
 pub struct Movie {
     child: Option<Child>,
     rx: mpsc::Receiver<Vec<u8>>,
+    /// the uploaded frames' buffers, for the decoder to reuse
+    pool: decoder::FramePool,
     pub tex: TexRef,
     fps: f32,
     elapsed: f32,
@@ -146,16 +148,17 @@ fn spawn_video(
     path: &Path,
     start: f32,
     fps: f32,
+    pool: &decoder::FramePool,
 ) -> Result<(Option<Child>, mpsc::Receiver<Vec<u8>>)> {
-    match decoder::spawn(path, start, fps) {
+    match decoder::spawn(path, start, fps, pool.clone()) {
         Ok(rx) => return Ok((None, rx)),
         Err(e) => tracing::warn!("platform movie decoder unavailable, trying ffmpeg: {e:#}"),
     }
-    let (child, rx) = spawn_ffmpeg(path, start)?;
+    let (child, rx) = spawn_ffmpeg(path, start, pool.clone())?;
     Ok((Some(child), rx))
 }
 
-fn spawn_ffmpeg(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
+fn spawn_ffmpeg(path: &Path, start: f32, pool: decoder::FramePool) -> Result<(Child, mpsc::Receiver<Vec<u8>>)> {
     let mut child = Command::new("ffmpeg")
         .args([
             "-v",
@@ -182,16 +185,16 @@ fn spawn_ffmpeg(path: &Path, start: f32) -> Result<(Child, mpsc::Receiver<Vec<u8
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(6);
     std::thread::spawn(move || {
-        // NV12 out of ffmpeg, converted like the platform decoder's frames (`decoder::nv12_to_rgba`)
+        // NV12 out of ffmpeg, converted like the platform decoder's frames (`decoder::nv12_to_rgba_into`)
         let size = (W * H) as usize;
+        let mut frame = decoder::Nv12Frame { y_plane: vec![0; size], uv_plane: vec![0; size / 2], width: W, height: H };
         loop {
-            let mut buf = vec![0u8; size * 3 / 2];
-            if stdout.read_exact(&mut buf).is_err() {
+            if stdout.read_exact(&mut frame.y_plane).and_then(|()| stdout.read_exact(&mut frame.uv_plane)).is_err() {
                 break;
             }
-            let uv_plane = buf.split_off(size);
-            let frame = decoder::Nv12Frame { y_plane: buf, uv_plane, width: W, height: H };
-            if tx.send(decoder::nv12_to_rgba(&frame)).is_err() {
+            let mut rgba = pool.take();
+            decoder::nv12_to_rgba_into(&frame, &mut rgba);
+            if tx.send(rgba).is_err() {
                 break;
             }
         }
@@ -219,10 +222,12 @@ pub fn decode_audio(path: &Path) -> Option<Pcm> {
 impl Movie {
     pub fn open(r: &Renderer, path: &Path, looping: bool) -> Result<Self> {
         let fps = track_fps(path);
-        let (child, rx) = spawn_video(path, 0.0, fps)?;
+        let pool = decoder::FramePool::default();
+        let (child, rx) = spawn_video(path, 0.0, fps, &pool)?;
         Ok(Self {
             child,
             rx,
+            pool,
             tex: r.create_writable(W, H, false, "movie"),
             fps,
             elapsed: 0.0,
@@ -283,7 +288,10 @@ impl Movie {
         while self.shown < due {
             match self.rx.try_recv() {
                 Ok(f) => {
-                    latest = Some(f);
+                    // a frame passed over to catch up goes straight back
+                    if let Some(skipped) = latest.replace(f) {
+                        self.pool.give(skipped);
+                    }
                     self.shown += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -295,7 +303,7 @@ impl Movie {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if self.looping {
-                        if let Ok((child, rx)) = spawn_video(&self.path, self.loop_start, self.fps)
+                        if let Ok((child, rx)) = spawn_video(&self.path, self.loop_start, self.fps, &self.pool)
                         {
                             self.kill();
                             self.child = child;
@@ -312,6 +320,7 @@ impl Movie {
         }
         if let Some(f) = latest {
             r.write_region(&self.tex, [0, 0, W, H], 4, &f);
+            self.pool.give(f);
             self.has_frame = true;
         }
     }
@@ -330,7 +339,7 @@ impl Movie {
         if self.finished {
             return;
         }
-        match spawn_video(&self.path, secs, self.fps) {
+        match spawn_video(&self.path, secs, self.fps, &self.pool) {
             Ok((child, rx)) => {
                 self.kill();
                 self.child = child;
@@ -369,8 +378,9 @@ mod tests {
         }
         for start in [0.0, 30.0] {
             let fps = super::track_fps(&path);
-            let ours = super::decoder::spawn(&path, start, fps).unwrap().recv().unwrap();
-            let (mut child, rx) = super::spawn_ffmpeg(&path, start).unwrap();
+            let pool = super::decoder::FramePool::default();
+            let ours = super::decoder::spawn(&path, start, fps, pool.clone()).unwrap().recv().unwrap();
+            let (mut child, rx) = super::spawn_ffmpeg(&path, start, pool).unwrap();
             let theirs = rx.recv().unwrap();
             let _ = child.kill();
             let diff = ours.iter().zip(&theirs).map(|(a, b)| u64::from(a.abs_diff(*b))).sum::<u64>() as f64

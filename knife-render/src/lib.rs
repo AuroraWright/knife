@@ -252,6 +252,21 @@ pub struct GpuTexture {
 }
 
 impl GpuTexture {
+    /// Bytes of GPU memory the texture's texels take (every mip level and layer).
+    pub fn bytes(&self) -> u64 {
+        let size = self.texture.size();
+        let format = self.texture.format();
+        let block = u64::from(format.block_copy_size(None).unwrap_or(4));
+        let (bw, bh) = format.block_dimensions();
+        (0..self.texture.mip_level_count())
+            .map(|level| {
+                let w = (size.width >> level).max(1).div_ceil(bw);
+                let h = (size.height >> level).max(1).div_ceil(bh);
+                u64::from(w) * u64::from(h) * u64::from(size.depth_or_array_layers) * block
+            })
+            .sum()
+    }
+
     /// UV coordinates of the bottom-right corner of the logical image (block-compressed
     /// textures are padded to whole blocks).
     pub fn uv_max(&self) -> [f32; 2] {
@@ -427,9 +442,12 @@ pub enum Upload<'a> {
 
 impl Renderer {
     pub fn new(window: Arc<impl wgpu::DisplayAndWindowHandle + 'static>, width: u32, height: u32) -> Result<Self> {
+        let defaults = wgpu::InstanceDescriptor::new_without_display_handle();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             flags: wgpu::InstanceFlags::default(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
+            // WGPU_BACKEND (e.g. `dx12`, `vulkan`, `metal`) picks the graphics API, as in other wgpu programs
+            backends: defaults.backends.with_env(),
+            ..defaults
         });
         let surface = instance.create_surface(window).context("creating surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

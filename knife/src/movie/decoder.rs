@@ -9,7 +9,7 @@ use tracing::debug;
 
 use super::{
     bitstream::Mp4BitstreamConverter,
-    mp4::{Mp4, presentation_times, sync_samples},
+    mp4::{Mp4, TrackReader, presentation_times, sync_samples},
 };
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -63,21 +63,54 @@ pub struct Packet<'a> {
     pub duration: u32,
 }
 
+/// RGBA frame buffers the player hands back once uploaded, for the decoder to convert the next frames into: a
+/// 1920x1080 frame is 8 MB, which a fresh allocation would fault in page by page 30 times a second.
+#[derive(Clone, Default)]
+pub struct FramePool(std::sync::Arc<parking_lot::Mutex<Vec<Vec<u8>>>>);
+
+impl FramePool {
+    /// Buffers kept: the frame channel's 6 and a couple in flight
+    const KEEP: usize = 8;
+
+    pub fn take(&self) -> Vec<u8> {
+        self.0.lock().pop().unwrap_or_default()
+    }
+
+    pub fn give(&self, buffer: Vec<u8>) {
+        let mut pool = self.0.lock();
+        if pool.len() < Self::KEEP {
+            pool.push(buffer);
+        }
+    }
+}
+
 /// Where a decoder delivers its frames, in presentation order.
 pub struct Output {
     frames: mpsc::SyncSender<Vec<u8>>,
+    pool: FramePool,
+    /// the planes of the frame emitted last, for the decoder to copy the next one into (`spare_planes`)
+    spare: Option<Nv12Frame>,
     /// frames still to drop before the start position
     skip: u32,
+    /// frames delivered past the start position (a software decoder taking over skips them again)
+    delivered: u32,
     closed: bool,
 }
 
 impl Output {
+    /// The luma and chroma buffers of the frame emitted last (empty before the first), to fill with the next.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn spare_planes(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.spare.take().map(|f| (f.y_plane, f.uv_plane)).unwrap_or_default()
+    }
+
     pub fn emit(&mut self, frame: Nv12Frame) {
         if self.closed {
             return;
         }
         if self.skip > 0 {
             self.skip -= 1;
+            self.spare = Some(frame);
             return;
         }
         if (frame.width, frame.height) != (super::W, super::H) {
@@ -90,7 +123,11 @@ impl Output {
             );
             return;
         }
-        if self.frames.send(nv12_to_rgba(&frame)).is_err() {
+        self.delivered += 1;
+        let mut rgba = self.pool.take();
+        nv12_to_rgba_into(&frame, &mut rgba);
+        self.spare = Some(frame);
+        if self.frames.send(rgba).is_err() {
             debug!("movie consumer closed the frame channel");
             self.closed = true;
         }
@@ -104,21 +141,66 @@ pub trait FrameDecoder: Sized {
     fn decode(&mut self, packet: &Packet, output: &mut Output) -> Result<()>;
     /// Emit every remaining frame after the last packet.
     fn finish(&mut self, output: &mut Output) -> Result<()>;
+    /// The decoder runs on the GPU and has a software one (`software`) to fall back to when it fails.
+    fn hardware(&self) -> bool {
+        false
+    }
+    /// A decoder that does not use the GPU.
+    fn software(info: &StreamInfo) -> Result<Self> {
+        Self::new(info)
+    }
+}
+
+/// Decode `video` from where it stands to its end into `output`.
+fn run<D: FrameDecoder>(
+    decoder: &mut D,
+    video: &mut TrackReader,
+    converter: &mut Mp4BitstreamConverter,
+    output: &mut Output,
+) -> Result<()> {
+    let mut annex_b = Vec::new();
+    while let Some(sample) = video.next_sample()? {
+        converter.convert_packet(&sample.bytes, &mut annex_b)?;
+        let packet = Packet {
+            avcc: &sample.bytes,
+            annex_b: &annex_b,
+            decode_time: sample.start_time,
+            presentation_time: sample.start_time as i64 + i64::from(sample.rendering_offset),
+            duration: sample.duration,
+        };
+        decoder.decode(&packet, output)?;
+        if output.closed {
+            return Ok(());
+        }
+    }
+    decoder.finish(output)
 }
 
 /// Copy a plane of `rows` rows of `width` bytes from rows `stride` bytes apart.
 ///
 /// # Safety
 /// `source` must be readable for `stride * (rows - 1) + width` bytes.
+#[cfg_attr(windows, allow(dead_code))]
 pub unsafe fn copy_plane(source: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
-    let mut plane = Vec::with_capacity(width * rows);
+    let mut plane = Vec::new();
+    // SAFETY: guaranteed by the caller.
+    unsafe { copy_plane_into(&mut plane, source, stride, width, rows) };
+    plane
+}
+
+/// `copy_plane` into `plane`, replacing its contents and keeping its allocation.
+///
+/// # Safety
+/// As `copy_plane`.
+pub unsafe fn copy_plane_into(plane: &mut Vec<u8>, source: *const u8, stride: usize, width: usize, rows: usize) {
+    plane.clear();
+    plane.reserve(width * rows);
     for row in 0..rows {
         // SAFETY: guaranteed by the caller.
         plane.extend_from_slice(unsafe {
             std::slice::from_raw_parts(source.add(row * stride), width)
         });
     }
-    plane
 }
 
 /// NV12 to RGBA as the Switch shows its movies: BT.601 video range in 8-bit integer coefficients, (298 Y' +
@@ -126,7 +208,87 @@ pub unsafe fn copy_plane(source: *const u8, stride: usize, width: usize, rows: u
 /// movies are tagged BT.709; an Astris capture of the titlebg4 title fits this at 0.78 mean abs, float BT.601
 /// rounded at 0.98, BT.709 at 1.5 and more). The chroma plane is sampled bilinearly with centred siting, as a
 /// linear texture lookup of the half-size plane would.
-pub fn nv12_to_rgba(f: &Nv12Frame) -> Vec<u8> {
+///
+/// The RGBA goes into `out`, resized to fit: a buffer of an earlier frame is reused without being faulted in
+/// again page by page.
+pub fn nv12_to_rgba_into(f: &Nv12Frame, out: &mut Vec<u8>) {
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(1, 8);
+    nv12_to_rgba_bands(f, out, threads);
+}
+
+/// `nv12_to_rgba_into` over `threads` bands of rows.
+fn nv12_to_rgba_bands(f: &Nv12Frame, out: &mut Vec<u8>, threads: usize) {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let ch = h / 2;
+    assert!(w >= 2 && w.is_multiple_of(2) && h.is_multiple_of(2), "odd movie frame size {w}x{h}");
+    out.resize(w * h * 4, 0);
+    // per 256, with chroma in sixteenths
+    const KY: i32 = 298 * 16;
+    const KRV: i32 = 409;
+    const KGU: i32 = -100;
+    const KGV: i32 = -208;
+    const KBU: i32 = 516;
+    let band = h.div_ceil(threads.max(1)).next_multiple_of(2);
+    std::thread::scope(|s| {
+        for (bi, chunk) in out.chunks_mut(band * w * 4).enumerate() {
+            s.spawn(move || {
+                // The bilinear tap's 9 / 3 / 3 / 1 sixteenths, taken in two passes: the chroma rows blended
+                // vertically, 3 * nearer + farther (Cb, Cr interleaved, with a column of padding each side that
+                // repeats the edge column), then 3 * nearer + farther column of that. An even output coordinate's
+                // farther row or column is the one before, an odd one's the one after, clamped to the plane.
+                let mut blend = vec![0i32; w + 4];
+                // the chroma terms of each output pixel's red, green and blue
+                let (mut rc, mut gc, mut bc) = (vec![0i32; w], vec![0i32; w], vec![0i32; w]);
+                let y0 = bi * band;
+                for (ry, row) in chunk.chunks_exact_mut(w * 4).enumerate() {
+                    let y = y0 + ry;
+                    let cy = y / 2;
+                    let oy = if y.is_multiple_of(2) { cy.saturating_sub(1) } else { (cy + 1).min(ch - 1) };
+                    let r0 = &f.uv_plane[cy * w..cy * w + w];
+                    let r1 = &f.uv_plane[oy * w..oy * w + w];
+                    for ((b, &n), &o) in blend[2..w + 2].iter_mut().zip(r0).zip(r1) {
+                        *b = 3 * i32::from(n) + i32::from(o);
+                    }
+                    blend.copy_within(2..4, 0);
+                    blend.copy_within(w..w + 2, w + 2);
+                    let columns = blend[0..w]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(blend[2..w + 2].as_chunks::<2>().0)
+                        .zip(blend[4..w + 4].as_chunks::<2>().0);
+                    let terms = rc.as_chunks_mut::<2>().0.iter_mut()
+                        .zip(gc.as_chunks_mut::<2>().0)
+                        .zip(bc.as_chunks_mut::<2>().0);
+                    for (((before, here), after), ((r, g), b)) in columns.zip(terms) {
+                        // chroma scaled by 16, centred; [0] the even pixel's, [1] the odd one's
+                        let u = [3 * here[0] + before[0] - 128 * 16, 3 * here[0] + after[0] - 128 * 16];
+                        let v = [3 * here[1] + before[1] - 128 * 16, 3 * here[1] + after[1] - 128 * 16];
+                        for i in 0..2 {
+                            r[i] = KRV * v[i];
+                            g[i] = KGU * u[i] + KGV * v[i];
+                            b[i] = KBU * u[i];
+                        }
+                    }
+                    let luma = &f.y_plane[y * w..y * w + w];
+                    let pixels = row.as_chunks_mut::<4>().0.iter_mut().zip(luma).zip(rc.iter().zip(&gc).zip(&bc));
+                    for ((px, &l), ((&r, &g), &b)) in pixels {
+                        let yy = (i32::from(l) - 16) * KY;
+                        let channel = |c: i32| ((yy + c) >> 12).clamp(0, 255) as u32;
+                        // one store per pixel, which LLVM vectorizes (four byte stores it does not)
+                        let rgba = channel(r) | channel(g) << 8 | channel(b) << 16 | 0xFF00_0000;
+                        *px = rgba.to_le_bytes();
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+fn nv12_to_rgba_reference(f: &Nv12Frame) -> Vec<u8> {
     let (w, h) = (f.width as usize, f.height as usize);
     let (cw, ch) = (w / 2, h / 2);
     let mut out = vec![0u8; w * h * 4];
@@ -190,7 +352,18 @@ pub fn nv12_to_rgba(f: &Nv12Frame) -> Vec<u8> {
 
 /// Start decoding `path` from `start` seconds on a worker thread with the platform decoder: RGBA frames from
 /// that position on, in presentation order. Decoding begins at the last sync sample at or before it.
-pub fn spawn(path: &Path, start: f32, fps: f32) -> Result<mpsc::Receiver<Vec<u8>>> {
+pub fn spawn(path: &Path, start: f32, fps: f32, pool: FramePool) -> Result<mpsc::Receiver<Vec<u8>>> {
+    spawn_with(path, start, fps, pool, platform::Decoder::new)
+}
+
+/// `spawn` with the decoder `create` makes.
+fn spawn_with(
+    path: &Path,
+    start: f32,
+    fps: f32,
+    pool: FramePool,
+    create: fn(&StreamInfo) -> Result<platform::Decoder>,
+) -> Result<mpsc::Receiver<Vec<u8>>> {
     let mut mp4 = Mp4::open(path)?;
     let track = &mut mp4.video;
     let converter = track
@@ -228,7 +401,7 @@ pub fn spawn(path: &Path, start: f32, fps: f32) -> Result<mpsc::Receiver<Vec<u8>
     std::thread::Builder::new()
         .name(format!("movie decoder ({})", platform::Decoder::NAME))
         .spawn(move || {
-            let mut decoder = match platform::Decoder::new(&info) {
+            let mut decoder = match create(&info) {
                 Ok(d) => {
                     let _ = ready_tx.send(Ok(()));
                     d
@@ -240,28 +413,26 @@ pub fn spawn(path: &Path, start: f32, fps: f32) -> Result<mpsc::Receiver<Vec<u8>
             };
             let mut output = Output {
                 frames: frames_tx,
+                pool,
+                spare: None,
                 skip,
+                delivered: 0,
                 closed: false,
             };
-            let mut annex_b = Vec::new();
-            let result = (|| -> Result<()> {
-                while let Some(sample) = video.next_sample()? {
-                    converter.convert_packet(&sample.bytes, &mut annex_b)?;
-                    let packet = Packet {
-                        avcc: &sample.bytes,
-                        annex_b: &annex_b,
-                        decode_time: sample.start_time,
-                        presentation_time: sample.start_time as i64
-                            + i64::from(sample.rendering_offset),
-                        duration: sample.duration,
-                    };
-                    decoder.decode(&packet, &mut output)?;
-                    if output.closed {
-                        return Ok(());
-                    }
-                }
-                decoder.finish(&mut output)
-            })();
+            let mut result = run(&mut decoder, &mut video, &mut converter, &mut output);
+            // a GPU decoder that fails hands over to the software one, which decodes again from the same sync
+            // sample and passes over the frames already delivered
+            if let Err(e) = &result
+                && decoder.hardware()
+            {
+                tracing::warn!("{} hardware decoding failed, decoding in software: {e:#}", platform::Decoder::NAME);
+                result = platform::Decoder::software(&info).and_then(|mut software| {
+                    video.seek(first);
+                    output.skip = skip + output.delivered;
+                    output.delivered = 0;
+                    run(&mut software, &mut video, &mut converter, &mut output)
+                });
+            }
             if let Err(e) = result {
                 tracing::warn!("{}: {e:#}", platform::Decoder::NAME);
             }
@@ -271,4 +442,65 @@ pub fn spawn(path: &Path, start: f32, fps: f32) -> Result<mpsc::Receiver<Vec<u8>
         .recv()
         .map_err(|_| anyhow!("{} failed to start", platform::Decoder::NAME))??;
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameDecoder, FramePool, platform};
+
+    /// The hardware decoder's frames are the software decoder's, from the start and after a seek (needs
+    /// switch_romfs, or a movie in KNIFE_TEST_MOVIE).
+    #[test]
+    fn hardware_frames_match_software() {
+        let path = std::env::var_os("KNIFE_TEST_MOVIE").map_or_else(
+            || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../switch_romfs/movie/titlebg1.mp4"),
+            std::path::PathBuf::from,
+        );
+        if !path.exists() {
+            return;
+        }
+        let fps = 30.0;
+        for start in [0.0, 30.0] {
+            let frames = |create, label| {
+                let rx = super::spawn_with(&path, start, fps, FramePool::default(), create).unwrap();
+                let t = std::time::Instant::now();
+                let frames: Vec<Vec<u8>> = rx.iter().take(90).collect();
+                eprintln!("start {start}: {label} {} frames in {:.2} s", frames.len(), t.elapsed().as_secs_f64());
+                frames
+            };
+            let hardware = frames(
+                |info| {
+                    let decoder = platform::Decoder::new(info)?;
+                    eprintln!("default decoder on the GPU: {}", decoder.hardware());
+                    Ok(decoder)
+                },
+                "default",
+            );
+            let software = frames(platform::Decoder::software, "software");
+            assert_eq!(hardware.len(), software.len());
+            for (i, (h, s)) in hardware.iter().zip(&software).enumerate() {
+                assert!(h == s, "start {start}: frame {i} differs");
+            }
+        }
+    }
+
+    /// The row-blended conversion gives the per-pixel bilinear tap's bytes exactly.
+    #[test]
+    fn nv12_to_rgba_matches_reference() {
+        let (w, h) = (1920usize, 1080usize);
+        // a fixed pseudo-random frame, so every channel and clamp is exercised
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        };
+        let y_plane = (0..w * h).map(|_| next()).collect();
+        let uv_plane = (0..w * h / 2).map(|_| next()).collect();
+        let frame = super::Nv12Frame { y_plane, uv_plane, width: w as u32, height: h as u32 };
+        let mut out = Vec::new();
+        super::nv12_to_rgba_into(&frame, &mut out);
+        assert!(out == super::nv12_to_rgba_reference(&frame));
+    }
 }

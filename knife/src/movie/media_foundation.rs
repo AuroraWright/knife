@@ -1,13 +1,26 @@
 //! Decodes H.264 with the Media Foundation decoder that ships with Windows.
 //! Windows "N" editions only have it with the Media Feature Pack installed.
+//!
+//! The decoder runs on the GPU's video engine (DXVA, through a Direct3D 11 device) when it can, else on the
+//! CPU. Either way the frames are read back as NV12: H.264 decoding is exact, so both give the same pixels.
 
 use std::{mem::ManuallyDrop, ptr};
 
 use anyhow::{Context, Result, bail, ensure};
 use windows::{
     Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::{
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
+                ID3D11Multithread,
+            },
+            Dxgi::IDXGIAdapter,
+        },
         Media::MediaFoundation::{
-            CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFMediaBuffer, IMFSample, IMFTransform,
+            CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFSample, IMFTransform,
+            MF_SA_D3D11_AWARE, MFCreateDXGIDeviceManager, MFT_MESSAGE_SET_D3D_MANAGER,
             MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
             MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
             MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
@@ -26,7 +39,7 @@ use windows::{
     core::Interface,
 };
 
-use super::{FrameDecoder, Nv12Frame, Output, Packet, StreamInfo, copy_plane};
+use super::{FrameDecoder, Nv12Frame, Output, Packet, StreamInfo, copy_plane_into};
 
 /// COM and Media Foundation initialization for the decoder thread.
 struct Runtime {
@@ -78,13 +91,56 @@ struct Layout {
     stride: usize,
 }
 
+/// The Direct3D 11 device a hardware decoder decodes on, kept alive as long as the transform.
+struct Acceleration {
+    _manager: IMFDXGIDeviceManager,
+    _device: ID3D11Device,
+}
+
+impl Acceleration {
+    /// Give `transform` a Direct3D 11 video device, which makes it decode with DXVA.
+    fn attach(transform: &IMFTransform) -> Result<Self> {
+        // SAFETY: COM calls on objects created here and on a valid transform.
+        unsafe {
+            let aware = transform.GetAttributes()?.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0);
+            ensure!(aware != 0, "The decoder cannot use Direct3D 11");
+            let mut device = None;
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .context("Creating a Direct3D 11 video device")?;
+            let device = device.context("Direct3D 11 returned no device")?;
+            // the decoder uses the device from threads of its own
+            let _ = device.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
+            let mut token = 0;
+            let mut manager = None;
+            MFCreateDXGIDeviceManager(&mut token, &mut manager).context("Creating a DXGI device manager")?;
+            let manager = manager.context("Media Foundation returned no device manager")?;
+            manager.ResetDevice(&device, token)?;
+            transform
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                .context("Handing the device to the decoder")?;
+            Ok(Self { _manager: manager, _device: device })
+        }
+    }
+}
+
 pub struct Decoder {
     transform: IMFTransform,
     layout: Layout,
     provides_samples: bool,
     output_size: u32,
     timescale: u64,
-    // Declared last so it is dropped after the transform.
+    // Declared after the transform so they are dropped after it.
+    acceleration: Option<Acceleration>,
     _runtime: Runtime,
 }
 
@@ -162,9 +218,10 @@ impl Decoder {
         Ok(())
     }
 
-    /// Copy the visible area of a decoded NV12 sample into packed planes.
-    fn copy(&self, sample: &IMFSample) -> Result<Nv12Frame> {
+    /// Copy the visible area of a decoded NV12 sample into packed planes (the buffers of `output`'s last frame).
+    fn copy(&self, sample: &IMFSample, output: &mut Output) -> Result<Nv12Frame> {
         let layout = &self.layout;
+        let (mut y_plane, mut uv_plane) = output.spare_planes();
         // SAFETY: COM calls on a valid sample; the buffer is locked while read.
         unsafe {
             let buffer: IMFMediaBuffer = sample.ConvertToContiguousBuffer()?;
@@ -197,13 +254,15 @@ impl Decoder {
                         "Decoded frame buffer is too small"
                     );
                 }
-                let y_plane = copy_plane(
+                copy_plane_into(
+                    &mut y_plane,
                     base.add(stride * layout.y + layout.x),
                     stride,
                     layout.width,
                     layout.height,
                 );
-                let uv_plane = copy_plane(
+                copy_plane_into(
+                    &mut uv_plane,
                     chroma.add(stride * (layout.y / 2) + layout.x),
                     stride,
                     layout.width,
@@ -252,7 +311,8 @@ impl Decoder {
             match result {
                 Ok(()) => {
                     let sample = sample.context("The decoder produced no frame")?;
-                    output.emit(self.copy(&sample)?);
+                    let frame = self.copy(&sample, output)?;
+                    output.emit(frame);
                 }
                 Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
                 Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -264,10 +324,9 @@ impl Decoder {
     }
 }
 
-impl FrameDecoder for Decoder {
-    const NAME: &'static str = "Media Foundation";
-
-    fn new(info: &StreamInfo) -> Result<Self> {
+impl Decoder {
+    /// A decoder on the GPU (`hardware`) or the CPU.
+    fn create(info: &StreamInfo, hardware: bool) -> Result<Self> {
         let runtime = Runtime::start()?;
         // SAFETY: COM calls on objects created here.
         let transform: IMFTransform = unsafe {
@@ -276,6 +335,7 @@ impl FrameDecoder for Decoder {
                  (Windows N editions need the Media Feature Pack)",
             )?
         };
+        let acceleration = if hardware { Some(Acceleration::attach(&transform)?) } else { None };
         // SAFETY: as above.
         unsafe {
             let input = MFCreateMediaType()?;
@@ -296,6 +356,7 @@ impl FrameDecoder for Decoder {
             provides_samples: false,
             output_size: 0,
             timescale: u64::from(info.timescale).max(1),
+            acceleration,
             _runtime: runtime,
         };
         decoder.select_output()?;
@@ -309,6 +370,25 @@ impl FrameDecoder for Decoder {
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
         Ok(decoder)
+    }
+}
+
+impl FrameDecoder for Decoder {
+    const NAME: &'static str = "Media Foundation";
+
+    fn new(info: &StreamInfo) -> Result<Self> {
+        Self::create(info, true).or_else(|e| {
+            tracing::info!("Media Foundation hardware decoding unavailable, decoding in software: {e:#}");
+            Self::software(info)
+        })
+    }
+
+    fn hardware(&self) -> bool {
+        self.acceleration.is_some()
+    }
+
+    fn software(info: &StreamInfo) -> Result<Self> {
+        Self::create(info, false)
     }
 
     fn decode(&mut self, packet: &Packet, output: &mut Output) -> Result<()> {

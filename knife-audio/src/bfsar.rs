@@ -59,7 +59,9 @@ pub struct StreamSound {
 }
 
 pub struct SoundArchive {
-    data: Vec<u8>,
+    /// The whole archive: a `Vec` or a memory map of the file (the archive is hundreds of MB, of which a sound
+    /// reads a few KB)
+    data: Box<dyn std::ops::Deref<Target = [u8]> + Send + Sync>,
     names: HashMap<String, u32>,
     info: usize,
     file_body: usize,
@@ -69,7 +71,7 @@ pub struct SoundArchive {
 }
 
 impl SoundArchive {
-    pub fn parse(data: Vec<u8>) -> Result<Self> {
+    pub fn parse(data: impl std::ops::Deref<Target = [u8]> + Send + Sync + 'static) -> Result<Self> {
         let secs = sections(&data, b"FSAR")?;
         let (strg, _) = *secs.get(&0x2000).context("no STRG")?;
         let (info, _) = *secs.get(&0x2001).context("no INFO")?;
@@ -115,7 +117,7 @@ impl SoundArchive {
         let warcs = ref_table(&data, refs(0x2103)?)?;
         let files = ref_table(&data, refs(0x2106)?)?;
         Ok(Self {
-            data,
+            data: Box::new(data),
             names,
             info,
             file_body: file + 8,
