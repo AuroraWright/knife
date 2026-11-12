@@ -5,7 +5,7 @@
 //! in `\r\n`. `.mrg`: raw data, 0x800-byte sectors. Archives without a `.nam`
 //! (e.g. `parts`) are indexed by number only.
 
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -39,10 +39,7 @@ impl Archive {
         let hed = std::fs::read(path(&format!("{base}.hed")))
             .with_context(|| format!("reading {base}.hed"))?;
         let nam = std::fs::read(path(&format!("{base}.nam"))).ok();
-        let file = File::open(path(&format!("{base}.mrg")))
-            .with_context(|| format!("opening {base}.mrg"))?;
-        // SAFETY: the game files are read-only inputs and not modified while mapped.
-        let mrg = unsafe { Mmap::map(&file)? };
+        let mrg = super::map(&path(&format!("{base}.mrg"))).with_context(|| format!("mapping {base}.mrg"))?;
 
         let mut entries = Vec::new();
         for (i, e) in hed.as_chunks::<8>().0.iter().enumerate() {

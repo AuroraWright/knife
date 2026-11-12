@@ -142,7 +142,7 @@ fn main() -> Result<()> {
             println!("commands {cmds}, messages {msgs}, labels {labels}");
         }
         Cmd::Streams => {
-            let sar = knife_audio::bfsar::SoundArchive::parse(std::fs::read(cli.romfs.join("knife1.bfsar"))?)?;
+            let sar = knife_audio::bfsar::SoundArchive::parse(knife_core::format::map(&cli.romfs.join("knife1.bfsar"))?)?;
             for i in 0..sar.sound_count() {
                 if let Ok(s) = sar.stream_sound(i) { println!("{i:5} {:?}", s) }
             }
@@ -151,7 +151,7 @@ fn main() -> Result<()> {
             let pcm = if name.ends_with(".opus") {
                 knife_audio::codec::decode_nopus(&std::fs::read(cli.romfs.join("stream").join(&name))?)?
             } else {
-                let sar = knife_audio::bfsar::SoundArchive::parse(std::fs::read(cli.romfs.join("knife1.bfsar"))?)?;
+                let sar = knife_audio::bfsar::SoundArchive::parse(knife_core::format::map(&cli.romfs.join("knife1.bfsar"))?)?;
                 sar.load_wave_sound(&name)?
             };
             println!("{} Hz, {} frames, loop {:?}", pcm.sample_rate, pcm.frames.len(), pcm.loop_range);
