@@ -33,7 +33,17 @@ use super::{FrameDecoder, Nv12Frame, Output, Packet, StreamInfo, copy_plane};
 /// earlier frame is missing (more than the H.264 maximum of 16 references).
 const MAX_REORDER: usize = 17;
 
-type Decoded = BTreeMap<i64, Result<Nv12Frame>>;
+/// Spare plane buffers kept for the output callback.
+const SPARES: usize = 2;
+
+/// What the output callback fills.
+#[derive(Default)]
+struct Decoded {
+    /// decoded frames by presentation time
+    frames: BTreeMap<i64, Result<Nv12Frame>>,
+    /// the planes of emitted frames, for the callback to copy the next ones into (`Output::spare_planes`)
+    spares: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 pub struct Decoder {
     session: CFRetained<VTDecompressionSession>,
@@ -51,8 +61,8 @@ fn check(status: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy a locked NV12 pixel buffer into tightly packed planes.
-fn copy_frame(image: &CVImageBuffer) -> Result<Nv12Frame> {
+/// Copy a locked NV12 pixel buffer into tightly packed planes, reusing the buffers of `planes`.
+fn copy_frame(image: &CVImageBuffer, (mut y_plane, mut uv_plane): (Vec<u8>, Vec<u8>)) -> Result<Nv12Frame> {
     ensure!(
         CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
         "Decoder returned an unexpected pixel format"
@@ -64,21 +74,22 @@ fn copy_frame(image: &CVImageBuffer) -> Result<Nv12Frame> {
     )?;
     let width = CVPixelBufferGetWidthOfPlane(image, 0);
     let height = CVPixelBufferGetHeightOfPlane(image, 0);
-    let planes = (0..2).map(|plane| {
+    let readable = [(0, &mut y_plane), (1, &mut uv_plane)].into_iter().all(|(plane, out)| {
         let base = CVPixelBufferGetBaseAddressOfPlane(image, plane);
         let stride = CVPixelBufferGetBytesPerRowOfPlane(image, plane);
         let rows = CVPixelBufferGetHeightOfPlane(image, plane);
         // The chroma plane interleaves Cb and Cr, so its rows are as many
         // bytes wide as the luma plane's.
-        (!base.is_null() && stride >= width)
+        let readable = !base.is_null() && stride >= width;
+        if readable {
             // SAFETY: the plane is locked and holds `rows` rows `stride` apart.
-            .then(|| unsafe { copy_plane(base.cast(), stride, width, rows) })
+            unsafe { copy_plane(out, base.cast(), stride, width, rows) };
+        }
+        readable
     });
-    let planes: Option<Vec<_>> = planes.collect();
     // SAFETY: balanced with the lock above.
     unsafe { CVPixelBufferUnlockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) };
-    let [y_plane, uv_plane] =
-        <[Vec<u8>; 2]>::try_from(planes.context("Decoder returned an unreadable frame")?).unwrap();
+    ensure!(readable, "Decoder returned an unreadable frame");
     ensure!(
         uv_plane.len() == width * height / 2,
         "Decoder returned an unexpected chroma plane size"
@@ -102,13 +113,13 @@ unsafe extern "C-unwind" fn output_callback(
 ) {
     // SAFETY: the session was created with a pointer to the decoder's
     // `decoded` cell, which outlives the session, and decoding is synchronous.
-    let decoded = unsafe { &*decoded.cast::<RefCell<Decoded>>() };
+    let mut decoded = unsafe { &*decoded.cast::<RefCell<Decoded>>() }.borrow_mut();
     let frame = match (status, unsafe { image.as_ref() }) {
-        (0, Some(image)) => copy_frame(image),
+        (0, Some(image)) => copy_frame(image, decoded.spares.pop().unwrap_or_default()),
         (0, None) => Err(anyhow!("Decoder dropped a frame")),
         (status, _) => Err(anyhow!("Decoder decoding failed (OSStatus {status})")),
     };
-    decoded.borrow_mut().insert(presentation_time.value, frame);
+    decoded.frames.insert(presentation_time.value, frame);
 }
 
 impl Decoder {
@@ -116,12 +127,12 @@ impl Decoder {
     fn release(&mut self, output: &mut Output, flush: bool) -> Result<()> {
         loop {
             let mut decoded = self.decoded.borrow_mut();
-            let Some(&first) = decoded.keys().next() else {
+            let Some(&first) = decoded.frames.keys().next() else {
                 return Ok(());
             };
             let expected = self.presentation_order.get(self.next).copied();
-            let frame = if expected == Some(first) || flush || decoded.len() > MAX_REORDER {
-                decoded.remove(&first).unwrap()
+            let frame = if expected == Some(first) || flush || decoded.frames.len() > MAX_REORDER {
+                decoded.frames.remove(&first).unwrap()
             } else {
                 return Ok(());
             };
@@ -135,6 +146,11 @@ impl Decoder {
                 self.next += 1;
             }
             output.emit(frame?);
+            let mut decoded = self.decoded.borrow_mut();
+            if decoded.spares.len() < SPARES {
+                let spare = output.spare_planes();
+                decoded.spares.push(spare);
+            }
         }
     }
 }
@@ -176,7 +192,7 @@ impl FrameDecoder for Decoder {
             CFNumber::new_i32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange as i32);
         let attributes = CFDictionary::<CFString, CFNumber>::from_slices(&[key], &[&pixel_format]);
 
-        let decoded = Box::new(RefCell::new(Decoded::new()));
+        let decoded = Box::new(RefCell::new(Decoded::default()));
         let callback = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(output_callback),
             decompressionOutputRefCon: ptr::from_ref(&*decoded).cast_mut().cast(),

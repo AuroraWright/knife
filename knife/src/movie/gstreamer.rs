@@ -73,7 +73,9 @@ impl Decoder {
         let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
             .map_err(|_| anyhow!("Mapping a decoded frame"))?;
         let (width, height) = (info.width() as usize, info.height() as usize);
-        let mut planes = [0, 1].into_iter().map(|plane| -> Result<Vec<u8>> {
+        // into the buffers of the frame emitted last
+        let (mut y_plane, mut uv_plane) = output.spare_planes();
+        for (plane, out) in [(0, &mut y_plane), (1, &mut uv_plane)] {
             let data = frame.plane_data(plane).context("Reading a decoded plane")?;
             let stride = usize::try_from(frame.info().stride()[plane as usize])
                 .context("Bottom-up Decoder frames are not supported")?;
@@ -87,10 +89,8 @@ impl Decoder {
                 "Decoded plane is too small"
             );
             // SAFETY: checked above that the plane holds `rows` rows of `width` bytes.
-            Ok(unsafe { copy_plane(data.as_ptr(), stride, width, rows) })
-        });
-        let y_plane = planes.next().unwrap()?;
-        let uv_plane = planes.next().unwrap()?;
+            unsafe { copy_plane(out, data.as_ptr(), stride, width, rows) };
+        }
         output.emit(Nv12Frame {
             y_plane,
             uv_plane,

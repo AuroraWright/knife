@@ -3185,7 +3185,7 @@ impl Game {
             // SPFC(layer, image, snx2, snx3, va, vb, stec, color): effect/texture precache
             "SPFC" => {
                 if let Some(name) = c.args.get(1).filter(|n| !n.is_empty()) {
-                    let _ = self.assets.image(r, name);
+                    self.assets.precache(r, name);
                 }
             }
             // SPRD(layer, image, a0, b0, a1, b1) (0x7e214): precaches image_AA_BB for a in {a0, a1} and b in
@@ -3202,7 +3202,7 @@ impl Game {
                             } else {
                                 format!("{name}_{:02}_{:02}", a.rem_euclid(100), b.rem_euclid(100))
                             };
-                            let _ = self.assets.image(r, &v);
+                            self.assets.precache(r, &v);
                             b += (b1 - b0).max(1);
                         }
                         a += (a1 - a0).max(1);

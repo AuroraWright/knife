@@ -1483,7 +1483,6 @@ dependencies = [
  "knife-audio",
  "knife-core",
  "knife-render",
- "memmap2",
  "mp4",
  "objc2-core-foundation",
  "objc2-core-media",

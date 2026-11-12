@@ -99,7 +99,6 @@ pub struct Output {
 
 impl Output {
     /// The luma and chroma buffers of the frame emitted last (empty before the first), to fill with the next.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn spare_planes(&mut self) -> (Vec<u8>, Vec<u8>) {
         self.spare.take().map(|f| (f.y_plane, f.uv_plane)).unwrap_or_default()
     }
@@ -176,23 +175,12 @@ fn run<D: FrameDecoder>(
     decoder.finish(output)
 }
 
-/// Copy a plane of `rows` rows of `width` bytes from rows `stride` bytes apart.
+/// Copy a plane of `rows` rows of `width` bytes from rows `stride` bytes apart into `plane`, replacing its
+/// contents and keeping its allocation (the buffers of an earlier frame, `Output::spare_planes`).
 ///
 /// # Safety
 /// `source` must be readable for `stride * (rows - 1) + width` bytes.
-#[cfg_attr(windows, allow(dead_code))]
-pub unsafe fn copy_plane(source: *const u8, stride: usize, width: usize, rows: usize) -> Vec<u8> {
-    let mut plane = Vec::new();
-    // SAFETY: guaranteed by the caller.
-    unsafe { copy_plane_into(&mut plane, source, stride, width, rows) };
-    plane
-}
-
-/// `copy_plane` into `plane`, replacing its contents and keeping its allocation.
-///
-/// # Safety
-/// As `copy_plane`.
-pub unsafe fn copy_plane_into(plane: &mut Vec<u8>, source: *const u8, stride: usize, width: usize, rows: usize) {
+pub unsafe fn copy_plane(plane: &mut Vec<u8>, source: *const u8, stride: usize, width: usize, rows: usize) {
     plane.clear();
     plane.reserve(width * rows);
     for row in 0..rows {
@@ -212,14 +200,8 @@ pub unsafe fn copy_plane_into(plane: &mut Vec<u8>, source: *const u8, stride: us
 /// The RGBA goes into `out`, resized to fit: a buffer of an earlier frame is reused without being faulted in
 /// again page by page.
 pub fn nv12_to_rgba_into(f: &Nv12Frame, out: &mut Vec<u8>) {
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .clamp(1, 8);
-    nv12_to_rgba_bands(f, out, threads);
-}
-
-/// `nv12_to_rgba_into` over `threads` bands of rows.
-fn nv12_to_rgba_bands(f: &Nv12Frame, out: &mut Vec<u8>, threads: usize) {
+    // bands of rows on up to 8 threads
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
     let (w, h) = (f.width as usize, f.height as usize);
     let ch = h / 2;
     assert!(w >= 2 && w.is_multiple_of(2) && h.is_multiple_of(2), "odd movie frame size {w}x{h}");
@@ -230,7 +212,7 @@ fn nv12_to_rgba_bands(f: &Nv12Frame, out: &mut Vec<u8>, threads: usize) {
     const KGU: i32 = -100;
     const KGV: i32 = -208;
     const KBU: i32 = 516;
-    let band = h.div_ceil(threads.max(1)).next_multiple_of(2);
+    let band = h.div_ceil(threads).next_multiple_of(2);
     std::thread::scope(|s| {
         for (bi, chunk) in out.chunks_mut(band * w * 4).enumerate() {
             s.spawn(move || {
@@ -426,6 +408,8 @@ fn spawn_with(
                 && decoder.hardware()
             {
                 tracing::warn!("{} hardware decoding failed, decoding in software: {e:#}", platform::Decoder::NAME);
+                // the failed decoder's device and surfaces go before the software one starts
+                drop(decoder);
                 result = platform::Decoder::software(&info).and_then(|mut software| {
                     video.seek(first);
                     output.skip = skip + output.delivered;

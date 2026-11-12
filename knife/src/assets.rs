@@ -86,9 +86,9 @@ struct Lookup {
 /// How many prefetched images `Assets::trim_images` keeps unreferenced while they wait for their command (the
 /// latest ones: a prefetch the script never reaches is let go once enough newer ones arrive).
 const FRESH_IMAGES: usize = 64;
-/// GPU memory the cached images may take before `Assets::trim_images` drops the unreferenced ones: Windows
-/// charges every texture to the process's committed memory, and without a budget a long session kept GBs of
-/// pictures shown once.
+/// GPU memory the cached images may take before `Assets::trim_images` drops unreferenced ones, the least
+/// recently used first: Windows charges every texture to the process's committed memory, and without a budget a
+/// long session kept GBs of pictures shown once.
 const IMAGE_BUDGET: u64 = 512 << 20;
 /// How many prefetched images `Assets::finish_prefetched` uploads a frame.
 const UPLOADS_PER_FRAME: usize = 2;
@@ -139,7 +139,13 @@ pub struct Assets {
     pub text: ScriptText,
     pub sar: Arc<SoundArchive>,
     parsed: HashMap<usize, Arc<Scene>>,
-    images: HashMap<String, Option<Arc<Image>>>,
+    /// cached images (None: not found) and their last use (`uses` then)
+    images: HashMap<String, (Option<Arc<Image>>, u64)>,
+    /// GPU memory the cached images take (`GpuTexture::bytes`)
+    image_bytes: u64,
+    /// image cache lookups so far, and their count at the last `trim_images` (an image used since then stays)
+    uses: u64,
+    trimmed_at: u64,
     /// the images `prefetch` is decoding, by cache key
     decoding: HashMap<String, Decoding>,
     /// prefetched images no command has taken yet, which `trim_images` keeps for the commands that asked ahead
@@ -277,12 +283,8 @@ impl Assets {
         let scenes = SceneArchive::parse(&std::fs::read(roots.path("allscr.mrg")).context("reading allscr.mrg")?)?;
         let script_text = std::fs::read(roots.path("script_text.mrg")).context("reading script_text.mrg")?;
         let sar_name = if build == Build::Witch { "witch.bfsar" } else { "knife1.bfsar" };
-        let sar = {
-            let file = std::fs::File::open(roots.path(sar_name)).with_context(|| format!("opening {sar_name}"))?;
-            // SAFETY: the game files are read-only inputs and not modified while mapped (as the archives).
-            let map = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {sar_name}"))?;
-            SoundArchive::parse(map)?
-        };
+        let sar = knife_core::format::map(&roots.path(sar_name)).with_context(|| format!("mapping {sar_name}"))?;
+        let sar = SoundArchive::parse(sar)?;
         let allui = Arc::new(roots.archive(&w("allui"))?);
         let languages = Self::sysmes_file(&allui, build).map_or(1, |d| sysmes_u32(&d, 0).unwrap_or(1).max(1) as usize);
         let mut a = Self {
@@ -304,6 +306,9 @@ impl Assets {
             sar: Arc::new(sar),
             parsed: HashMap::new(),
             images: HashMap::new(),
+            image_bytes: 0,
+            uses: 0,
+            trimmed_at: 0,
             decoding: HashMap::new(),
             fresh: Default::default(),
             sounds: HashMap::new(),
@@ -375,7 +380,7 @@ impl Assets {
             .cloned()
             .collect();
         for k in strips {
-            self.images.remove(&k);
+            self.uncache_image(&k);
         }
         Ok(true)
     }
@@ -476,8 +481,8 @@ impl Assets {
     pub fn image_hd(&mut self, r: &Renderer, name: &str) -> Option<Arc<Image>> {
         let (name, grade, key) = Self::image_key(name, Bake::NONE);
         let key = format!("HD {key}");
-        if let Some(i) = self.images.get(&key) {
-            return i.clone();
+        if let Some(i) = self.cached_image(&key) {
+            return i;
         }
         let pixels = Self::decode_pixels(&self.hd_archives(), &name, grade, self.strip(&name));
         let img = match pixels.and_then(|(p, _)| self.upload_pixels(r, &name, (p, true))) {
@@ -491,7 +496,7 @@ impl Assets {
                 None
             }
         };
-        self.images.insert(key, img.clone());
+        self.cache_image(key, img.clone());
         img
     }
 
@@ -541,8 +546,7 @@ impl Assets {
     /// exe keys its texture cache (sub_AAA40) the same way, by image and the pre_alter parameters.
     pub fn image_graded(&mut self, r: &Renderer, name: &str, bake: Bake) -> Option<Arc<Image>> {
         let (name, grade, key) = Self::image_key(name, bake);
-        if let Some(i) = self.images.get(&key) {
-            let i = i.clone();
+        if let Some(i) = self.cached_image(&key) {
             // a prefetched image has reached its command
             if let Some(at) = self.fresh.iter().position(|k| *k == key) {
                 self.fresh.remove(at);
@@ -558,6 +562,14 @@ impl Assets {
         }
         let pixels = Self::decode_pixels(&self.image_archives(), &name, grade, self.strip(&name));
         self.finish_image(r, key, &name, pixels, false)
+    }
+
+    /// Load an image for a script's precache command (SPFC / SPRD) and keep it for the command that takes it,
+    /// as a prefetched one.
+    pub fn precache(&mut self, r: &Renderer, name: &str) {
+        if self.image(r, name).is_some() {
+            self.keep_fresh(Self::image_key(name, Bake::NONE).2);
+        }
     }
 
     /// Cache key of an image load: (upper-case name, effective bake, key).
@@ -577,7 +589,15 @@ impl Assets {
     /// its way; `finish_prefetched` uploads and caches it once decoded, or `image_graded` waits for it.
     pub fn prefetch(&mut self, name: &str, bake: Bake) {
         let (name, grade, k) = Self::image_key(name, bake);
-        if self.images.contains_key(&k) || self.decoding.contains_key(&k) {
+        if let Some((i, _)) = self.images.get(&k) {
+            // a cached one (perhaps let go by the layer that took it earlier) is kept again for the command
+            // now asking for it
+            if i.is_some() {
+                self.keep_fresh(k);
+            }
+            return;
+        }
+        if self.decoding.contains_key(&k) {
             return;
         }
         let archives = self.image_archives();
@@ -645,25 +665,73 @@ impl Assets {
             }
         };
         if prefetched {
-            self.fresh.push_back(key.clone());
-            if self.fresh.len() > FRESH_IMAGES {
-                self.fresh.pop_front();
-            }
+            self.keep_fresh(key.clone());
         }
-        self.images.insert(key, img.clone());
+        self.cache_image(key, img.clone());
         img
     }
 
-    /// Drop cached images nobody else references (but the `FRESH_IMAGES` latest) once more than `keep` are
-    /// cached or they take more than `IMAGE_BUDGET`.
-    pub fn trim_images(&mut self, keep: usize) {
-        if self.images.len() <= keep
-            && self.images.values().flatten().map(|i| i.tex.bytes()).sum::<u64>() <= IMAGE_BUDGET
-        {
-            return;
+    /// Keep a cached image for the command that asked ahead for it (the `FRESH_IMAGES` latest are kept).
+    fn keep_fresh(&mut self, key: String) {
+        if let Some(at) = self.fresh.iter().position(|k| *k == key) {
+            self.fresh.remove(at);
         }
-        let fresh = &self.fresh;
-        self.images.retain(|k, v| v.as_ref().is_some_and(|i| Arc::strong_count(i) > 1) || fresh.contains(k));
+        self.fresh.push_back(key);
+        if self.fresh.len() > FRESH_IMAGES {
+            self.fresh.pop_front();
+        }
+    }
+
+    /// A cached image (Some(None): known missing), marked used.
+    fn cached_image(&mut self, key: &str) -> Option<Option<Arc<Image>>> {
+        let (i, used) = self.images.get_mut(key)?;
+        self.uses += 1;
+        *used = self.uses;
+        Some(i.clone())
+    }
+
+    fn cache_image(&mut self, key: String, img: Option<Arc<Image>>) {
+        self.uses += 1;
+        self.image_bytes += img.as_ref().map_or(0, |i| i.tex.bytes());
+        if let Some((old, _)) = self.images.insert(key, (img, self.uses)) {
+            self.image_bytes -= old.map_or(0, |i| i.tex.bytes());
+        }
+    }
+
+    fn uncache_image(&mut self, key: &str) {
+        if let Some((old, _)) = self.images.remove(key) {
+            self.image_bytes -= old.map_or(0, |i| i.tex.bytes());
+        }
+    }
+
+    /// Once more than `keep` images are cached or they take more than `IMAGE_BUDGET`, drop the ones nobody else
+    /// references, the least recently used first, until both hold again; an image used since the last trim
+    /// (one a menu fetches every frame) or kept for a command that asked ahead (`fresh`) stays, and a missing
+    /// image's entry (no memory) goes only for the count.
+    pub fn trim_images(&mut self, keep: usize) {
+        if self.images.len() > keep || self.image_bytes > IMAGE_BUDGET {
+            let mut old: Vec<(u64, String)> = self
+                .images
+                .iter()
+                .filter(|(k, (i, used))| {
+                    *used <= self.trimmed_at
+                        && i.as_ref().is_none_or(|i| Arc::strong_count(i) == 1)
+                        && !self.fresh.contains(*k)
+                })
+                .map(|(k, (_, used))| (*used, k.clone()))
+                .collect();
+            old.sort_unstable();
+            for (_, k) in old {
+                let count = self.images.len() > keep;
+                if !count && self.image_bytes <= IMAGE_BUDGET {
+                    break;
+                }
+                if count || self.images[&k].0.is_some() {
+                    self.uncache_image(&k);
+                }
+            }
+        }
+        self.trimmed_at = self.uses;
     }
 
     /// The (strip, strip count) an image draws: a language-strip image (overseas ImageInfo +67 bit 1) stacks
